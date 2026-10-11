@@ -1,0 +1,65 @@
+[package]
+name = "xi-launcher"
+version = "1.0.8"
+edition = "2021"
+license = "GPL-3.0-only"
+publish = false
+
+[features]
+elevated-ui = []
+launcher-startup-diagnostics = []
+
+[dependencies]
+iced = { version = "=0.14.0", default-features = false, features = ["wgpu", "tiny-skia", "tokio", "advanced-shaping", "image-without-codecs", "svg", "advanced"] }
+imagecrate = { package = "image", version = "=0.25.8", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
+crystal-pol = { path = "crates/pol-auth" }
+sha1 = "=0.10.7"
+sha2 = "0.10"
+ring = "=0.17.14"
+semver = "=1.0.28"
+zeroize = "=1.9.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "=0.12.28", default-features = false, features = ["rustls-tls"] }
+quick-xml = "=0.41.0"
+scraper = "=0.24.0"
+chrono = { version = "=0.4.45", features = ["clock"] }
+md5 = "=0.7.0"
+flate2 = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "io-util", "macros"] }
+png = "=0.17.16"
+rfd = { version = "0.15", default-features = false, features = ["common-controls-v6"] } # native folder/file pickers
+gilrs = { version = "0.11", default-features = false, features = ["wgi"] }
+unicode-script = "0.5" # the Script type cosmic-text's font Fallback trait takes (already in the tree via cosmic-text)
+windows-sys = { version = "=0.61.2", features = [
+    "Win32_Foundation", "Win32_Security", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm",
+    "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_System_Registry",
+    "Win32_System_Diagnostics_ToolHelp", "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Controls", "Win32_UI_HiDpi", "Win32_UI_Shell",
+    "Win32_UI_Input_KeyboardAndMouse", "Win32_Security_Cryptography", "Win32_Security_WinTrust",
+    "Win32_Storage_FileSystem",
+    "Win32_Security_Cryptography_Catalog", "Win32_Security_Cryptography_Sip", # signer lookup
+    "Win32_System_Pipes", "Win32_System_IO", # session pipe
+    "Win32_Globalization",
+    "Win32_NetworkManagement_IpHelper",
+] }
+zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] } # read the pinned release zip (inflate only, no zopfli)
+
+[build-dependencies]
+sha2 = "0.10"
+embed-resource = "3"
+
+[dev-dependencies]
+iced_tiny_skia = { version = "=0.14.1", default-features = false }
+
+[workspace]
+exclude = ["crystal-loader", "crates/pol-auth"]
+
+[profile.dev]
+debug = 0
+
+[profile.release]
+opt-level = 3
+lto = "off"
+codegen-units = 16
+strip = "debuginfo"

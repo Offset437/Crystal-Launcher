@@ -1,0 +1,909 @@
+//! Signed launcher releases, downloaded separately from the game updater.
+//! The release signature covers the version, URL, archive length and hash.
+mod apply;
+
+use crate::{
+    backend::Config,
+    i18n::{t, tf},
+    App, Message,
+};
+use iced::{Element, Task};
+use reqwest::{Client, Url};
+use ring::signature::{self, KeyPair};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::{
+    fs,
+    io::{Read, Write},
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
+const INDEX: &str = "https://api.github.com/repos/Offset437/Crystal-Launcher/releases?per_page=10";
+const RELEASE_PATH: &str = "/Offset437/Crystal-Launcher/releases/download/";
+const PUBLIC_KEY: &str = include_str!("../assets/update-public-key.hex");
+const MAX_ARCHIVE: u64 = 256 * 1024 * 1024;
+const MAX_METADATA: usize = 512 * 1024;
+const FILES: [&str; 5] = [
+    "Crystal-Launcher.exe",
+    "README.md",
+    "LICENSE",
+    "THIRD_PARTY.md",
+    "THIRD_PARTY_LICENSES.txt",
+];
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Payload {
+    format: u32,
+    platform: String,
+    version: String,
+    url: String,
+    size: u64,
+    sha256: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Envelope {
+    payload: String,
+    signature: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct Release {
+    payload: Payload,
+    envelope: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct Stage {
+    release: Release,
+    directory: PathBuf,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) enum State {
+    #[default]
+    Idle,
+    Checking,
+    Current,
+    NotPublished,
+    Available(Release),
+    Downloading,
+    Ready(Stage),
+    Applying,
+    Error(String),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum Msg {
+    Check,
+    Checked(Result<Option<Release>, String>),
+    Download,
+    Downloaded(Result<Stage, String>),
+    Apply,
+    Applied(Result<(), String>),
+    AutoCheck(bool),
+}
+
+pub(crate) fn initial(config: &Config) -> State {
+    let path = config.experiment.join("launcher-updates/last-error.txt");
+    let mut text = String::new();
+    if let Ok(file) = fs::File::open(path) {
+        if file.take(32 * 1024).read_to_string(&mut text).is_ok() && !text.is_empty() {
+            return State::Error(text);
+        }
+    }
+    State::Idle
+}
+
+fn read_metadata(path: &Path) -> Result<Vec<u8>, String> {
+    let file = fs::File::open(path).map_err(|e| e.to_string())?;
+    let mut data = Vec::new();
+    file.take(MAX_METADATA as u64 + 1)
+        .read_to_end(&mut data)
+        .map_err(|e| e.to_string())?;
+    if data.len() > MAX_METADATA {
+        return Err(t("Launcher update metadata is too large.").into());
+    }
+    Ok(data)
+}
+
+fn bytes<const N: usize>(hex: &str) -> Result<[u8; N], String> {
+    if hex.len() != N * 2 || !hex.is_ascii() {
+        return Err(t("Invalid launcher update signature or checksum.").into());
+    }
+    let mut output = [0; N];
+    for (i, pair) in hex.as_bytes().chunks_exact(2).enumerate() {
+        let digit = |b: u8| (b as char).to_digit(16).map(|x| x as u8);
+        output[i] = digit(pair[0])
+            .zip(digit(pair[1]))
+            .map(|(a, b)| (a << 4) | b)
+            .ok_or(t("Invalid launcher update signature or checksum."))?;
+    }
+    Ok(output)
+}
+
+fn hex(input: &[u8]) -> String {
+    input.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn trusted_key() -> Result<[u8; 32], String> {
+    let key = bytes(PUBLIC_KEY.trim())?;
+    if key == [0; 32] {
+        return Err(t("Launcher release signing has not been configured.").into());
+    }
+    Ok(key)
+}
+
+fn asset_url(url: &Url, extension: &str) -> bool {
+    url.scheme() == "https"
+        && url.host_str() == Some("github.com")
+        && url.port_or_known_default() == Some(443)
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && !url.path().contains('%')
+        && url.path().strip_prefix(RELEASE_PATH).is_some_and(|rest| {
+            let parts: Vec<_> = rest.split('/').collect();
+            parts.len() == 2
+                && !parts[0].is_empty()
+                && !parts[1].is_empty()
+                && parts[1].ends_with(extension)
+        })
+}
+
+fn download_host(url: &Url) -> bool {
+    url.scheme() == "https"
+        && url.port_or_known_default() == Some(443)
+        && url.username().is_empty()
+        && url.password().is_none()
+        && matches!(
+            url.host_str(),
+            Some(
+                "github.com"
+                    | "api.github.com"
+                    | "release-assets.githubusercontent.com"
+                    | "objects.githubusercontent.com"
+            )
+        )
+}
+
+fn client() -> Result<Client, String> {
+    Client::builder()
+        .https_only(true)
+        .connect_timeout(Duration::from_secs(10))
+        .read_timeout(Duration::from_secs(20))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() < 5 && download_host(attempt.url()) {
+                attempt.follow()
+            } else {
+                attempt.error("Launcher update redirect left GitHub's HTTPS release hosts")
+            }
+        }))
+        .user_agent(concat!("Crystal-Launcher/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(|e| e.to_string())
+}
+
+fn verify(envelope: &[u8], key: &[u8; 32]) -> Result<Release, String> {
+    if envelope.len() > MAX_METADATA {
+        return Err(t("Launcher update metadata is too large.").into());
+    }
+    let signed: Envelope =
+        serde_json::from_slice(envelope).map_err(|_| t("Invalid launcher update metadata."))?;
+    signature::UnparsedPublicKey::new(&signature::ED25519, key)
+        .verify(signed.payload.as_bytes(), &bytes::<64>(&signed.signature)?)
+        .map_err(|_| t("Launcher update signature did not verify."))?;
+    let payload: Payload = serde_json::from_str(&signed.payload)
+        .map_err(|_| t("Invalid launcher update metadata."))?;
+    let version = semver::Version::parse(&payload.version)
+        .map_err(|_| t("Invalid launcher update version."))?;
+    if payload.format != 1
+        || payload.platform != "windows-x86_64"
+        || version.major > u32::MAX as u64
+        || payload.size == 0
+        || payload.size > MAX_ARCHIVE
+        || !asset_url(
+            &Url::parse(&payload.url).map_err(|_| t("Invalid launcher update URL."))?,
+            ".zip",
+        )
+    {
+        return Err(t("Launcher update is not a supported Windows release.").into());
+    }
+    bytes::<32>(&payload.sha256)?;
+    Ok(Release {
+        payload,
+        envelope: envelope.to_vec(),
+    })
+}
+
+async fn body(mut response: reqwest::Response, limit: usize) -> Result<Vec<u8>, String> {
+    if response
+        .content_length()
+        .is_some_and(|size| size > limit as u64)
+    {
+        return Err(t("Launcher update metadata is too large.").into());
+    }
+    let mut output = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+        if output.len().saturating_add(chunk.len()) > limit {
+            return Err(t("Launcher update metadata is too large.").into());
+        }
+        output.extend_from_slice(&chunk);
+    }
+    Ok(output)
+}
+
+#[derive(Deserialize)]
+struct PublishedRelease {
+    #[serde(default)]
+    draft: bool,
+    assets: Vec<Asset>,
+}
+#[derive(Deserialize)]
+struct Asset {
+    name: String,
+    browser_download_url: String,
+}
+
+async fn check() -> Result<Option<Release>, String> {
+    let key = trusted_key()?;
+    let client = client()?;
+    let index = client
+        .get(INDEX)
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if index.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    let releases: Vec<PublishedRelease> = serde_json::from_slice(
+        &body(
+            index.error_for_status().map_err(|e| e.to_string())?,
+            MAX_METADATA,
+        )
+        .await?,
+    )
+    .map_err(|_| t("GitHub returned invalid launcher release metadata."))?;
+    let mut newest: Option<Release> = None;
+    for release in releases.into_iter().filter(|r| !r.draft).take(10) {
+        let Some(asset) = release
+            .assets
+            .into_iter()
+            .find(|a| a.name == "launcher-update.json")
+        else {
+            continue;
+        };
+        let url = Url::parse(&asset.browser_download_url)
+            .map_err(|_| t("Invalid launcher update URL."))?;
+        if !asset_url(&url, ".json") {
+            return Err(t("Invalid launcher update URL.").into());
+        }
+        let response = client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .error_for_status()
+            .map_err(|e| e.to_string())?;
+        let candidate = verify(&body(response, MAX_METADATA).await?, &key)?;
+        let version = semver::Version::parse(&candidate.payload.version).unwrap();
+        if newest
+            .as_ref()
+            .is_none_or(|r| version > semver::Version::parse(&r.payload.version).unwrap())
+        {
+            newest = Some(candidate);
+        }
+    }
+    Ok(newest)
+}
+
+fn verify_archive(path: &Path, release: &Release) -> Result<(), String> {
+    let mut file = fs::File::open(path).map_err(|e| e.to_string())?;
+    if file.metadata().map_err(|e| e.to_string())?.len() != release.payload.size {
+        return Err(t("Launcher update download is incomplete.").into());
+    }
+    let mut hash = Sha256::new();
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer).map_err(|e| e.to_string())?;
+        if count == 0 {
+            break;
+        }
+        hash.update(&buffer[..count]);
+    }
+    if hash.finalize().as_slice() != bytes::<32>(&release.payload.sha256)? {
+        return Err(t("Launcher update checksum did not match.").into());
+    }
+    Ok(())
+}
+
+/// Exact names only: no paths, duplicate entries, symlinks or unexpected files.
+fn unpack(archive: &Path, directory: &Path) -> Result<(), String> {
+    let file = fs::File::open(archive).map_err(|e| e.to_string())?;
+    let mut zip = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+    if zip.len() != FILES.len() {
+        return Err(t("Launcher update package has unexpected files.").into());
+    }
+    let mut found = std::collections::BTreeSet::new();
+    let mut expanded = 0u64;
+    for i in 0..zip.len() {
+        let mut entry = zip.by_index(i).map_err(|e| e.to_string())?;
+        let name = entry.name().to_owned();
+        expanded = expanded.saturating_add(entry.size());
+        if !FILES.contains(&name.as_str())
+            || !found.insert(name.clone())
+            || entry.is_dir()
+            || entry.unix_mode().is_some_and(|m| m & 0o170000 == 0o120000)
+            || expanded > MAX_ARCHIVE
+        {
+            return Err(t("Launcher update package has unexpected files.").into());
+        }
+        let path = directory.join(&name);
+        let mut output = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|e| e.to_string())?;
+        let count = std::io::copy(&mut (&mut entry).take(MAX_ARCHIVE + 1), &mut output)
+            .map_err(|e| e.to_string())?;
+        if count > MAX_ARCHIVE || count != entry.size() {
+            return Err(t("Launcher update package is incomplete.").into());
+        }
+        output.sync_all().map_err(|e| e.to_string())?;
+    }
+    let mut file = fs::File::open(directory.join(FILES[0])).map_err(|e| e.to_string())?;
+    let mut header = vec![0; 1024];
+    let count = file.read(&mut header).map_err(|e| e.to_string())?;
+    header.truncate(count);
+    if !windows_executable(&header) {
+        return Err(t("Launcher update is not a 64-bit Windows executable.").into());
+    }
+    Ok(())
+}
+
+fn windows_executable(header: &[u8]) -> bool {
+    if header.len() < 64 || &header[..2] != b"MZ" {
+        return false;
+    }
+    let offset = u32::from_le_bytes(header[60..64].try_into().unwrap()) as usize;
+    header
+        .get(offset..offset.saturating_add(6))
+        .is_some_and(|pe| pe == b"PE\0\0\x64\x86")
+}
+
+async fn download(release: Release, data: PathBuf) -> Result<Stage, String> {
+    // Recheck the signed fields before touching the staging directory.
+    let release = verify(&release.envelope, &trusted_key()?)?;
+    let directory = data.join("launcher-updates").join(format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
+    let archive = directory.join("release.zip");
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&archive)
+        .map_err(|e| e.to_string())?;
+    let mut response = client()?
+        .get(&release.payload.url)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())?;
+    if response
+        .content_length()
+        .is_some_and(|n| n != release.payload.size)
+    {
+        return Err(t("Launcher update download has an unexpected length.").into());
+    }
+    let mut downloaded = 0u64;
+    while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+        downloaded = downloaded.saturating_add(chunk.len() as u64);
+        if downloaded > release.payload.size {
+            return Err(t("Launcher update download has an unexpected length.").into());
+        }
+        file.write_all(&chunk).map_err(|e| e.to_string())?;
+    }
+    file.sync_all().map_err(|e| e.to_string())?;
+    drop(file);
+    verify_archive(&archive, &release)?;
+    fs::write(directory.join("launcher-update.json"), &release.envelope)
+        .map_err(|e| e.to_string())?;
+    let extracted = directory.join("verified");
+    fs::create_dir(&extracted).map_err(|e| e.to_string())?;
+    unpack(&archive, &extracted)?;
+    Ok(Stage { release, directory })
+}
+
+pub(crate) fn busy(state: &State) -> bool {
+    matches!(state, State::Downloading | State::Applying)
+}
+
+pub(crate) fn banner(app: &App) -> Option<Element<'_, Message>> {
+    use crate::ui::{colors, control, Tone, BODY};
+    use iced::widget::{container, row, text};
+    use iced::{Alignment, Length};
+    let (label, action) = match &app.self_update {
+        State::Available(release) => (
+            tf(
+                "Crystal Launcher {version} is available.",
+                &[("version", &release.payload.version)],
+            ),
+            Some((t("Update and restart"), Msg::Download)),
+        ),
+        State::Downloading => (
+            t("Downloading and verifying the launcher update…").into(),
+            None,
+        ),
+        State::Ready(_) => (
+            t("The launcher update is ready.").into(),
+            app.can_restart_launcher()
+                .then_some((t("Restart to update"), Msg::Apply)),
+        ),
+        State::Applying => (t("Restarting Crystal Launcher…").into(), None),
+        _ => return None,
+    };
+    let c = colors(app.settings.light_theme);
+    let action = action
+        .map(|(label, msg)| {
+            control(
+                c,
+                Tone::Secondary,
+                None,
+                label,
+                Some(Message::SelfUpdate(msg)),
+                None,
+            )
+        })
+        .unwrap_or_else(|| iced::widget::Space::new().into());
+    Some(
+        container(
+            row![
+                text(label)
+                    .font(BODY)
+                    .size(13)
+                    .color(c.accent)
+                    .width(Length::Fill),
+                action
+            ]
+            .align_y(Alignment::Center)
+            .spacing(16),
+        )
+        .padding([6, 48])
+        .width(Length::Fill)
+        .into(),
+    )
+}
+
+pub(crate) fn update(state: &mut State, msg: Msg, config: &Config, can_restart: bool) -> Task<Msg> {
+    match msg {
+        Msg::Check if !matches!(state, State::Checking) && !busy(state) => {
+            *state = State::Checking;
+            return Task::perform(check(), Msg::Checked);
+        }
+        Msg::Checked(result) => {
+            *state = match result {
+                Ok(Some(release))
+                    if semver::Version::parse(&release.payload.version).unwrap()
+                        > semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap() =>
+                {
+                    State::Available(release)
+                }
+                Ok(Some(_)) => State::Current,
+                Ok(None) => State::NotPublished,
+                Err(error) => State::Error(error),
+            };
+        }
+        Msg::Download => {
+            if let State::Available(release) = state {
+                let release = release.clone();
+                *state = State::Downloading;
+                return Task::perform(
+                    download(release, config.experiment.clone()),
+                    Msg::Downloaded,
+                );
+            }
+        }
+        Msg::Downloaded(result) => {
+            *state = match result {
+                Ok(stage) => State::Ready(stage),
+                Err(error) => State::Error(error),
+            };
+            if can_restart && matches!(state, State::Ready(_)) {
+                return Task::done(Msg::Apply);
+            }
+        }
+        Msg::Apply if can_restart => {
+            if let State::Ready(stage) = state {
+                let stage = stage.clone();
+                *state = State::Applying;
+                return Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || apply::start(&stage))
+                            .await
+                            .unwrap_or_else(|_| {
+                                Err(t("The launcher update helper could not start.").into())
+                            })
+                    },
+                    Msg::Applied,
+                );
+            }
+        }
+        Msg::Applied(Err(error)) => *state = State::Error(error),
+        _ => {}
+    }
+    Task::none()
+}
+
+pub(crate) fn view(app: &App) -> Element<'_, Message> {
+    use crate::ui::{colors, control, Tone, BODY};
+    use iced::widget::{column, container, row, text};
+    use iced::{Alignment, Length};
+    let c = colors(app.settings.light_theme);
+    let (status, action) = match &app.self_update {
+        State::Idle => (
+            t("Launcher updates have not been checked.").into(),
+            Some((t("Check for launcher updates"), Msg::Check)),
+        ),
+        State::Checking => (t("Checking for launcher updates…").into(), None),
+        State::Current => (
+            t("Crystal Launcher is up to date.").into(),
+            Some((t("Check again"), Msg::Check)),
+        ),
+        State::NotPublished => (
+            t("No launcher releases have been published yet.").into(),
+            Some((t("Check again"), Msg::Check)),
+        ),
+        State::Available(release) => (
+            tf(
+                "Crystal Launcher {version} is available.",
+                &[("version", &release.payload.version)],
+            ),
+            Some((t("Update and restart"), Msg::Download)),
+        ),
+        State::Downloading => (
+            t("Downloading and verifying the launcher update…").into(),
+            None,
+        ),
+        State::Ready(stage) => (
+            tf(
+                "Crystal Launcher {version} is ready to install.",
+                &[("version", &stage.release.payload.version)],
+            ),
+            app.can_restart_launcher()
+                .then_some((t("Restart to update"), Msg::Apply)),
+        ),
+        State::Applying => (t("Restarting Crystal Launcher…").into(), None),
+        State::Error(error) => (error.clone(), Some((t("Try again"), Msg::Check))),
+    };
+    let action = action
+        .map(|(label, msg)| {
+            control(
+                c,
+                Tone::Secondary,
+                None,
+                label,
+                Some(Message::SelfUpdate(msg)),
+                None,
+            )
+        })
+        .unwrap_or_else(|| iced::widget::Space::new().into());
+    column![
+        row![
+            text(t("Launcher updates"))
+                .font(BODY)
+                .size(16)
+                .color(c.ink)
+                .width(Length::Fill),
+            text(env!("CARGO_PKG_VERSION"))
+                .font(BODY)
+                .size(13)
+                .color(c.sub)
+        ],
+        row![
+            container(crate::ui::private_text(app, &status, 13.0, BODY, c.sub)).width(Length::Fill),
+            action
+        ]
+        .spacing(16)
+        .align_y(Alignment::Center),
+        crate::controller_nav::toggler(app.settings.launcher_auto_updates)
+            .label(t("Check for launcher updates when Crystal opens"))
+            .on_toggle(|on| Message::SelfUpdate(Msg::AutoCheck(on)))
+            .font(BODY)
+            .text_size(13)
+            .size(18),
+        text(t(
+            "Updates are signed and verified before installation. Running games stay open."
+        ))
+        .font(BODY)
+        .size(12)
+        .color(c.sub),
+    ]
+    .spacing(12)
+    .padding([12, 0])
+    .into()
+}
+
+/// Release tooling and the post-exit helper run before account storage or UI.
+pub(crate) fn cli(args: &[String]) -> Option<Result<(), String>> {
+    match args.get(1).map(String::as_str) {
+        Some("--apply-launcher-update") => Some(apply::run(args)),
+        Some("--create-launcher-update-key") => Some((|| {
+            let path = PathBuf::from(
+                args.get(2)
+                    .ok_or("An absolute private-key path is required.")?,
+            );
+            if !path.is_absolute() {
+                return Err("An absolute private-key path is required.".into());
+            }
+            let document =
+                signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
+                    .map_err(|_| "Windows could not generate the release signing key.")?;
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .map_err(|e| e.to_string())?;
+            file.write_all(document.as_ref())
+                .and_then(|_| file.sync_all())
+                .map_err(|e| e.to_string())?;
+            let key = signature::Ed25519KeyPair::from_pkcs8(document.as_ref())
+                .map_err(|_| "Invalid generated key.")?;
+            println!("{}", hex(key.public_key().as_ref()));
+            Ok(())
+        })()),
+        Some("--sign-launcher-release") => Some(sign_release(args)),
+        _ => None,
+    }
+}
+
+fn sign_release(args: &[String]) -> Result<(), String> {
+    if args.len() != 7 {
+        return Err(
+            "Expected: private-key version package-folder archive-URL output-folder".into(),
+        );
+    }
+    let key_path = Path::new(&args[2]);
+    let version = &args[3];
+    let package = Path::new(&args[4]);
+    let url = &args[5];
+    let output = Path::new(&args[6]);
+    if !key_path.is_absolute()
+        || !package.is_absolute()
+        || !output.is_absolute()
+        || version != env!("CARGO_PKG_VERSION")
+    {
+        return Err("Use absolute paths and the version of this built launcher.".into());
+    }
+    let url = Url::parse(url).map_err(|e| e.to_string())?;
+    if !asset_url(&url, ".zip") {
+        return Err("The archive URL must belong to Crystal's GitHub releases.".into());
+    }
+    let private = zeroize::Zeroizing::new(fs::read(key_path).map_err(|e| e.to_string())?);
+    let key = signature::Ed25519KeyPair::from_pkcs8(&private)
+        .map_err(|_| "Invalid release signing key.")?;
+    if key.public_key().as_ref() != trusted_key()? {
+        return Err("Signing key does not match this launcher's public key.".into());
+    }
+    fs::create_dir_all(output).map_err(|e| e.to_string())?;
+    let filename = url
+        .path_segments()
+        .and_then(|mut parts| parts.next_back())
+        .ok_or("Missing archive name.")?;
+    let archive = output.join(filename);
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&archive)
+        .map_err(|e| e.to_string())?;
+    let mut zip = zip::ZipWriter::new(file);
+    for name in FILES {
+        let path = package.join(name);
+        if !path.is_file() {
+            return Err(format!("Package is missing {name}."));
+        }
+        zip.start_file(
+            name,
+            zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated),
+        )
+        .map_err(|e| e.to_string())?;
+        std::io::copy(
+            &mut fs::File::open(path).map_err(|e| e.to_string())?,
+            &mut zip,
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    zip.finish()
+        .map_err(|e| e.to_string())?
+        .sync_all()
+        .map_err(|e| e.to_string())?;
+    let archive_bytes = fs::read(&archive).map_err(|e| e.to_string())?;
+    let payload = Payload {
+        format: 1,
+        platform: "windows-x86_64".into(),
+        version: version.clone(),
+        url: url.to_string(),
+        size: archive_bytes.len() as u64,
+        sha256: hex(&Sha256::digest(&archive_bytes)),
+    };
+    let payload = serde_json::to_string(&payload).map_err(|e| e.to_string())?;
+    let signed = Envelope {
+        signature: hex(key.sign(payload.as_bytes()).as_ref()),
+        payload,
+    };
+    let metadata = serde_json::to_vec_pretty(&signed).map_err(|e| e.to_string())?;
+    verify(&metadata, &trusted_key()?)?;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(output.join("launcher-update.json"))
+        .map_err(|e| e.to_string())?;
+    file.write_all(&metadata)
+        .and_then(|_| file.sync_all())
+        .map_err(|e| e.to_string())?;
+    println!("Signed {filename} and launcher-update.json; nothing was uploaded.");
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn signed(version: &str) -> (Vec<u8>, [u8; 32]) {
+        let key = signature::Ed25519KeyPair::from_seed_unchecked(&[17; 32]).unwrap();
+        let payload = Payload { format: 1, platform: "windows-x86_64".into(), version: version.into(),
+            url: "https://github.com/Offset437/Crystal-Launcher/releases/download/v0.2.0/Crystal-Launcher.zip".into(),
+            size: 400, sha256: "ab".repeat(32) };
+        let payload = serde_json::to_string(&payload).unwrap();
+        let envelope = Envelope {
+            signature: hex(key.sign(payload.as_bytes()).as_ref()),
+            payload,
+        };
+        (
+            serde_json::to_vec(&envelope).unwrap(),
+            key.public_key().as_ref().try_into().unwrap(),
+        )
+    }
+
+    #[test]
+    fn signature_rejects_tampering_and_other_keys() {
+        let (data, key) = signed("0.2.0");
+        assert_eq!(verify(&data, &key).unwrap().payload.version, "0.2.0");
+        let mut envelope: Envelope = serde_json::from_slice(&data).unwrap();
+        envelope.payload = envelope.payload.replace("0.2.0", "0.3.0");
+        assert!(verify(&serde_json::to_vec(&envelope).unwrap(), &key).is_err());
+        assert!(verify(&data, &[0; 32]).is_err());
+    }
+
+    #[test]
+    fn only_crystals_https_release_assets_are_accepted() {
+        let good = "https://github.com/Offset437/Crystal-Launcher/releases/download/v1/Crystal-Launcher.zip";
+        assert!(asset_url(&Url::parse(good).unwrap(), ".zip"));
+        for bad in [
+            good.replace("https:", "http:"),
+            good.replace("Offset437", "someone"),
+            format!("{good}?target=other"),
+            good.replace("github.com", "github.com.evil.example"),
+            good.replace("/v1/", "/%2e%2e/"),
+            good.replace("https://", "https://user@"),
+        ] {
+            assert!(!asset_url(&Url::parse(&bad).unwrap(), ".zip"), "{bad}");
+        }
+    }
+
+    #[test]
+    fn wrong_platform_and_unbounded_packages_fail_even_when_signed() {
+        let (data, key) = signed("0.2.0");
+        let signer = signature::Ed25519KeyPair::from_seed_unchecked(&[17; 32]).unwrap();
+        let original: Envelope = serde_json::from_slice(&data).unwrap();
+        for replacement in [
+            original.payload.replace("windows-x86_64", "linux"),
+            original
+                .payload
+                .replace("\"size\":400", "\"size\":999999999999"),
+        ] {
+            let envelope = Envelope {
+                signature: hex(signer.sign(replacement.as_bytes()).as_ref()),
+                payload: replacement,
+            };
+            assert!(verify(&serde_json::to_vec(&envelope).unwrap(), &key).is_err());
+        }
+    }
+
+    #[test]
+    fn executable_header_is_checked_without_unbounded_offsets() {
+        let mut header = [0u8; 256];
+        header[..2].copy_from_slice(b"MZ");
+        header[60..64].copy_from_slice(&128u32.to_le_bytes());
+        header[128..134].copy_from_slice(b"PE\0\0\x64\x86");
+        assert!(windows_executable(&header));
+        header[132..134].copy_from_slice(&0x14cu16.to_le_bytes());
+        assert!(!windows_executable(&header));
+        header[60..64].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(!windows_executable(&header));
+    }
+
+    #[test]
+    fn downloaded_archives_reject_same_size_changes_and_truncation() {
+        let root = std::env::temp_dir().join(format!(
+            "crystal-update-hash-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let archive = root.join("release.zip");
+        let (metadata, key) = signed("0.2.0");
+        let mut release = verify(&metadata, &key).unwrap();
+        let original = vec![7; 400];
+        release.payload.sha256 = hex(&Sha256::digest(&original));
+        fs::write(&archive, &original).unwrap();
+        verify_archive(&archive, &release).unwrap();
+        let mut changed = original;
+        changed[99] ^= 1;
+        fs::write(&archive, &changed).unwrap();
+        assert!(verify_archive(&archive, &release).is_err());
+        fs::write(&archive, &changed[..100]).unwrap();
+        assert!(verify_archive(&archive, &release).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn extraction_accepts_the_package_and_rejects_paths_and_foreign_files() {
+        let root = std::env::temp_dir().join(format!(
+            "crystal-update-zip-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let mut header = [0u8; 256];
+        header[..2].copy_from_slice(b"MZ");
+        header[60..64].copy_from_slice(&128u32.to_le_bytes());
+        header[128..134].copy_from_slice(b"PE\0\0\x64\x86");
+        for (index, replacement) in [None, Some("../README.md"), Some("surprise.exe")]
+            .iter()
+            .enumerate()
+        {
+            let archive = root.join(format!("case-{index}.zip"));
+            let directory = root.join(format!("case-{index}"));
+            fs::create_dir(&directory).unwrap();
+            let mut zip = zip::ZipWriter::new(fs::File::create(&archive).unwrap());
+            for (file_index, name) in FILES.iter().enumerate() {
+                let name = if file_index == 1 {
+                    replacement.unwrap_or(name)
+                } else {
+                    name
+                };
+                zip.start_file(name, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                zip.write_all(if file_index == 0 { &header } else { b"notice" })
+                    .unwrap();
+            }
+            zip.finish().unwrap();
+            let result = unpack(&archive, &directory);
+            assert_eq!(result.is_ok(), replacement.is_none());
+        }
+        assert!(!root.join("README.md").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+}

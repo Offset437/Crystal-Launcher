@@ -1,0 +1,2 @@
+# Preserve authored fixture encodings and line endings, including Shift_JIS.
+fixtures/** -text

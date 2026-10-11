@@ -1,0 +1,14 @@
+target/
+*.exe
+*.pdb
+previews/
+settings.json
+directories.json
+*.dpapi
+/.diagnostics/
+
+/preview*.png
+*.log
+__pycache__/
+*.pyc
+/THIRD_PARTY_LICENSES.txt

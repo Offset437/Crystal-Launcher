@@ -1,0 +1,65 @@
+[package]
+name = "crystal-loader"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+publish = false
+description = "32-bit FFXI game host using the installed PlayOnline core for retail authentication and sessions"
+
+[features]
+default = ["native-fast-login-poll"]
+# Temporary, content-free forwarding traces for server-settings live pilots.
+native-backup-diagnostics = []
+# Temporary socket-call metadata only; never changes native POL transport.
+native-login-diagnostics = ["windows-sys/Win32_Networking_WinSock"]
+# A/B pilot only: disable Nagle on transient startup PML requests, with the
+# same read-only diagnostics as the control. Never enabled by default.
+native-login-nodelay = ["native-login-diagnostics"]
+# Faster initial sign-in and mail-list polling; mail transfers and idle retain Viewer cadence.
+# --no-default-features retains the original startup polling for comparison.
+native-fast-login-poll = []
+
+# Own workspace root: this crate never joins the launcher build.
+[workspace]
+
+[lib]
+name = "crystal_loader"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pol"
+path = "src/main.rs"
+
+# Offline harness: a stand-in launcher that serves dummy session values and
+# listens on loopback for the lobby connection attempt. Never signs in.
+[[bin]]
+name = "crystal-harness"
+path = "src/bin/crystal-harness.rs"
+
+[dependencies]
+zeroize = { version = "=1.9.0", default-features = false, features = ["alloc", "zeroize_derive"] }
+windows-sys = { version = "=0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_IO",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Pipes",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    # Scoped game-window verification and optional login-menu input.
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"

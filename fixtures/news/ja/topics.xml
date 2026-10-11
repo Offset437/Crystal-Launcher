@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Independently authored parser fixture. These are fictional articles. -->
+<rss version="2.0">
+  <channel>
+    <title>合成トピックス</title>
+    <item>
+      <title>表示テスト &amp; お知らせ</title>
+      <link>https://sqex.to/crystal-test-update</link>
+      <pubDate>Tue, 06 Oct 2026 17:00:00 JST</pubDate>
+      <description>&lt;p&gt;表示テストです。&lt;br&gt;続きは &amp;quot;案内&amp;quot; を確認してください。&lt;/p&gt;</description>
+    </item>
+    <item>
+      <title><![CDATA[画像付きの試験記事]]></title>
+      <link>https://www.playonline.com/pcd2/topics/ff11/detail/fixture-image/detail.html</link>
+      <pubDate>Mon, 05 Oct 2026 09:30:00 +0900</pubDate>
+      <description><![CDATA[<p>記事本文の画像です。</p><img src="fixture-image_0.png" width="640" height="360">]]></description>
+    </item>
+    <item>
+      <title>表示期間の試験記事 &#x3010;確認用&#x3011;</title>
+      <link>/pcd2/topics/ff11/detail/fixture-period/detail.html</link>
+      <pubDate>Sun, 04 Oct 2026 12:00:00 JST</pubDate>
+      <description><![CDATA[<p>期間を<span>二週間</span>に変更<br>表示枠を20 → 30に拡張</p>]]></description>
+    </item>
+  </channel>
+</rss>

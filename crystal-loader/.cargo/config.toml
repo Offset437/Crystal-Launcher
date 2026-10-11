@@ -1,0 +1,8 @@
+# The loader is always a 32-bit process (polcore, FFXi.dll and FFXiMain are x86).
+[build]
+target = "i686-pc-windows-msvc"
+
+# Static CRT: no VCRUNTIME140/api-ms-win-crt imports, so the loader starts on a
+# machine without the VC++ redistributable and its static import list stays small.
+[target.i686-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
