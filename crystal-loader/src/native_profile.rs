@@ -4,6 +4,7 @@
 //! The file is read only; the Viewer's default-save (app 101a09e6) is omitted.
 
 use crate::native_auth::Api;
+use std::io::Read;
 use std::path::Path;
 
 pub(crate) const HEADER_LEN: usize = 0xe4;
@@ -20,11 +21,13 @@ pub(crate) const PROFILE_NOT_FOUND: i32 = -11267;
 /// Holds no credentials for a LAN profile (02 Â§2.1).
 pub(crate) fn read_file(viewer: &Path) -> Option<Vec<u8>> {
     let path = viewer.join("usr").join("all").join("inet_w.bin");
-    let size = std::fs::metadata(&path).ok()?.len() as usize;
-    if size > HEADER_LEN + MAX_RECORDS * RECORD_LEN {
+    let limit = HEADER_LEN + MAX_RECORDS * RECORD_LEN;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path).ok()?.take(limit as u64 + 1).read_to_end(&mut bytes).ok()?;
+    if bytes.len() > limit {
         return Some(Vec::new()); // present but invalid: the Viewer's defaults
     }
-    std::fs::read(path).ok()
+    Some(bytes)
 }
 
 fn u32_at(p: usize, offset: usize) -> u32 {
@@ -60,6 +63,22 @@ unsafe fn copy_in(api: &Api, header: usize, bytes: &[u8]) -> bool {
     let capacity = u32::from_le_bytes(bytes[0x60..0x64].try_into().unwrap()) as usize;
     if capacity > MAX_RECORDS || bytes.len() != HEADER_LEN + capacity * RECORD_LEN {
         return false;
+    }
+    let field = |offset| u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+    if !bytes[..0x40].starts_with(MAGIC) || bytes[MAGIC.len()] != 0
+        || field(0x40) != HEADER_LEN || field(0x44) != RECORD_LEN {
+        return false;
+    }
+    // The core's 809 returns count directly; 849 walks from the first record
+    // through unchecked next indices. A valid checksum does not bound that walk.
+    let count = field(0x50);
+    if count > capacity { return false; }
+    let mut index = field(0x54);
+    let mut visited = [false; MAX_RECORDS];
+    for number in 0..count {
+        if index >= capacity || visited[index] { return false; }
+        visited[index] = true;
+        if number + 1 < count { index = field(HEADER_LEN + index * RECORD_LEN + 4); }
     }
     std::ptr::copy_nonoverlapping(bytes.as_ptr(), header as *mut u8, HEADER_LEN);
     let (mut records, mut size) = (0usize, 0u32);

@@ -82,8 +82,9 @@ pub(crate) fn edit_profiles(folder: &std::path::Path, mut progress: impl FnMut(&
 pub(crate) struct State {
     pub detected: Detected,
     generation: u64,
+    detected_for: Option<(u64, ToolSettings)>,
     pending: Option<ToolSettings>,
-    worker: Option<std::sync::mpsc::Receiver<(u64, Detected)>>,
+    worker: Option<std::sync::mpsc::Receiver<(u64, ToolSettings, Detected)>>,
 }
 
 impl State {
@@ -98,8 +99,11 @@ impl State {
     pub(crate) fn poll(&mut self) {
         let result = self.worker.as_ref().map(|worker| worker.try_recv());
         match result {
-            Some(Ok((generation, detected))) => {
-                if generation == self.generation { self.detected = detected; }
+            Some(Ok((generation, settings, detected))) => {
+                if generation == self.generation {
+                    self.detected = detected;
+                    self.detected_for = Some((generation, settings));
+                }
                 self.worker = None;
             }
             Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => self.worker = None,
@@ -114,10 +118,37 @@ impl State {
         let generation = self.generation;
         let (sender, receiver) = std::sync::mpsc::channel();
         if std::thread::Builder::new().name("launch-tool-discovery".into()).spawn(move || {
-            let _ = sender.send((generation, pol_less::detect_all(&settings)));
+            let detected = pol_less::detect_all(&settings);
+            let _ = sender.send((generation, settings, detected));
         }).is_ok() {
             self.worker = Some(receiver);
         }
+    }
+
+    /// Carry a still-valid directory into the headless worker instead of making
+    /// every account repeat the UI's inventory scan. Saved preferences stay as
+    /// they are; the worker revalidates the path and reads the profile itself.
+    pub(crate) fn launch_plan(&self, settings: &Settings, account: &Account) -> Option<Plan> {
+        let mut plan = settings.launch_plan(account)?;
+        let Some((generation, discovered)) = &self.detected_for else { return Some(plan); };
+        if *generation != self.generation
+            || discovered.ashita != settings.ashita_path
+            || discovered.windower != settings.windower_path
+            || discovered.loader != settings.loader_path
+        {
+            return Some(plan);
+        }
+        let (configured, folder) = match plan.tool {
+            Tool::Ashita => (&mut plan.settings.ashita, self.detected.ashita.as_deref()),
+            Tool::Windower => (&mut plan.settings.windower, self.detected.windower.as_deref()),
+            Tool::Vanilla => return Some(plan),
+        };
+        if configured.trim().is_empty() {
+            if let Some(folder) = folder.and_then(|folder| pol_less::tools::validated_folder(plan.tool, folder)) {
+                if let Some(path) = folder.to_str() { *configured = path.to_owned(); }
+            }
+        }
+        Some(plan)
     }
 }
 
@@ -190,7 +221,7 @@ impl Settings {
             settings.windower_profile = profile.clone();
         }
         Some(Plan { tool, settings, social_only: false, invisible_login: false,
-            auto_away_minutes: self.auto_away_for(account), auto_login: self.auto_login_for(account) })
+            auto_away_minutes: self.auto_away_for(account), auto_login: self.auto_login_for(account), viewer_gaps: false, trigger: Default::default() })
     }
 
     /// The account's Auto-Away minutes (0 = off), the Viewer's 10 by default.
@@ -495,15 +526,98 @@ mod tests {
     fn a_completed_discovery_cannot_replace_newer_preferences() {
         let (sender, receiver) = std::sync::mpsc::channel();
         let mut state = State { generation: 2, worker: Some(receiver), ..State::default() };
-        sender.send((1, Detected { windower: Some(PathBuf::from(r"C:\Old Windower")), ..Detected::default() })).unwrap();
+        sender.send((1, ToolSettings::default(), Detected { windower: Some(PathBuf::from(r"C:\Old Windower")), ..Detected::default() })).unwrap();
         state.poll();
         assert!(state.detected.windower.is_none());
+        assert!(state.detected_for.is_none());
 
         let (sender, receiver) = std::sync::mpsc::channel();
         state.worker = Some(receiver);
-        sender.send((2, Detected { windower: Some(PathBuf::from(r"D:\Current Windower")), ..Detected::default() })).unwrap();
+        sender.send((2, ToolSettings::default(), Detected { windower: Some(PathBuf::from(r"D:\Current Windower")), ..Detected::default() })).unwrap();
         state.poll();
         assert_eq!(state.detected.windower, Some(PathBuf::from(r"D:\Current Windower")));
+        assert_eq!(state.detected_for.as_ref().map(|(generation, _)| *generation), Some(2));
+    }
+
+    fn completed_discovery(settings: &Settings, detected: Detected) -> State {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let mut state = State { generation: 1, worker: Some(receiver), ..State::default() };
+        sender.send((1, settings.tool_settings(), detected)).unwrap();
+        state.poll();
+        state
+    }
+
+    fn tool_fixture() -> PathBuf {
+        let root = std::env::temp_dir().join(format!("crystal-launch-path-{}", crate::backend::unique_id().unwrap()));
+        for (folder, exe) in [("Windower", "Windower.exe"), ("Ashita", "Ashita-cli.exe")] {
+            std::fs::create_dir_all(root.join(folder)).unwrap();
+            std::fs::write(root.join(folder).join(exe), []).unwrap();
+        }
+        root
+    }
+
+    #[test]
+    fn runtime_plan_reuses_discovered_directories_without_saving_or_selecting_a_profile() {
+        let root = tool_fixture();
+        let settings = Settings { launch_with: LaunchWith::Windower, ..Settings::default() };
+        let saved = serde_json::to_vec(&settings).unwrap();
+        let state = completed_discovery(&settings, Detected {
+            windower: Some(root.join("Windower")), ashita: Some(root.join("Ashita")),
+            profiles: vec!["Named profile".into()], ..Detected::default()
+        });
+        let mut account = retail();
+        let plan = state.launch_plan(&settings, &account).unwrap();
+        let windower = pol_less::tools::validated_folder(Tool::Windower, &root.join("Windower")).unwrap();
+        assert_eq!(PathBuf::from(&plan.settings.windower), windower);
+        assert!(plan.settings.windower_profile.is_empty(), "the unnamed default remains selected");
+        // The worker's ordinary path validation accepts the serialized hint.
+        let handed: Plan = serde_json::from_slice(&serde_json::to_vec(&plan).unwrap()).unwrap();
+        assert_eq!(pol_less::tools::detect(handed.tool, &handed.settings.windower), Some(windower));
+
+        account.windower_profile = Some("Per-account profile".into());
+        assert_eq!(state.launch_plan(&settings, &account).unwrap().settings.windower_profile, "Per-account profile");
+        account.launch_with = Some(LaunchWith::Ashita);
+        account.ashita_boot_ini = Some("account.ini".into());
+        let plan = state.launch_plan(&settings, &account).unwrap();
+        assert_eq!(pol_less::tools::detect(plan.tool, &plan.settings.ashita),
+            pol_less::tools::validated_folder(Tool::Ashita, &root.join("Ashita")));
+        assert_eq!(plan.settings.boot_ini, "account.ini");
+        account.launch_with = Some(LaunchWith::Vanilla);
+        let plan = state.launch_plan(&settings, &account).unwrap();
+        assert!(plan.settings.windower.is_empty() && plan.settings.ashita.is_empty());
+        assert_eq!(serde_json::to_vec(&settings).unwrap(), saved);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn runtime_plan_preserves_explicit_paths_even_when_they_need_normal_fallback() {
+        let root = tool_fixture();
+        let selected = root.join("Selected Windower");
+        std::fs::create_dir_all(&selected).unwrap();
+        std::fs::write(selected.join("Windower.exe"), []).unwrap();
+        for selected in [selected, root.join("missing selection")] {
+            let settings = Settings { launch_with: LaunchWith::Windower,
+                windower_path: selected.to_string_lossy().into_owned(), ..Settings::default() };
+            let state = completed_discovery(&settings, Detected { windower: Some(root.join("Windower")), ..Detected::default() });
+            assert_eq!(state.launch_plan(&settings, &retail()).unwrap().settings.windower, settings.windower_path);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn runtime_plan_rejects_stale_discovery_generation_settings_and_executable() {
+        let root = tool_fixture();
+        let settings = Settings { launch_with: LaunchWith::Windower, ..Settings::default() };
+        let mut state = completed_discovery(&settings, Detected { windower: Some(root.join("Windower")), ..Detected::default() });
+        state.generation += 1;
+        assert!(state.launch_plan(&settings, &retail()).unwrap().settings.windower.is_empty());
+        state.generation -= 1;
+        state.detected_for.as_mut().unwrap().1.windower = "previous selection".into();
+        assert!(state.launch_plan(&settings, &retail()).unwrap().settings.windower.is_empty());
+        state.detected_for.as_mut().unwrap().1 = settings.tool_settings();
+        std::fs::remove_file(root.join("Windower/Windower.exe")).unwrap();
+        assert!(state.launch_plan(&settings, &retail()).unwrap().settings.windower.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

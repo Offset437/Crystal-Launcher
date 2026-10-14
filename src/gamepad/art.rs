@@ -29,7 +29,7 @@ pub(crate) fn face_color(family: Family, b: Btn) -> Color {
             Btn::West => rgb(0xE68BC8),
             _ => rgb(0x3EC6A4),
         }
-    } else if family == Family::Xbox {
+    } else if family.is_xbox() {
         match b {
             Btn::South => rgb(0x6CC24A),
             Btn::East => rgb(0xE9493F),
@@ -112,6 +112,7 @@ pub(crate) fn stick_chip(ink: Color, accent: Color) -> String {
 #[derive(Clone, Copy)]
 enum Shape {
     Xbox,
+    Handheld,
     PlayStation,
     Generic,
 }
@@ -134,7 +135,7 @@ struct Palette {
 fn palette(shape: Shape, light: bool) -> Palette {
     let s = |v: u32| hex(rgb(v));
     match (shape, light) {
-        (Shape::Xbox, false) => Palette {
+        (Shape::Xbox | Shape::Handheld, false) => Palette {
             body_top: s(0x3B444E),
             body_bottom: s(0x1E252C),
             edge: s(0x56626E),
@@ -148,7 +149,7 @@ fn palette(shape: Shape, light: bool) -> Palette {
             symbol: rgb(0xC8D0D8),
             shadow: 0.45,
         },
-        (Shape::Xbox, true) => Palette {
+        (Shape::Xbox | Shape::Handheld, true) => Palette {
             body_top: s(0xFDFDFE),
             body_bottom: s(0xDCE2E7),
             edge: s(0xAFBAC4),
@@ -211,6 +212,7 @@ const XBOX_BODY: &str = "M300 78 C360 78 400 74 430 72 C480 68 515 85 530 115 C5
 const PS_BODY: &str = "M300 72 C360 72 410 66 446 66 C492 66 520 80 536 110 C562 160 590 268 590 322 C590 362 562 386 528 380 C498 374 480 350 462 324 C446 302 430 292 405 292 L195 292 C170 292 154 302 138 324 C120 350 102 374 72 380 C38 386 10 362 10 322 C10 268 38 160 64 110 C80 80 108 66 154 66 C190 66 240 72 300 72 Z";
 const PS_CORE: &str = "M196 96 L404 96 C420 96 426 110 428 128 C434 170 452 198 472 220 C490 242 488 272 464 285 C452 291 440 292 425 292 L175 292 C160 292 148 291 136 285 C112 272 110 242 128 220 C148 198 166 170 172 128 C174 110 180 96 196 96 Z";
 const GENERIC_BODY: &str = "M150 92 H450 C520 92 568 140 576 220 C584 300 548 352 494 352 C452 352 430 322 402 302 H198 C170 322 148 352 106 352 C52 352 16 300 24 220 C32 140 80 92 150 92 Z";
+const HANDHELD_BODY: &str = "M143 96 H457 C478 81 516 78 544 94 C570 109 580 139 580 178 L584 263 C587 305 572 338 548 346 C524 354 509 336 493 307 L470 277 H130 L107 307 C91 336 76 354 52 346 C28 338 13 305 16 263 L20 178 C20 139 30 109 56 94 C84 78 122 81 143 96 Z";
 
 struct Spots {
     ls: (f32, f32),
@@ -232,6 +234,15 @@ fn spots(shape: Shape) -> Spots {
             back: (262.0, 160.0),
             start: (338.0, 160.0),
             guide: (300.0, 112.0),
+        },
+        Shape::Handheld => Spots {
+            ls: (72.0, 155.0),
+            rs: (514.0, 244.0),
+            dpad: (83.0, 244.0),
+            face: (520.0, 153.0),
+            back: (122.0, 111.0),
+            start: (478.0, 111.0),
+            guide: (122.0, 143.0),
         },
         Shape::PlayStation => Spots {
             ls: (232.0, 240.0),
@@ -455,6 +466,7 @@ impl Ctx<'_> {
 fn shape_of(family: Family) -> Shape {
     match family {
         Family::Xbox => Shape::Xbox,
+        Family::RogXboxAlly | Family::RogXboxAllyX => Shape::Handheld,
         f if f.is_playstation() => Shape::PlayStation,
         _ => Shape::Generic,
     }
@@ -463,7 +475,18 @@ fn shape_of(family: Family) -> Shape {
 /// The full controller illustration (600x400) with `input` lit up.
 pub(crate) fn controller(family: Family, input: &Input, light: bool, accent: Color) -> String {
     let shape = shape_of(family);
-    let p = palette(shape, light);
+    // The Ally's white shell and Ally X's black shell identify the hardware;
+    // the surrounding UI theme does not change the device's case colour.
+    let mut p = palette(shape, if family.is_handheld() { family == Family::RogXboxAlly } else { light });
+    if family.is_handheld() {
+        p.well = hex(rgb(0x14191F));
+        p.cap_top = hex(rgb(0x424B54));
+        p.cap_bottom = hex(rgb(0x20262C));
+        p.cap_ring = hex(rgb(0x606B75));
+        p.button = rgb(0x242B32);
+        p.symbol = rgb(0xD6DEE5);
+        p.shadow = if light { 0.16 } else { 0.45 };
+    }
     let mut c = Ctx {
         s: String::with_capacity(16 * 1024),
         p,
@@ -479,6 +502,48 @@ pub(crate) fn controller(family: Family, input: &Input, light: bool, accent: Col
     );
     let sp = spots(shape);
     match shape {
+        Shape::Handheld => {
+            let trigger = "M24 120 C23 98 32 83 53 77 L110 74 C127 74 137 83 137 96 L133 106 L34 131 Z";
+            c.trigger(input.lt, trigger, false);
+            c.trigger(input.rt, trigger, true);
+            let _ = write!(
+                c.s,
+                r##"<g data-part="handheld"><title>{}</title><path d="{HANDHELD_BODY}" fill="url(#body)" stroke="{}" stroke-width="1.6"/><path d="M31 180 L27 262 C25 294 33 317 49 323 M569 180 L573 262 C575 294 567 317 551 323" fill="none" stroke="{}" stroke-width="1.4" opacity="0.65"/><rect x="140" y="96" width="320" height="182" rx="12" fill="{}" stroke="{}" stroke-width="1.5"/><rect data-part="handheld-screen" x="151" y="106" width="298" height="162" rx="4" fill="#0e171e"/>"##,
+                family.label(), c.p.edge, c.p.edge, c.p.well, c.p.edge
+            );
+            // Original geometric screen artwork, with no game or vendor assets.
+            let _ = write!(
+                c.s,
+                r#"<g fill="{}"><path d="M151 246 L209 195 L260 235 L328 169 L397 228 L449 195 V268 H151 Z" opacity="0.08"/><path d="M300 143 L327 175 L300 221 L273 175 Z" opacity="0.22"/><path d="M300 143 V221 M273 175 H327 M300 143 L288 175 L300 221 L312 175 Z" fill="none" stroke="{}" stroke-width="1" opacity="0.6"/></g><path d="M160 259 H440" stroke="{}" stroke-width="1" opacity="0.25"/>"#,
+                hex(accent), hex(accent), hex(accent)
+            );
+            let bumper = "M24 115 C29 99 42 91 59 89 L124 87 C132 87 136 92 133 98 L60 101 C46 102 38 108 34 121 Z";
+            c.bumper(Btn::LB, bumper, false);
+            c.bumper(Btn::RB, bumper, true);
+            c.pill(Btn::Back, sp.back, 16.0, 16.0, r#"<rect x="-3.6" y="-2.6" width="5" height="4" rx="0.6"/><rect x="-1.4" y="-0.6" width="5" height="4" rx="0.6"/>"#);
+            c.pill(Btn::Start, sp.start, 16.0, 16.0, r#"<path d="M-3.4 -2.4 H3.4 M-3.4 0 H3.4 M-3.4 2.4 H3.4"/>"#);
+            c.pill(Btn::Guide, sp.guide, 17.0, 17.0, r#"<circle r="5.6"/><path d="M-3.8 -3.8 L3.8 3.8 M3.8 -3.8 L-3.8 3.8"/>"#);
+            // Command Center and Library are device shortcuts, not generic
+            // gamepad buttons. Show their positions without claiming input.
+            let _ = write!(c.s, r#"<g fill="{}" stroke="{}" stroke-width="1"><rect x="114" y="168" width="16" height="14" rx="5"/><rect x="470" y="168" width="16" height="14" rx="5"/></g>"#, hex(c.p.button), c.p.edge);
+            let _ = write!(c.s, r#"<g stroke="{}" stroke-width="1" fill="none" opacity="0.7"><path d="M119 172 H125 M119 175 H125 M119 178 H125 M475 172 H481 V178 H475 Z"/></g>"#, hex(c.p.symbol));
+            for (x, y) in [(72, 155), (514, 244)] {
+                let _ = write!(c.s, r#"<circle cx="{x}" cy="{y}" r="36.5" fill="none" stroke="{}" stroke-width="2.5" opacity="0.65"/>"#, hex(accent));
+            }
+            c.stick(sp.ls, input.lx, input.ly, c.on(Btn::LS));
+            c.cross_dpad(sp.dpad);
+            c.stick(sp.rs, input.rx, input.ry, c.on(Btn::RS));
+            c.faces(sp.face, 24.0, 12.5);
+            // Speaker perforations are part of the front shell.
+            for x in [111, 472] {
+                for row in 0..3 {
+                    for column in 0..4 {
+                        let _ = write!(c.s, r#"<circle cx="{}" cy="{}" r="1.2" fill="{}" opacity="0.6"/>"#, x + column * 4, 259 + row * 4, c.p.edge);
+                    }
+                }
+            }
+            c.s.push_str("</g>");
+        }
         Shape::Xbox => {
             c.trigger(input.lt, "M98 96 C100 64 122 42 154 40 C182 38 200 50 204 72 L206 80 L98 104 Z", false);
             c.trigger(input.rt, "M98 96 C100 64 122 42 154 40 C182 38 200 50 204 72 L206 80 L98 104 Z", true);
@@ -586,13 +651,20 @@ mod tests {
         }
         input.lt = 0.5;
         input.lx = 1.0;
-        for family in [Family::Xbox, Family::DualSense, Family::DualShock4, Family::SwitchPro, Family::Generic] {
+        for family in [Family::Xbox, Family::RogXboxAlly, Family::RogXboxAllyX, Family::DualSense, Family::DualSenseEdge, Family::DualShock4, Family::SwitchPro, Family::Generic] {
             for light in [false, true] {
                 for inp in [Input::default(), input] {
                     let svg = controller(family, &inp, light, Color::from_rgb8(157, 213, 234));
                     assert!(svg.starts_with("<svg") && svg.ends_with("</svg>"));
                     assert_eq!(svg.matches("<svg").count(), 1);
                     assert!(!svg.contains("NaN"));
+                    let mut reader = quick_xml::Reader::from_str(&svg);
+                    loop {
+                        match reader.read_event().expect("valid controller SVG") {
+                            quick_xml::events::Event::Eof => break,
+                            _ => (),
+                        }
+                    }
                 }
             }
             for b in [Btn::South, Btn::East, Btn::West, Btn::North] {
@@ -611,5 +683,24 @@ mod tests {
         assert!(face_glyph(Family::Xbox, Btn::North).contains("L0 0.2"));
         assert!(face_glyph(Family::SwitchPro, Btn::West).contains("L0 0.2"));
         assert!(face_glyph(Family::DualSense, Btn::South).contains("M-5.5"));
+        for family in [Family::RogXboxAlly, Family::RogXboxAllyX] {
+            for b in [Btn::South, Btn::East, Btn::West, Btn::North] {
+                assert_eq!(face_glyph(family, b), face_glyph(Family::Xbox, b));
+                assert_eq!(face_color(family, b), face_color(Family::Xbox, b));
+            }
+        }
+    }
+
+    #[test]
+    fn gamepad_handheld_illustration_has_a_screen_and_distinct_case_colours() {
+        let render = |family| controller(family, &Input::default(), false, Color::from_rgb8(157, 213, 234));
+        let ally = render(Family::RogXboxAlly);
+        let ally_x = render(Family::RogXboxAllyX);
+        for svg in [&ally, &ally_x] {
+            assert!(svg.contains("data-part=\"handheld-screen\""));
+            assert!(svg.contains(HANDHELD_BODY));
+        }
+        assert_ne!(ally, ally_x);
+        assert!(!render(Family::Xbox).contains("data-part=\"handheld-screen\""));
     }
 }

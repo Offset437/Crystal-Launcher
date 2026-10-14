@@ -7,7 +7,8 @@ publish = false
 description = "32-bit FFXI game host using the installed PlayOnline core for retail authentication and sessions"
 
 [features]
-default = ["native-fast-login-poll"]
+# The default build steps polcore at the Viewer's 20 ms frame (pol-spec 07b decision 2).
+default = []
 # Temporary, content-free forwarding traces for server-settings live pilots.
 native-backup-diagnostics = []
 # Temporary socket-call metadata only; never changes native POL transport.
@@ -15,8 +16,8 @@ native-login-diagnostics = ["windows-sys/Win32_Networking_WinSock"]
 # A/B pilot only: disable Nagle on transient startup PML requests, with the
 # same read-only diagnostics as the control. Never enabled by default.
 native-login-nodelay = ["native-login-diagnostics"]
-# Faster initial sign-in and mail-list polling; mail transfers and idle retain Viewer cadence.
-# --no-default-features retains the original startup polling for comparison.
+# Comparison pilot only, never shipped: 1 ms initial sign-in and mail-list polling,
+# turnarounds no stock Viewer produces (07a stock-faithful-pacing).
 native-fast-login-poll = []
 
 # Own workspace root: this crate never joins the launcher build.
@@ -41,7 +42,10 @@ zeroize = { version = "=1.9.0", default-features = false, features = ["alloc", "
 windows-sys = { version = "=0.61.2", features = [
     "Win32_Foundation",
     "Win32_Globalization",
+    "Win32_Graphics_Gdi",
     "Win32_Security",
+    # BCryptHash: pins the exact Windower Hook.dll build (windower_exit.rs).
+    "Win32_Security_Cryptography",
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
     "Win32_System_Diagnostics_Debug",

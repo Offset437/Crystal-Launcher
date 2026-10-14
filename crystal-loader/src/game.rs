@@ -90,6 +90,8 @@ pub struct GameConfig {
     pub native_auth: Option<proto::NativeCredentials>,
     pub start_game: bool,
     pub keep_session: bool,
+    /// Session `viewer_gaps` (sign-in-only sessions; 07c §4).
+    pub viewer_gaps: bool,
     pub auto_away_minutes: u32,
     pub auto_login: proto::AutoLogin,
     pub selftest: bool,
@@ -416,8 +418,41 @@ unsafe fn table_slice(tbl: *mut usize, polcore: HMODULE) -> Result<&'static mut 
     Ok(std::slice::from_raw_parts_mut(tbl, TABLE_LEN))
 }
 
+/// The per-Play part of a parked host's session, from its `credentials` line
+/// (pol-spec 07d §1.2): the fields a direct `session` line gives `GameConfig`.
+pub struct Play {
+    pub native_auth: proto::NativeCredentials,
+    pub start_game: bool,
+    pub keep_session: bool,
+    pub viewer_gaps: bool,
+    pub auto_away_minutes: u32,
+}
+
 /// Runs the game to completion. Errors are plain stage descriptions (no secrets).
 pub fn run(mut cfg: GameConfig) -> Result<GameOutcome, String> {
+    run_with(&mut cfg, None)
+}
+
+/// A parked host (07d §1.3): the cold path's pre-credential part, then
+/// `ready(polcore creation time)` and window messages only until the Play.
+/// `cfg` carries the host fields; `play` gives the rest. A main thread that
+/// gives up (pipe closed, credentials rejected) ends it with EXIT_PIPE; nothing
+/// was networked and no polcore entry was called.
+pub fn run_parked(mut cfg: GameConfig, ready: std::sync::mpsc::Sender<std::time::Duration>, play: std::sync::mpsc::Receiver<Play>) -> Result<GameOutcome, String> {
+    let mut park = move |cfg: &mut GameConfig, polcore: std::time::Duration| {
+        let _ = ready.send(polcore);
+        let Some(play) = crate::park::wait_for_play(&play, crate::park::PUMP, &mut crate::native_auth::pump_idle_messages) else { return false };
+        cfg.native_auth = Some(play.native_auth);
+        (cfg.start_game, cfg.keep_session, cfg.viewer_gaps, cfg.auto_away_minutes) = (play.start_game, play.keep_session, play.viewer_gaps, play.auto_away_minutes);
+        true
+    };
+    run_with(&mut cfg, Some(&mut park))
+}
+
+/// Called once at the park end point; false when no Play will come.
+type ParkHook<'a> = &'a mut dyn FnMut(&mut GameConfig, std::time::Duration) -> bool;
+
+fn run_with(cfg: &mut GameConfig, park: Option<ParkHook<'_>>) -> Result<GameOutcome, String> {
     #[cfg(feature = "native-login-diagnostics")]
     let started = crate::startup_timing::Stamp::capture();
     // SAFETY: plain COM init on this thread.
@@ -428,13 +463,15 @@ pub fn run(mut cfg: GameConfig) -> Result<GameOutcome, String> {
         return Err(format!("CoInitializeEx failed (hr={hr:#010x})"));
     }
     log!("stage: COM initialised (STA)");
-    let result = run_in_apartment(&mut cfg);
+    let result = run_in_apartment(cfg, park);
     // SAFETY: balances CoInitializeEx above.
     unsafe { CoUninitialize() };
     result
 }
 
-fn run_in_apartment(cfg: &mut GameConfig) -> Result<GameOutcome, String> {
+fn run_in_apartment(cfg: &mut GameConfig, park: Option<ParkHook<'_>>) -> Result<GameOutcome, String> {
+    // A park exists only for a native sign-in (07d §1.1).
+    let native_host = cfg.native_auth.is_some() || park.is_some();
     let region = cfg.region;
     let area = region.area_code();
     if region != Region::Us {
@@ -459,11 +496,15 @@ fn run_in_apartment(cfg: &mut GameConfig) -> Result<GameOutcome, String> {
     // --- polcore ---
     let polcore_name = if region == Region::Eu { "polcoreEU.dll" } else { "polcore.dll" };
     let polcore_path = viewer.join("viewer").join("com").join(polcore_name);
+    let polcore_started = Instant::now();
     let polcore = if cfg.pol_install_dir.is_some() {
         create_from_dll(&CLSID_POLCORE[area as usize], &IID_POLCORE[area as usize], &polcore_path, "polcore")?
     } else {
         create(&CLSID_POLCORE[area as usize], &IID_POLCORE[area as usize], &polcore_path, "polcore")?
     };
+    // Includes polcore's second-boundary spin (0.1-0.7 s; 08 §2), which a park absorbs.
+    let polcore_time = polcore_started.elapsed();
+    log!("local launch timing: polcore created in {:.3}s", polcore_time.as_secs_f64());
     let wname = wide(polcore_name);
     // SAFETY: NUL-terminated name.
     let pmod = unsafe { GetModuleHandleW(wname.as_ptr()) };
@@ -504,7 +545,7 @@ fn run_in_apartment(cfg: &mut GameConfig) -> Result<GameOutcome, String> {
     // SAFETY: validated against polcore's image before use.
     let table = unsafe { table_slice(tbl, pmod)? };
     log!("stage: polcore SetAreaCode/SetParamInit done; function table at {:#x}", tbl as usize);
-    if cfg.native_auth.is_some() {
+    if native_host {
         crate::native_auth::validate_entries(table,module_image(pmod).0)?;
     }
 
@@ -512,13 +553,24 @@ fn run_in_apartment(cfg: &mut GameConfig) -> Result<GameOutcome, String> {
     // forwarding imports stay valid for the process lifetime, including error
     // teardown and native worker calls; dropping this guard only stops logging.
     #[cfg(feature = "native-login-diagnostics")]
-    let socket_trace = if cfg.native_auth.is_some() {
+    let socket_trace = if native_host {
         let (base, size, _) = module_image(pmod);
         match unsafe { crate::native_socket_trace::Recording::install(base, size) } {
             Ok(trace) => Some(trace),
             Err(error) => { log!("native POL socket trace unavailable: {error}"); None }
         }
     } else { None };
+
+    // --- park end point (07d §1.3 step 3): polcore and its validated table
+    // only. No restore_viewer_policy, no bootstrap, no member select, no Open
+    // and no entry call of any kind until the credentials arrive.
+    if let Some(park) = park {
+        if !park(cfg, polcore_time) {
+            log!("stage: parked host released without a Play; nothing was networked");
+            return Ok(GameOutcome { code: crate::EXIT_PIPE, message: String::new(), game_returned: false });
+        }
+        if cfg.native_auth.is_none() { return Err("The parked host received no credentials.".into()); }
+    }
 
     // --- native: the Viewer's own startup and sign-in (pol-spec 01 §8) ---
     let mut native = if let Some(credentials) = cfg.native_auth.take() {
@@ -530,6 +582,7 @@ fn run_in_apartment(cfg: &mut GameConfig) -> Result<GameOutcome, String> {
         let mut session = unsafe { crate::native_auth::NativeSession::bootstrap(table, base, &viewer, viewer_c, regkey, area, pol_language(area, lang), cfg.auto_away_minutes)? };
         #[cfg(feature = "native-login-diagnostics")]
         crate::startup_timing::report("native-bootstrap-complete", bootstrap_started, crate::startup_timing::Stamp::capture());
+        session.set_viewer_gaps(cfg.viewer_gaps);
         let signed_in = session.sign_in(credentials);
         #[cfg(feature = "native-login-diagnostics")]
         if let Some(trace) = &socket_trace { trace.finish_startup(); }
@@ -671,6 +724,7 @@ fn run_game(polcore: &Com, ffxi_dir: &Path, table: &[usize], mut native: Option<
     }
     crate::events::send(proto::started_line(std::process::id()));
     let auto_login = crate::auto_login::Worker::start(auto_login);
+    let live_controller = crate::controller_settings::Worker::start();
     log!("stage: calling FFXiEntry::GameStart");
     let mut message: *mut c_void = std::ptr::null_mut();
     // SAFETY: IFFXiEntry::GameStart(this, IUnknown* pol, IUnknown** msg); blocks for the session.
@@ -679,6 +733,7 @@ fn run_game(polcore: &Com, ffxi_dir: &Path, table: &[usize], mut native: Option<
         start(ffxi.0, polcore.0, &mut message)
     };
     // Stop all input before game callbacks/interfaces can be detached or freed.
+    drop(live_controller);
     drop(auto_login);
     if let Some(observer) = lobby_observer { observer.finish(); }
     drop(native_friends);

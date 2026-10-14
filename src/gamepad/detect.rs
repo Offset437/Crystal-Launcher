@@ -4,6 +4,9 @@ use crate::i18n::{t, tf};
 use std::sync::{mpsc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+#[path = "hardware.rs"]
+mod hardware;
+
 /// Logical controls in SDL's positional naming (South is the bottom face
 /// button: A on Xbox, Cross on PlayStation, B on Nintendo).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -62,6 +65,8 @@ impl Btn {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Family {
     Xbox,
+    RogXboxAlly,
+    RogXboxAllyX,
     DualSense,
     DualSenseEdge,
     DualShock4,
@@ -73,6 +78,8 @@ impl Family {
     pub(crate) fn label(self) -> &'static str {
         match self {
             Family::Xbox => "Xbox",
+            Family::RogXboxAlly => "ROG Xbox Ally",
+            Family::RogXboxAllyX => "ROG Xbox Ally X",
             Family::DualSense => "PlayStation DualSense",
             Family::DualSenseEdge => "PlayStation DualSense Edge",
             Family::DualShock4 => "PlayStation DualShock 4",
@@ -83,6 +90,36 @@ impl Family {
     pub(crate) fn is_playstation(self) -> bool {
         matches!(self, Family::DualSense | Family::DualSenseEdge | Family::DualShock4)
     }
+    pub(crate) fn is_xbox(self) -> bool {
+        matches!(self, Family::Xbox | Family::RogXboxAlly | Family::RogXboxAllyX)
+    }
+    pub(crate) fn is_handheld(self) -> bool {
+        matches!(self, Family::RogXboxAlly | Family::RogXboxAllyX)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BatterySource {
+    Controller,
+    Handheld,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum BatteryState {
+    #[default]
+    Unknown,
+    Charging,
+    Discharging,
+    Idle,
+}
+
+/// WGI's low-cost controller reports are discrete levels, not measured %.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BatteryLevel {
+    Critical,
+    Low,
+    Medium,
+    Full,
 }
 
 /// Classifies by USB ids, falling back to the device name.
@@ -139,18 +176,46 @@ pub(crate) struct Pad {
     /// `Some(true)` wireless, `Some(false)` cable, `None` unknown.
     pub wireless: Option<bool>,
     pub battery: Option<u8>,
+    pub battery_source: Option<BatterySource>,
+    pub battery_state: BatteryState,
+    pub battery_level: Option<BatteryLevel>,
     pub rumble: bool,
     pub input: Input,
 }
 
 impl Pad {
     pub(crate) fn connection(&self) -> String {
-        match (self.wireless, self.battery) {
-            (Some(false), _) => t("Wired (USB)").into(),
-            (Some(true), Some(b)) => tf("Wireless · battery {percent}%", &[("percent", &b)]),
-            (Some(true), None) => t("Wireless").into(),
-            (None, _) => t("Connected").into(),
+        let transport = if self.family.is_handheld() {
+            t("Built-in")
+        } else {
+            match self.wireless {
+                Some(false) => t("Wired"),
+                Some(true) => t("Wireless"),
+                None => t("Connected"),
+            }
+        };
+        let handheld = self.battery_source == Some(BatterySource::Handheld);
+        let battery = match (self.battery.filter(|p| *p <= 100), self.battery_level) {
+            (Some(b), _) if handheld => tf("Handheld battery {percent}%", &[("percent", &b)]),
+            (Some(b), _) => tf("Controller battery {percent}%", &[("percent", &b)]),
+            (_, Some(level)) => {
+                let label = match level {
+                    BatteryLevel::Critical => t("Critical"),
+                    BatteryLevel::Low => t("Low"),
+                    BatteryLevel::Medium => t("Medium"),
+                    BatteryLevel::Full => t("Full"),
+                };
+                tf("Controller battery: {level}", &[("level", &label)])
+            }
+            _ if handheld => t("Handheld battery unavailable").into(),
+            _ => t("Controller battery unavailable").into(),
+        };
+        let mut connection = format!("{transport} · {battery}");
+        if self.battery_state == BatteryState::Charging {
+            connection.push_str(" · ");
+            connection.push_str(t("Charging"));
         }
+        connection
     }
 }
 
@@ -193,8 +258,8 @@ fn sony_extra_buttons(family: Family, buttons: impl IntoIterator<Item = (u32, bo
     })
 }
 
-fn read_pad(id: gilrs::GamepadId, g: &gilrs::Gamepad) -> Pad {
-    use gilrs::{Axis, Button, PowerInfo};
+fn read_pad(id: gilrs::GamepadId, g: &gilrs::Gamepad, hardware: &hardware::Snapshot) -> Pad {
+    use gilrs::{Axis, Button};
     const MAP: [(Button, Btn); 17] = [
         (Button::South, Btn::South),
         (Button::East, Btn::East),
@@ -215,7 +280,7 @@ fn read_pad(id: gilrs::GamepadId, g: &gilrs::Gamepad) -> Pad {
         (Button::Mode, Btn::Guide),
     ];
     let (vid, pid) = (g.vendor_id(), g.product_id());
-    let family = classify(vid, pid, g.name());
+    let (family, wireless, power) = hardware.metadata(vid, pid, g.name());
     let mut input = Input::default();
     for (gb, b) in MAP {
         if g.is_pressed(gb) {
@@ -242,12 +307,6 @@ fn read_pad(id: gilrs::GamepadId, g: &gilrs::Gamepad) -> Pad {
     input.ly = q(g.value(Axis::LeftStickY));
     input.rx = q(g.value(Axis::RightStickX));
     input.ry = q(g.value(Axis::RightStickY));
-    let (wireless, battery) = match g.power_info() {
-        PowerInfo::Wired => (Some(false), None),
-        PowerInfo::Discharging(p) | PowerInfo::Charging(p) => (Some(true), Some(p)),
-        PowerInfo::Charged => (Some(true), Some(100)),
-        PowerInfo::Unknown => (None, None),
-    };
     Pad {
         id: usize::from(id),
         name: g.name().to_string(),
@@ -255,18 +314,32 @@ fn read_pad(id: gilrs::GamepadId, g: &gilrs::Gamepad) -> Pad {
         vid,
         pid,
         wireless,
-        battery,
+        battery: power.percent,
+        battery_source: power.source,
+        battery_state: power.state,
+        battery_level: power.level,
         rumble: g.is_ff_supported(),
         input,
     }
 }
 
-fn snapshot(gilrs: &gilrs::Gilrs) -> Vec<Pad> {
+fn snapshot(gilrs: &gilrs::Gilrs, hardware: &hardware::Snapshot) -> Vec<Pad> {
     gilrs
         .gamepads()
         .filter(|(_, g)| g.is_connected())
-        .map(|(id, g)| read_pad(id, &g))
+        .map(|(id, g)| read_pad(id, &g, hardware))
         .collect()
+}
+
+fn publish_change(last: &mut Option<Vec<Pad>>, now: Vec<Pad>, emit: &mut impl FnMut(Vec<Pad>) -> bool) -> bool {
+    if last.as_ref() == Some(&now) {
+        return true;
+    }
+    if !emit(now.clone()) {
+        return false;
+    }
+    *last = Some(now);
+    true
 }
 
 fn play_rumble(gilrs: &mut gilrs::Gilrs, id: usize) -> Option<gilrs::ff::Effect> {
@@ -296,8 +369,8 @@ fn play_rumble(gilrs: &mut gilrs::Gilrs, id: usize) -> Option<gilrs::ff::Effect>
 }
 
 /// Runs the controller thread, calling `emit` with the full list whenever a
-/// controller connects, disconnects or changes input. Returns when `emit`
-/// reports the receiver is gone.
+/// controller connects, disconnects, changes input, or changes reported power
+/// or transport. Returns when `emit` reports the receiver is gone.
 pub(crate) fn run(mut emit: impl FnMut(Vec<Pad>) -> bool) {
     let mut gilrs = match gilrs::Gilrs::new() {
         Ok(g) => g,
@@ -313,35 +386,28 @@ pub(crate) fn run(mut emit: impl FnMut(Vec<Pad>) -> bool) {
     }
     let mut last: Option<Vec<Pad>> = None;
     let mut effects: Vec<(Instant, gilrs::ff::Effect)> = Vec::new();
+    let mut hardware = hardware::Snapshot::refresh();
     let mut last_power = Instant::now();
     loop {
-        while gilrs.next_event().is_some() {}
+        let mut topology_changed = false;
+        while let Some(event) = gilrs.next_event() {
+            topology_changed |= matches!(event.event, gilrs::EventType::Connected | gilrs::EventType::Disconnected);
+        }
         while let Ok(Command::Rumble(id)) = rx.try_recv() {
             if let Some(e) = play_rumble(&mut gilrs, id) {
                 effects.push((Instant::now(), e));
             }
         }
         effects.retain(|(t, _)| t.elapsed() < Duration::from_secs(1));
-        let mut now = snapshot(&gilrs);
-        // Battery level changes slowly; refresh it every few seconds only, so
-        // it never costs a redraw on its own.
-        if let Some(prev) = &last {
-            if last_power.elapsed() < Duration::from_secs(5) {
-                for p in &mut now {
-                    if let Some(old) = prev.iter().find(|o| o.id == p.id) {
-                        p.battery = old.battery;
-                        p.wireless = old.wireless;
-                    }
-                }
-            } else {
-                last_power = Instant::now();
-            }
+        // Poll battery/transport independently of input; emit changes even if
+        // the controller has stayed untouched throughout the interval.
+        if topology_changed || last_power.elapsed() >= Duration::from_secs(5) {
+            hardware = hardware::Snapshot::refresh();
+            last_power = Instant::now();
         }
-        if last.as_ref() != Some(&now) {
-            if !emit(now.clone()) {
-                break;
-            }
-            last = Some(now);
+        let now = snapshot(&gilrs, &hardware);
+        if !publish_change(&mut last, now, &mut emit) {
+            break;
         }
         std::thread::sleep(Duration::from_millis(16));
     }
@@ -353,6 +419,71 @@ pub(crate) fn run(mut emit: impl FnMut(Vec<Pad>) -> bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pad() -> Pad {
+        Pad {
+            id: 0, name: "Xbox Controller".into(), family: Family::Xbox,
+            vid: Some(0x045e), pid: Some(0x0b12), wireless: None, battery: None,
+            battery_source: Some(BatterySource::Controller), battery_state: BatteryState::Unknown,
+            battery_level: None, rumble: false, input: Input::default(),
+        }
+    }
+
+    #[test]
+    fn gamepad_connection_does_not_infer_transport_from_charging() {
+        let mut controller = pad();
+        controller.battery = Some(42);
+        controller.battery_state = BatteryState::Charging;
+        for (wireless, prefix) in [(Some(false), "Wired"), (Some(true), "Wireless"), (None, "Connected")] {
+            controller.wireless = wireless;
+            let label = controller.connection();
+            assert!(label.starts_with(prefix));
+            assert!(label.contains("Controller battery 42%"));
+            assert!(label.ends_with("Charging"));
+        }
+    }
+
+    #[test]
+    fn gamepad_connection_names_handheld_source_and_missing_battery() {
+        let mut controller = pad();
+        controller.family = Family::RogXboxAlly;
+        controller.battery_source = Some(BatterySource::Handheld);
+        controller.battery_state = BatteryState::Idle;
+        assert_eq!(controller.connection(), "Built-in · Handheld battery unavailable");
+        controller.battery = Some(42);
+        assert_eq!(controller.connection(), "Built-in · Handheld battery 42%");
+        controller.battery = Some(255);
+        assert!(!controller.connection().contains("255%"));
+    }
+
+    #[test]
+    fn gamepad_connection_labels_coarse_full_without_a_percentage() {
+        let mut controller = pad();
+        controller.wireless = Some(true);
+        controller.battery_level = Some(BatteryLevel::Full);
+        assert_eq!(controller.connection(), "Wireless · Controller battery: Full");
+        assert!(!controller.connection().contains('%'));
+        controller.battery_level = None;
+        assert_eq!(controller.connection(), "Wireless · Controller battery unavailable");
+    }
+
+    #[test]
+    fn gamepad_worker_publishes_battery_changes_without_input_changes() {
+        let first = pad();
+        let mut previous = None;
+        let mut published = Vec::new();
+        let mut emit = |pads| { published.push(pads); true };
+        assert!(publish_change(&mut previous, vec![first.clone()], &mut emit));
+        assert!(publish_change(&mut previous, vec![first.clone()], &mut emit));
+        let mut next = first.clone();
+        next.battery = Some(42);
+        assert_eq!(first.input, next.input);
+        assert!(publish_change(&mut previous, vec![next], &mut emit));
+        let mut next = first.clone();
+        next.battery_state = BatteryState::Charging;
+        assert!(publish_change(&mut previous, vec![next], &mut emit));
+        assert_eq!(published.len(), 3);
+    }
 
     #[test]
     fn gamepad_classifies_by_usb_ids() {
@@ -397,7 +528,7 @@ mod tests {
             while gilrs.next_event().is_some() {}
             std::thread::sleep(Duration::from_millis(10));
         }
-        let pads = snapshot(&gilrs);
+        let pads = snapshot(&gilrs, &hardware::Snapshot::refresh());
         println!("{} controller(s)", pads.len());
         for p in &pads {
             println!(

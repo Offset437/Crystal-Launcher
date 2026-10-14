@@ -1893,117 +1893,137 @@ fn shared_banner_aspect(sizes: &[(u32, u32)]) -> f32 {
 /// and width step.
 fn banner_fit(source: Option<&image::Handle>, grid: NewsGrid, fill: Color) -> Option<image::Handle> {
     use std::sync::{Mutex, OnceLock};
-    type Key = (u64, u32, u32, u32, [u8; 4]);
-    static CACHE: OnceLock<Mutex<Lru<Key, image::Handle>>> = OnceLock::new();
-    static DECODED: OnceLock<Mutex<Lru<u64, std::sync::Arc<imagecrate::RgbaImage>>>> =
-        OnceLock::new();
-    let display_w = grid.card_w - 2.0;
-    if display_w < 1.0 || !(grid.aspect > 0.0) {
-        return None;
+    static CACHE: OnceLock<Mutex<BannerCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(BannerCache::new())).lock().ok()?.fit(source, grid, fill)
+}
+
+type BannerKey = (u64, u32, u32, u32, [u8; 4]);
+const FITTED_BANNER_BYTES: usize = 24 * 1_048_576;
+const DECODED_BANNER_BYTES: usize = 12 * 1_048_576;
+
+struct BannerCache {
+    fitted: Lru<BannerKey, image::Handle>,
+    decoded: Lru<u64, std::sync::Arc<imagecrate::RgbaImage>>,
+}
+impl BannerCache {
+    fn new() -> Self {
+        Self {
+            // Enough for three visible banners at their largest 2x size;
+            // resizing and switching feeds must not retain every old canvas.
+            fitted: Lru::new(64, FITTED_BANNER_BYTES),
+            decoded: Lru::new(12, DECODED_BANNER_BYTES),
+        }
     }
-    // Width steps of 64 px keep a window drag from re-baking every frame;
-    // iced scales the bucketed texture to the exact card width on the GPU.
-    let canvas_w = (((display_w * 2.0) / 64.0).ceil() as u32 * 64).clamp(64, 1536);
-    let canvas_h = ((canvas_w as f32 / grid.aspect).round() as u32).max(1);
-    // The radius depends on the bucket alone (not the exact card width), so
-    // every width in a bucket shares one cache entry. Past the 1536 px cap
-    // the on-screen scale is bucketed too.
-    let shown_w = if display_w * 2.0 > 1536.0 {
-        (display_w / 64.0).ceil() * 64.0
-    } else {
-        canvas_w as f32 / 2.0
-    };
-    let radius = ((NEWS_RADIUS - 1.0) * canvas_w as f32 / shown_w).round();
-    let rgba8 = fill.into_rgba8();
-    let key = (source.map_or(0, image_key), canvas_w, canvas_h, radius as u32, rgba8);
-    let cache = CACHE.get_or_init(|| Mutex::new(Lru::new(64)));
-    if let Some(hit) = cache.lock().ok()?.get(&key) {
-        return Some(hit.clone());
-    }
-    let mut out = imagecrate::RgbaImage::from_pixel(canvas_w, canvas_h, imagecrate::Rgba(rgba8));
-    if let Some(source) = source {
-        // The decoded pixels are kept per source image, so a new size never
-        // decodes the PNG/JPEG again.
-        let decoded = DECODED.get_or_init(|| Mutex::new(Lru::new(12)));
-        let src_key = image_key(source);
-        let cached = decoded.lock().ok()?.get(&src_key).cloned();
-        let rgba = match cached {
-            Some(hit) => hit,
-            None => {
-                let img = match source {
-                    image::Handle::Rgba {
-                        width,
-                        height,
-                        pixels,
-                        ..
-                    } => imagecrate::RgbaImage::from_raw(*width, *height, pixels.to_vec())?,
-                    image::Handle::Bytes(_, bytes) => {
-                        imagecrate::load_from_memory(bytes).ok()?.to_rgba8()
-                    }
-                    image::Handle::Path(_, path) => imagecrate::open(path).ok()?.to_rgba8(),
-                };
-                let img = std::sync::Arc::new(img);
-                if let Ok(mut map) = decoded.lock() {
-                    map.insert(src_key, img.clone());
-                }
-                img
-            }
-        };
-        let (sw, sh) = (rgba.width() as f32, rgba.height() as f32);
-        if sw < 1.0 || sh < 1.0 {
+
+    fn fit(&mut self, source: Option<&image::Handle>, grid: NewsGrid, fill: Color) -> Option<image::Handle> {
+        let display_w = grid.card_w - 2.0;
+        if display_w < 1.0 || !(grid.aspect > 0.0) {
             return None;
         }
-        // Contain: the whole image, centred, on the fill.
-        let k = (canvas_w as f32 / sw).min(canvas_h as f32 / sh);
-        let (fw, fh) = (
-            ((sw * k).round() as u32).clamp(1, canvas_w),
-            ((sh * k).round() as u32).clamp(1, canvas_h),
-        );
-        let fitted = if (fw, fh) == (rgba.width(), rgba.height()) {
-            (*rgba).clone()
+        // Width steps of 64 px keep a window drag from re-baking every frame;
+        // iced scales the bucketed texture to the exact card width on the GPU.
+        let canvas_w = (((display_w * 2.0) / 64.0).ceil() as u32 * 64).clamp(64, 1536);
+        let canvas_h = ((canvas_w as f32 / grid.aspect).round() as u32).max(1);
+        // The radius depends on the bucket alone (not the exact card width), so
+        // every width in a bucket shares one cache entry. Past the 1536 px cap
+        // the on-screen scale is bucketed too.
+        let shown_w = if display_w * 2.0 > 1536.0 {
+            (display_w / 64.0).ceil() * 64.0
         } else {
-            imagecrate::imageops::resize(&*rgba, fw, fh, imagecrate::imageops::FilterType::CatmullRom)
+            canvas_w as f32 / 2.0
         };
-        imagecrate::imageops::overlay(
-            &mut out,
-            &fitted,
-            ((canvas_w - fw) / 2) as i64,
-            ((canvas_h - fh) / 2) as i64,
-        );
-    }
-    // Anti-aliased top corners, in image pixels.
-    let r = radius;
-    let ri = r.ceil() as u32;
-    let ow = out.width();
-    for y in 0..ri.min(out.height()) {
-        for x in 0..ri.min(ow) {
-            let dx = r - (x as f32 + 0.5);
-            let dy = r - (y as f32 + 0.5);
-            let cover = (r - (dx * dx + dy * dy).sqrt() + 0.5).clamp(0.0, 1.0);
-            if cover < 1.0 {
-                for px in [x, ow - 1 - x] {
-                    let p = out.get_pixel_mut(px, y);
-                    p.0[3] = (p.0[3] as f32 * cover).round() as u8;
+        let radius = ((NEWS_RADIUS - 1.0) * canvas_w as f32 / shown_w).round();
+        let rgba8 = fill.into_rgba8();
+        let key = (source.map_or(0, image_key), canvas_w, canvas_h, radius as u32, rgba8);
+        if let Some(hit) = self.fitted.get(&key) {
+            return Some(hit.clone());
+        }
+        let mut out = imagecrate::RgbaImage::from_pixel(canvas_w, canvas_h, imagecrate::Rgba(rgba8));
+        if let Some(source) = source {
+            // Feed images already own decoded RGBA pixels. Borrow those directly;
+            // only encoded images need a separate decoded cache.
+            let decoded = if matches!(source, image::Handle::Rgba { .. }) {
+                None
+            } else {
+                let src_key = image_key(source);
+                Some(match self.decoded.get(&src_key).cloned() {
+                    Some(hit) => hit,
+                    None => {
+                        let img = match source {
+                            image::Handle::Bytes(_, bytes) => imagecrate::load_from_memory(bytes).ok()?.to_rgba8(),
+                            image::Handle::Path(_, path) => imagecrate::open(path).ok()?.to_rgba8(),
+                            image::Handle::Rgba { .. } => unreachable!(),
+                        };
+                        let img = std::sync::Arc::new(img);
+                        self.decoded.insert(src_key, img.clone(), img.as_raw().len());
+                        img
+                    }
+                })
+            };
+            let (width, height, pixels) = match source {
+                image::Handle::Rgba { width, height, pixels, .. } => (*width, *height, pixels.as_ref()),
+                _ => {
+                    let rgba = decoded.as_ref()?;
+                    (rgba.width(), rgba.height(), rgba.as_raw().as_slice())
+                }
+            };
+            let rgba = imagecrate::ImageBuffer::<imagecrate::Rgba<u8>, _>::from_raw(width, height, pixels)?;
+            let (sw, sh) = (rgba.width() as f32, rgba.height() as f32);
+            if sw < 1.0 || sh < 1.0 {
+                return None;
+            }
+            // Contain: the whole image, centred, on the fill.
+            let k = (canvas_w as f32 / sw).min(canvas_h as f32 / sh);
+            let (fw, fh) = (
+                ((sw * k).round() as u32).clamp(1, canvas_w),
+                ((sh * k).round() as u32).clamp(1, canvas_h),
+            );
+            let offset = (((canvas_w - fw) / 2) as i64, ((canvas_h - fh) / 2) as i64);
+            if (fw, fh) == (rgba.width(), rgba.height()) {
+                imagecrate::imageops::overlay(&mut out, &rgba, offset.0, offset.1);
+            } else {
+                let fitted = imagecrate::imageops::resize(&rgba, fw, fh, imagecrate::imageops::FilterType::CatmullRom);
+                imagecrate::imageops::overlay(&mut out, &fitted, offset.0, offset.1);
+            }
+        }
+        // Anti-aliased top corners, in image pixels.
+        let r = radius;
+        let ri = r.ceil() as u32;
+        let ow = out.width();
+        for y in 0..ri.min(out.height()) {
+            for x in 0..ri.min(ow) {
+                let dx = r - (x as f32 + 0.5);
+                let dy = r - (y as f32 + 0.5);
+                let cover = (r - (dx * dx + dy * dy).sqrt() + 0.5).clamp(0.0, 1.0);
+                if cover < 1.0 {
+                    for px in [x, ow - 1 - x] {
+                        let p = out.get_pixel_mut(px, y);
+                        p.0[3] = (p.0[3] as f32 * cover).round() as u8;
+                    }
                 }
             }
         }
+        let bytes = out.as_raw().len();
+        let handle = image::Handle::from_rgba(out.width(), out.height(), out.into_raw());
+        self.fitted.insert(key, handle.clone(), bytes);
+        Some(handle)
     }
-    let handle = image::Handle::from_rgba(out.width(), out.height(), out.into_raw());
-    if let Ok(mut map) = cache.lock() {
-        map.insert(key, handle.clone());
-    }
-    Some(handle)
 }
-/// A small bounded map that evicts the least recently used entry.
+/// Image caches need a byte limit as well as an entry limit: a window resize
+/// can otherwise keep dozens of multi-megabyte canvases alive.
 struct Lru<K, V> {
     cap: usize,
+    max_bytes: usize,
+    bytes: usize,
     tick: u64,
-    map: std::collections::HashMap<K, (V, u64)>,
+    map: std::collections::HashMap<K, (V, u64, usize)>,
 }
 impl<K: std::hash::Hash + Eq + Clone, V> Lru<K, V> {
-    fn new(cap: usize) -> Self {
+    fn new(cap: usize, max_bytes: usize) -> Self {
         Self {
             cap,
+            max_bytes,
+            bytes: 0,
             tick: 0,
             map: Default::default(),
         }
@@ -2011,22 +2031,29 @@ impl<K: std::hash::Hash + Eq + Clone, V> Lru<K, V> {
     fn get(&mut self, key: &K) -> Option<&V> {
         self.tick += 1;
         let tick = self.tick;
-        self.map.get_mut(key).map(|(v, used)| {
+        self.map.get_mut(key).map(|(v, used, _)| {
             *used = tick;
             &*v
         })
     }
-    fn insert(&mut self, key: K, value: V) {
+    fn insert(&mut self, key: K, value: V, bytes: usize) {
+        if let Some((_, _, old_bytes)) = self.map.remove(&key) {
+            self.bytes -= old_bytes;
+        }
+        if bytes > self.max_bytes { return; }
         self.tick += 1;
-        self.map.insert(key, (value, self.tick));
-        while self.map.len() > self.cap {
+        self.map.insert(key, (value, self.tick, bytes));
+        self.bytes += bytes;
+        while self.map.len() > self.cap || self.bytes > self.max_bytes {
             let oldest = self
                 .map
                 .iter()
-                .min_by_key(|(_, (_, used))| *used)
+                .min_by_key(|(_, (_, used, _))| *used)
                 .map(|(k, _)| k.clone());
             match oldest {
-                Some(k) => self.map.remove(&k),
+                Some(k) => {
+                    if let Some((_, _, bytes)) = self.map.remove(&k) { self.bytes -= bytes; }
+                }
                 None => break,
             };
         }
@@ -2120,6 +2147,67 @@ fn wrap_lines(text: &str, width: f32, size: f32, max_lines: usize) -> Vec<String
 #[cfg(test)]
 mod news_card_tests {
     use super::*;
+
+    fn grid(card_w: f32, aspect: f32) -> NewsGrid {
+        NewsGrid { s: 1.0, cols: 3, card_w, aspect, card_h: 300.0 }
+    }
+
+    #[test]
+    fn decoded_feed_pixels_are_borrowed_and_match_encoded_banners() {
+        let pixels = imagecrate::RgbaImage::from_fn(256, 128, |x, y| {
+            imagecrate::Rgba([x as u8, y as u8, 140, 255])
+        });
+        let mut png = std::io::Cursor::new(Vec::new());
+        imagecrate::DynamicImage::ImageRgba8(pixels.clone())
+            .write_to(&mut png, imagecrate::ImageFormat::Png).unwrap();
+        let raw = image::Handle::from_rgba(256, 128, pixels.into_raw());
+        let encoded = image::Handle::from_bytes(png.into_inner());
+        let mut cache = BannerCache::new();
+        let size = grid(130.0, 2.0);
+        let raw_banner = cache.fit(Some(&raw), size, Color::BLACK).unwrap();
+        assert!(cache.decoded.map.is_empty(), "feed pixels must not be copied into another cache");
+        let encoded_banner = cache.fit(Some(&encoded), size, Color::BLACK).unwrap();
+        let image::Handle::Rgba { width, height, pixels, .. } = &raw_banner else { panic!() };
+        let image::Handle::Rgba { pixels: encoded_pixels, .. } = &encoded_banner else { panic!() };
+        assert_eq!((*width, *height), (256, 128));
+        assert_eq!(pixels.as_ref(), encoded_pixels.as_ref());
+        assert_eq!(&pixels[(64 * 256 + 100) * 4..][..4], &[100, 64, 140, 255]);
+        assert_eq!(pixels[3], 0, "top corners remain rounded");
+        assert_eq!(pixels[(127 * 256) * 4 + 3], 255, "bottom corners remain square");
+        assert_eq!(cache.fit(Some(&raw), size, Color::BLACK).unwrap().id(), raw_banner.id());
+    }
+
+    #[test]
+    fn banner_cache_stays_bounded_across_window_resizes_and_themes() {
+        let mut cache = BannerCache::new();
+        for aspect in [1.2, 2.0, 3.0] {
+            for card_w in (258..=770).step_by(64) {
+                for fill in [Color::BLACK, Color::WHITE, DEEP] {
+                    cache.fit(None, grid(card_w as f32, aspect), fill).unwrap();
+                    assert!(cache.fitted.bytes <= FITTED_BANNER_BYTES);
+                    assert!(cache.fitted.map.len() <= 64);
+                }
+            }
+        }
+        assert!(cache.fitted.map.len() < 64, "large canvases must hit the byte limit first");
+        assert!(cache.decoded.map.is_empty());
+    }
+
+    #[test]
+    fn image_cache_accounts_for_replacements_and_recently_used_entries() {
+        let mut cache = Lru::new(10, 10);
+        cache.insert(1, "first", 4);
+        cache.insert(2, "second", 4);
+        assert_eq!(cache.get(&1), Some(&"first"));
+        cache.insert(3, "third", 4);
+        assert_eq!(cache.get(&2), None);
+        assert_eq!(cache.bytes, 8);
+        cache.insert(1, "smaller replacement", 1);
+        assert_eq!(cache.bytes, 5);
+        cache.insert(4, "too large to retain", 11);
+        assert_eq!(cache.get(&4), None);
+        assert_eq!(cache.bytes, 5);
+    }
 
     #[test]
     fn maintenance_metadata_uses_a_short_date() {
@@ -2452,14 +2540,15 @@ fn play_bar(app: &App) -> Element<'_, Message> {
     let starting_row = targets.iter().find(|a| a.game_start_pending());
     let running = targets.iter().filter(|a| a.is_playing()).count();
     // Status badge: soft round tint + glyph, coloured by state.
-    let (status, detail, tone): (String, String, u8) = if app.maintenance.is_some() {
-        (
-            t("Maintenance in progress").into(),
-            app.maintenance.map(|k| k.label()).unwrap_or(t("Working")).into(),
-            1,
-        )
+    let (status, detail, tone): (String, String, u8) = if let Some(kind) = app.maintenance {
+        // Crystal's own file work, with its progress: never worded like Square Enix's
+        // server maintenance.
+        (maintenance_status(app), dl_stage(kind, &app.maintenance_progress.stage), 2)
     } else if main_action == MainAction::Update {
         ((if app.viewer.as_ref().is_some_and(crate::viewer::Status::requires_update) { t("PlayOnline needs attention") } else { t("Update available") }).into(), t("Click Update to install official updates").into(), 1)
+    } else if matches!(main_action, MainAction::Maintenance | MainAction::Offline) && targets.iter().any(|a| app.is_waiting(&a.key)) {
+        // "Wait and play": what the waiting Play will do.
+        ((if main_action == MainAction::Maintenance { t("Maintenance") } else { t("Worlds offline") }).into(), app.wait_headline().into(), 2)
     } else if main_action == MainAction::Maintenance {
         (t("Maintenance").into(), t("View official maintenance notices").into(), 1)
     } else if main_action == MainAction::Offline {
@@ -2482,8 +2571,9 @@ fn play_bar(app: &App) -> Element<'_, Message> {
                 } else { t("Game version is up to date") }, 0)
             }
             Some(crate::patch::PatchState::Required) => {
-                (t("Update available"), t("Open Install & repair to update"), 1)
+                (t("Update available"), t("Press Update to install it"), 1)
             }
+            Some(crate::patch::PatchState::Interrupted) => (t("Interrupted update"), t("Press Play to finish it"), 1),
             _ if app.patch_loading => (t("Checking version…"), t("Reading the installed version"), 2),
             _ if app.patch.as_ref().is_some_and(|p| p.files_verified == Some(true)) => (t("Files verified"), t("Version will be checked when you play"), 0),
             _ => (t("Ready to launch"), t("Version will be checked when you play"), 2),
@@ -2526,12 +2616,20 @@ fn play_bar(app: &App) -> Element<'_, Message> {
             ..Default::default()
         }
     };
+    // During downtime the button sets the selected accounts waiting ("Wait and play"), and says
+    // so once every one of them waits.
+    let wait_label = (app.vault_ready && !app.wait_keys().is_empty()).then(|| t("Wait and play"))
+        .or_else(|| targets.iter().any(|a| app.is_waiting(&a.key)).then(|| t("Waiting for FFXI…")));
     let (play_label, play_ink) = match main_action {
         MainAction::Update => (t("Update").to_owned(), c.play_text),
+        MainAction::Maintenance | MainAction::Offline if wait_label.is_some() => (wait_label.unwrap_or_default().to_owned(), badge_ink),
         MainAction::Maintenance => (t("Maintenance").to_owned(), badge_ink),
         MainAction::Offline => (t("Worlds offline").to_owned(), badge_ink),
         MainAction::Working if app.reshade.busy => (t("ReShade setup").to_owned(), c.sub),
-        MainAction::Working => (app.maintenance.map(MaintenanceKind::label).unwrap_or(t("Working")).to_owned(), c.sub),
+        MainAction::Working => (match maintenance_percent(&app.maintenance_progress) {
+            Some(percent) if app.maintenance.is_some() => tf("{label} · {percent}%", &[("label", &app.maintenance_label()), ("percent", &percent)]),
+            _ => app.maintenance_label().to_owned(),
+        }, c.sub),
         MainAction::Play => match play_state {
         PlayState::Playing => (t("Playing").to_owned(), if light { rgb(0x347355) } else { rgb(0xA6D4BE) }),
         PlayState::Starting => (t("Starting…").to_owned(), c.sub),
@@ -2767,8 +2865,9 @@ fn compact_status(app: &App) -> (&'static str, Color, &'static str, Color) {
     let (patch, patch_color) = match app.patch.as_ref().map(|p| &p.state) {
         Some(crate::patch::PatchState::Current) => (t("Version current"), CRYSTAL),
         Some(crate::patch::PatchState::Required) => {
-            (t("Update available · Install & repair"), GOLD_BRIGHT)
+            (t("Update available · press Update"), GOLD_BRIGHT)
         }
+        Some(crate::patch::PatchState::Interrupted) => (t("Interrupted update · press Play"), GOLD_BRIGHT),
         _ => (
             if app.patch_loading {
                 t("Checking version")
@@ -3081,6 +3180,7 @@ fn patch_state<'a>(app: &App, c: Colors) -> (Element<'a, Message>, &'static str)
     match app.patch.as_ref().map(|p| p.state) {
         Some(crate::patch::PatchState::Current) => (icon(Icon::CheckCircle, 16.0, dl_ok(c)), t("Version current")),
         Some(crate::patch::PatchState::Required) => (icon(Icon::Download, 16.0, c.accent), t("Update available")),
+        Some(crate::patch::PatchState::Interrupted) => (icon(Icon::AlertCircle, 16.0, c.accent), t("Interrupted update")),
         _ if app.patch_loading => (icon(Icon::Refresh, 16.0, c.sub), t("Checking version")),
         _ => (icon(Icon::AlertCircle, 16.0, c.sub), t("Version unchecked")),
     }
@@ -3104,7 +3204,7 @@ fn details<'a>(app: &'a App, base: Element<'a, Message>) -> Element<'a, Message>
     if let Some(s) = &app.services {
         service_block = service_block.push(
             column![
-                text(&s.availability_note).size(12).color(c.sub),
+                text(app.service_note()).size(12).color(c.sub),
                 text(tf("Last checked: {time}", &[("time", &s.checked_at)])).size(12).color(c.sub)
             ]
             .spacing(2),
@@ -3116,7 +3216,7 @@ fn details<'a>(app: &'a App, base: Element<'a, Message>) -> Element<'a, Message>
             private_text(
                 app,
                 if matches!(p.state, crate::patch::PatchState::Required) {
-                    t("A newer official version is available. Open Downloads, select the game folder, then choose Update.")
+                    t("A newer official version is available. Press Update to install it.")
                 } else {
                     &p.detail
                 },
@@ -3400,14 +3500,42 @@ fn account_row<'a>(app: &'a App, item: &'a crate::AccountRow, c: Colors) -> Elem
     } else {
         (c.sub, dot(false, with_alpha(c.sub, 0.7)))
     };
-    let status_line = row![marker, private_text(app, &item.status_text(), 13.0, BODY, tone)]
+    // "Wait and play": the wait (with Cancel), or the update its released Play asked for.
+    let waiting = app.is_waiting(&item.key);
+    let updating = app.waited_update_running(&item.key);
+    let shown: std::borrow::Cow<'_, str> = if waiting {
+        app.wait_headline().into()
+    } else if updating {
+        t("Updating FFXI before it starts…").into()
+    } else {
+        item.status_text()
+    };
+    let (tone, marker) = if waiting || updating { (c.accent, dot(true, c.accent)) } else { (tone, marker) };
+    let status_line = row![marker, private_text(app, &shown, 13.0, BODY, tone)]
         .spacing(10)
         .align_y(Alignment::Center);
     // How long the launch took, once the game has started; aligned under the status text.
     let timing_line: Option<Element<'a, Message>> = (item.is_playing() && !item.timing.is_empty())
         .then(|| container(text(&item.timing).font(BODY).size(12).color(c.sub)).padding([0, 25]).into());
     // Launch diagnostics: once a client has run, its log is one click away.
-    let status = if item.log.is_some() && idle {
+    let status = if waiting || updating {
+        let detail = if waiting {
+            app.wait_detail()
+        } else {
+            match maintenance_percent(&app.maintenance_progress) {
+                Some(percent) => tf("{label} · {percent}%", &[("label", &app.maintenance_label()), ("percent", &percent)]),
+                None => app.maintenance_label().to_owned(),
+            }
+        };
+        let mut lines = column![status_line].spacing(4).width(Length::FillPortion(3));
+        if !detail.is_empty() {
+            lines = lines.push(container(text(detail).font(BODY).size(12).color(c.sub)).padding([0, 25]));
+        }
+        if waiting {
+            lines = lines.push(container(log_link(c, t("Cancel"), Message::CancelWait(vec![item.key.clone()]))).padding([0, 25]));
+        }
+        lines
+    } else if item.log.is_some() && idle {
         column![
             status_line,
             row![
@@ -3432,7 +3560,7 @@ fn account_row<'a>(app: &'a App, item: &'a crate::AccountRow, c: Colors) -> Elem
     } else {
         Space::new().width(152).into()
     };
-    let can_launch = item.can_play() && app.vault_ready && !app.launch_blocked();
+    let can_launch = item.can_play() && app.vault_ready && !app.launch_blocked() && !waiting;
     let launch = control(
         c,
         Tone::Secondary,
@@ -3983,15 +4111,7 @@ fn launch_section<'a>(app: &'a App, account: &'a crate::backend::Account, c: Col
             );
         }
     }
-    section = section.push(column![
-        crate::controller_nav::checkbox(app.editor.as_ref().is_some_and(|editor| editor.startup_signin))
-            .label(t("Sign in when Crystal opens"))
-            .on_toggle(Message::EditorStartupSignin)
-            .size(18)
-            .text_size(14)
-            .style(check),
-        sub_text(t("For accounts without a security token. Prepare a PlayOnline session on startup so Play can start FFXI without another sign-in."), 12.0),
-    ].spacing(8));
+    // Signing in when Crystal opens is no per-account choice: Settings → System has its switch.
     let choice = app.editor.as_ref().map(|editor| editor.auto_login).unwrap_or_default();
     section = section.push(column![
         crate::controller_nav::checkbox(choice.enabled)
@@ -4000,7 +4120,7 @@ fn launch_section<'a>(app: &'a App, account: &'a crate::backend::Account, c: Col
         row![form_label(t("Character slot")),
             crate::controller_nav::pick_list((1u8..=16).collect::<Vec<_>>(), Some(choice.character_slot), Message::EditorCharacterSlot)
                 .text_size(14).padding([8, 12])].spacing(16).align_y(Alignment::Center),
-        sub_text(t("1 selects the first character. Crystal continues only while this game window is active; unavailable slots stay at character selection."), 12.0)
+        sub_text(t("1 selects the first character. Each client can log in in the background; unavailable slots stay at character selection."), 12.0)
     ].spacing(8));
     section.into()
 }
@@ -4015,44 +4135,23 @@ fn maintenance(app: &App) -> Element<'_, Message> {
     let can_check = idle && !app.installation_loading && app.settings.install_selected;
     let can_change = can_check && !update_blocked && app.vault_ready;
     let can_install = idle;
-    let update_due = matches!(
-        app.patch.as_ref().map(|p| p.state),
-        Some(crate::patch::PatchState::Required)
-    ) || app.viewer.as_ref().is_some_and(crate::viewer::Status::requires_update);
 
     let header = page_header(
         c,
         s,
         t("Downloads"),
-        t("Install, update and repair FINAL FANTASY XI and PlayOnline. Nothing on disk changes until you press a button."),
+        t("Install FINAL FANTASY XI and PlayOnline, and check or repair their files. Play installs official updates when they are needed."),
         None,
     );
 
-    // Game installation: folder, version summary, actions, safety notes.
+    // Game installation: the folder (chosen in Settings), version summary, troubleshooting.
+    let shown_folder = if app.settings.install_path.trim().is_empty() { t("Not selected").to_owned() }
+        else { crate::privacy::mask_path(&app.settings.install_path).to_string() };
     let game_folder = column![
         form_label(t("Game folder")).color(c.ink),
         row![
-            text_field("C:\\Games\\SquareEnix\\FINAL FANTASY XI", &crate::privacy::mask_path(&app.settings.install_path))
-                .on_input_maybe(crate::privacy::editable().then_some(|v| Message::InstallPathChanged(crate::privacy::unmask_path(v))))
-                .on_submit(Message::SelectInstallPath)
-                .font(MONO)
-                .size(13),
-            control(
-                c,
-                Tone::Secondary,
-                Some(Icon::Search),
-                if app.installation_loading { t("Finding…") } else { t("Find game") },
-                (idle && !app.installation_loading).then_some(Message::FindInstallation),
-                None
-            ),
-            control(
-                c,
-                Tone::Secondary,
-                Some(Icon::Folder),
-                t("Browse…"),
-                idle.then_some(Message::Browse(crate::PickTarget::GameFolder)),
-                None
-            )
+            text(shown_folder).font(MONO).size(13).color(c.ink).width(Length::Fill),
+            control(c, Tone::Secondary, Some(Icon::Folder), t("Change in Settings"), Some(Message::ToggleSettings), None)
         ]
         .spacing(8)
         .align_y(Alignment::Center),
@@ -4072,6 +4171,7 @@ fn maintenance(app: &App) -> Element<'_, Message> {
     let (state_icon, state_color, state_text) = match app.patch.as_ref().map(|p| p.state) {
         Some(crate::patch::PatchState::Current) => (Icon::CheckCircle, dl_ok(c), t("Up to date")),
         Some(crate::patch::PatchState::Required) => (Icon::Download, c.accent, t("Update available")),
+        Some(crate::patch::PatchState::Interrupted) => (Icon::AlertCircle, c.accent, t("Interrupted update")),
         _ if app.patch_loading => (Icon::Refresh, c.sub, t("Checking version…")),
         _ => (Icon::AlertCircle, c.sub, t("Not checked")),
     };
@@ -4093,41 +4193,53 @@ fn maintenance(app: &App) -> Element<'_, Message> {
     .padding([16, 16])
     .width(Length::Fill)
     .style(soft_tile(c));
-    let mut actions = row![
-        control(
-            c,
-            if update_due { Tone::Secondary } else { Tone::Primary },
-            Some(Icon::CheckCircle),
-            t("Check files"),
-            can_check.then_some(Message::StartMaintenance(MaintenanceKind::Check)),
-            None
-        ),
-        control(
-            c,
-            if update_due { Tone::Primary } else { Tone::Secondary },
-            Some(Icon::Download),
-            t("Update"),
-            can_change.then_some(Message::StartMaintenance(MaintenanceKind::Update)),
-            None
-        ),
-        control(
-            c,
-            Tone::Secondary,
-            Some(Icon::Wrench),
-            t("Repair modified files"),
-            can_change.then_some(Message::StartMaintenance(MaintenanceKind::Repair)),
-            None
-        ),
-        Space::new().width(Length::Fill)
-    ]
-    .spacing(8)
-    .align_y(Alignment::Center);
-    if can_check && update_blocked {
-        actions = actions.push(text(t("Close running clients to update or repair")).size(12).color(c.sub));
+    // Check and Repair are troubleshooting steps, not part of an update: Play updates.
+    let troubleshooting_head = crate::controller_nav::button(
+        row![
+            icon(if app.troubleshooting_open { Icon::ChevronDown } else { Icon::ChevronRight }, 16.0, c.sub),
+            text(t("Troubleshooting")).font(semibold()).size(16).color(c.ink),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center),
+    )
+    .padding(0)
+    .style(|_, _| button::Style::default())
+    .on_press(Message::ToggleTroubleshooting);
+    let mut troubleshooting = column![troubleshooting_head].spacing(12);
+    if app.troubleshooting_open {
+        let mut actions = row![
+            control(
+                c,
+                Tone::Secondary,
+                Some(Icon::CheckCircle),
+                t("Check files"),
+                can_check.then_some(Message::StartMaintenance(MaintenanceKind::Check)),
+                None
+            ),
+            control(
+                c,
+                Tone::Secondary,
+                Some(Icon::Wrench),
+                t("Repair files"),
+                can_change.then_some(Message::StartMaintenance(MaintenanceKind::Repair)),
+                None
+            ),
+            Space::new().width(Length::Fill)
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
+        if can_check && update_blocked {
+            actions = actions.push(text(t("Close running clients to repair")).size(12).color(c.sub));
+        }
+        troubleshooting = troubleshooting.push(actions).push(column![
+            dl_note(c, Icon::CheckCircle, t("Check files compares your files with the installed file list. It doesn't contact the update service and can run while clients are open.")),
+            dl_note(c, Icon::Wrench, t("Repair files restores every official PlayOnline and FINAL FANTASY XI file. Copies of modified files are kept in .xi-updater\\kept; replaced files are backed up.")),
+            dl_note(c, Icon::AlertCircle, t("Close all games before repairing. Idle PlayOnline sessions sign out automatically. Sign out before official setup."))
+        ].spacing(8));
     }
     let (viewer_local, viewer_latest, viewer_detail) = app.viewer.as_ref().map(|v|
         (v.version.local_version.as_str(), v.version.remote_version.as_str(), v.version.detail.as_str()))
-        .unwrap_or((t("Not checked"), t("Not checked"), t("Check files and Update cover both PlayOnline and FINAL FANTASY XI.")));
+        .unwrap_or((t("Not checked"), t("Not checked"), t("Check files and Repair files cover both PlayOnline and FINAL FANTASY XI.")));
     let viewer_state = if app.viewer_loading { t("Checking…") }
         else if app.viewer.as_ref().is_some_and(crate::viewer::Status::requires_update) { t("Needs attention") }
         else if app.viewer.as_ref().is_some_and(|v| v.version.state == crate::patch::PatchState::Current) { t("Up to date") }
@@ -4154,20 +4266,15 @@ fn maintenance(app: &App) -> Element<'_, Message> {
             card_title(
                 c,
                 t("Installation"),
-                Some(t("Select the existing FINAL FANTASY XI game folder. This is separate from the installer download folder."))
+                Some(t("The FINAL FANTASY XI game folder from Settings. This is separate from the installer download folder."))
             ),
             game_folder,
             text(t("FINAL FANTASY XI")).font(semibold()).size(16).color(c.ink),
             stats,
             text(app.patch.as_ref().map_or("", |report| report.detail.as_str())).size(13).color(c.sub),
             viewer,
-            actions,
-            column![
-                dl_note(c, Icon::CheckCircle, t("Check files reads the official file manifest and local files. It can run while clients are open.")),
-                dl_note(c, Icon::Wrench, t("Update installs official PlayOnline components and missing or outdated FFXI files. Modified FFXI files are preserved; Repair restores them too. Replaced files are backed up.")),
-                dl_note(c, Icon::AlertCircle, t("Close all games before updating or repairing. Idle PlayOnline sessions sign out automatically. Sign out before official setup."))
-            ]
-            .spacing(8)
+            dl_divider(c),
+            troubleshooting
         ]
         .spacing(20),
     );
@@ -4393,7 +4500,7 @@ fn maintenance(app: &App) -> Element<'_, Message> {
     installer = installer.push(dl_divider(c)).push(dl_note(
         c,
         Icon::AlertCircle,
-        t("Choose the game destination in the official setup wizard. After installation, select that game folder under Game installation and Check files. Extraction and setup use their own windows; wait for them to finish before closing this launcher."),
+        t("Choose the game destination in the official setup wizard. After installation, Crystal finds that game folder (or choose it in Settings) and Play installs the official updates. Extraction and setup use their own windows; wait for them to finish before closing this launcher."),
     ));
     // A running operation moves its progress above the fold.
     let main = if idle {
@@ -4632,6 +4739,25 @@ fn dl_remaining_time(duration: std::time::Duration) -> String {
         tf("{hours} hr {minutes} min", &[("hours", &hours), ("minutes", &minutes)])
     }
 }
+/// Percent done of the running file operation: the whole update's estimate when there is
+/// one, else the current step's.
+fn maintenance_percent(progress: &crate::operation::Progress) -> Option<u8> {
+    match &progress.overall {
+        Some(overall) => overall.remaining_percent().map(|left| 100 - left),
+        None => progress.remaining_percent().map(|left| 100 - left),
+    }
+}
+/// Home's line for Crystal's own file work: "Updating FINAL FANTASY XI · 43% · 3 min left".
+fn maintenance_status(app: &App) -> String {
+    let progress = &app.maintenance_progress;
+    let mut parts = vec![app.maintenance_label().to_owned()];
+    if let Some(percent) = maintenance_percent(progress) { parts.push(format!("{percent}%")); }
+    let left = progress.overall.map_or(progress.remaining, |overall| overall.remaining);
+    if let Some(left) = left.filter(|left| !left.is_zero()) {
+        parts.push(tf("{time} left", &[("time", &dl_remaining_time(left))]));
+    }
+    parts.join(" · ")
+}
 fn dl_stage(kind: MaintenanceKind, stage: &str) -> String {
     match stage {
         "installer-metadata" => t("Checking the official installer files").into(),
@@ -4661,13 +4787,27 @@ fn settings_panel<'a>(app: &'a App, base: Element<'a, Message>) -> Element<'a, M
                     .on_submit(Message::SelectInstallPath)
                     .font(MONO)
                     .size(13),
+                control(
+                    c,
+                    Tone::Secondary,
+                    Some(Icon::Search),
+                    if app.installation_loading { t("Finding…") } else { t("Find game") },
+                    (app.maintenance.is_none() && !app.installation_loading).then_some(Message::FindInstallation),
+                    None
+                ),
                 icon_control(c, Icon::Folder, true, (app.maintenance.is_none()).then_some(Message::Browse(crate::PickTarget::GameFolder)))
             ]
             .spacing(8)
             .align_y(Alignment::Center),
             text(t("Used to check the installed version against the official update service."))
                 .size(12)
-                .color(c.sub)
+                .color(c.sub),
+            dl_flag(
+                c,
+                app.settings.install_selected,
+                t("Folder confirmed as the target for checks and changes"),
+                t("Confirm this folder before starting")
+            )
         ]
         .spacing(8),
         container(
@@ -4678,7 +4818,7 @@ fn settings_panel<'a>(app: &'a App, base: Element<'a, Message>) -> Element<'a, M
                 ]
                 .spacing(10)
                 .align_y(Alignment::Center),
-                text(t("Check files, update, or repair this installation from Downloads. Select its target folder there before making changes."))
+                text(t("Check or repair this installation under Downloads → Troubleshooting. Play installs official updates."))
                     .size(12)
                     .color(c.sub),
                 Space::new().height(4),
@@ -4759,15 +4899,50 @@ fn field<'a>(
     secure: bool,
     enabled: bool,
 ) -> Element<'a, Message> {
+    let hide = crate::privacy::on();
+    let shown = crate::privacy::mask(value);
     column![
         form_label(label),
-        text_field(placeholder, value)
+        text_field(placeholder, &shown)
             .secure(secure)
-            .on_input_maybe(enabled.then_some(move |value| Message::EditorChanged(field, value)))
+            .on_input_maybe((enabled && !hide).then_some(move |value| Message::EditorChanged(field, value)))
     ]
     .spacing(8)
     .width(Length::Fill)
     .into()
+}
+#[cfg(test)]
+mod privacy_field_tests {
+    use super::*;
+
+    #[test]
+    fn private_account_fields_have_fixed_masks_and_cannot_replace_saved_values() {
+        crate::privacy::set(true);
+        let mut expected = None;
+        for value in ["Al", "An exceptionally long account name", "アリスドラゴン", "e\u{301}🐉"] {
+            let build = || field("Account name", "Name", value, Field::Label, true, true);
+            let texts = crate::privacy::testing::text_bounds(build(), iced::Size::new(500.0, 200.0));
+            assert_eq!(texts[1].0, "••••••••");
+            if let Some(expected) = &expected { assert_eq!(&texts, expected); } else { expected = Some(texts); }
+            assert!(crate::privacy::testing::type_text(build(), "X").is_empty());
+        }
+        crate::privacy::set(false);
+        let messages = crate::privacy::testing::type_text(field("Account name", "Name", "Al", Field::Label, false, true), "X");
+        assert!(matches!(messages.as_slice(), [Message::EditorChanged(Field::Label, value)] if value == "AlX"));
+    }
+
+    #[test]
+    fn password_fields_keep_normal_security_with_privacy_off() {
+        crate::privacy::set(false);
+        let build = || field("Password", "Password", "synthetic", Field::PolPassword, true, true);
+        let texts = crate::privacy::testing::texts(build(), iced::Size::new(500.0, 200.0));
+        assert_eq!(texts[1], "•••••••••");
+        let messages = crate::privacy::testing::type_text(build(), "X");
+        assert!(matches!(messages.as_slice(), [Message::EditorChanged(Field::PolPassword, value)] if value == "syntheticX"));
+        crate::privacy::set(true);
+        assert!(crate::privacy::testing::type_text(build(), "X").is_empty());
+        crate::privacy::set(false);
+    }
 }
 // ---- Dialogs: one frame for every modal ----
 fn dialog_style(theme: &Theme) -> container::Style {

@@ -408,17 +408,17 @@ pub fn default_handle_record(idx: u32) -> [u8; HANDLE_RECORD_LEN] {
     r
 }
 
-// FFXiMain's character table used by the legacy slot-177 fixture.
+// FFXiMain's character table used by the legacy slot-177 fixture. The lobby
+// global comes from this process's resolved layout (game_layout), which also
+// checks this table's count, entry offset, 0x8c stride and 16 slots against
+// the game's own accessors. Each read starts 4 bytes before an entry, at the
+// count or the previous entry's tail, which is ignored.
+const CHAR_TABLE_OFFSET: usize = crate::lobby::LOBBY_CHARACTER_COUNT;
+const CHAR_ENTRY_SIZE: usize = crate::lobby::LOBBY_CHARACTER_SIZE;
+const MAX_LOBBY_CHARS: u32 = crate::lobby::LOBBY_CHARACTER_SLOTS as u32;
 
-/// The FFXiMain build the offsets below were read from (PE timestamp, SizeOfImage).
-pub const FFXIMAIN_TIMESTAMP: u32 = 0x6A99_5428;
-pub const FFXIMAIN_SIZE_OF_IMAGE: u32 = 0x00C1_5000;
-const LOBBYCTL_PTR_RVA: usize = crate::lobby::LOBBY_PTR_RVA; // verified [0x104df770]
-const CHAR_TABLE_OFFSET: usize = 0x13820;
-const CHAR_ENTRY_SIZE: usize = 0x8C;
-const MAX_LOBBY_CHARS: u32 = 16;
-
-static LOBBYCTL_PTR: OnceLock<Option<usize>> = OnceLock::new();
+static NOT_READY_REPORTED: AtomicBool = AtomicBool::new(false);
+static FALLBACK_REPORTED: AtomicBool = AtomicBool::new(false);
 
 fn read<T: Copy>(addr: usize) -> Option<T> {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
@@ -431,15 +431,23 @@ fn read<T: Copy>(addr: usize) -> Option<T> {
     (ok != 0 && n == std::mem::size_of::<T>()).then(|| unsafe { v.assume_init() })
 }
 
-/// Address of FFXiMain's lobby-context pointer, only for the verified build.
+/// Address of FFXiMain's lobby-context pointer, only when this process's game
+/// layout resolved it and the character table it indexes.
 fn lobbyctl_ptr() -> Option<usize> {
-    *LOBBYCTL_PTR.get_or_init(|| {
-        match crate::lobby::verified_image() {
-            Ok(Some(base)) => Some(base + LOBBYCTL_PTR_RVA),
-            Ok(None) => { log!("slot 177: FFXiMain.dll is not loaded"); None }
-            Err(reason) => { log!("slot 177: fallback unavailable: {reason}"); None }
-        }
-    })
+    fn report(once: &AtomicBool, message: &str) {
+        if !once.swap(true, Ordering::AcqRel) { log!("slot 177: {message}"); }
+    }
+    // Not loaded or still initializing: nothing is cached, a later call retries.
+    let Some(layout) = crate::game_layout::ffximain() else {
+        report(&NOT_READY_REPORTED, "FFXiMain.dll is not loaded or not initialized yet");
+        return None;
+    };
+    let resolved = crate::lobby::verified_lobby(layout)
+        .and_then(|lobby| layout.characters.clone().map(|_| lobby));
+    match resolved {
+        Ok(lobby) => layout.base.checked_add(lobby.ptr),
+        Err(reason) => { report(&FALLBACK_REPORTED, &format!("fallback unavailable: {reason}")); None }
+    }
 }
 
 fn ffximain_char_record(idx: u32) -> Option<[u8; CHAR_RECORD_LEN]> {

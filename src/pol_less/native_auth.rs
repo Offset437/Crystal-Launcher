@@ -7,6 +7,7 @@ use crate::{
     friends::{self, Snapshot},
 };
 use std::{
+    collections::BTreeMap,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicI32, Ordering},
@@ -27,15 +28,24 @@ pub(super) struct NativeAuth {
     input: Mutex<Option<Input>>,
     directory: PathBuf,
     snapshot: Mutex<Snapshot>,
+    control_errors: Mutex<BTreeMap<&'static str, String>>,
     cache_dirty: AtomicBool,
     status: AtomicI32,
     social_only: bool,
     /// A Play whose game start waits for the sign-in and the version check (see `SignedIn`).
     start_pending: AtomicBool,
     invisible_login: bool,
+    /// The session line's `viewer_gaps` (pol-spec 07c §4): true only for a sign-in-only
+    /// session started as a pre-sign-in, never for a cold Play or a batch's sign-in.
+    viewer_gaps: bool,
     auto_away_minutes: u8,
     auto_login: super::AutoLogin,
     game_running: Arc<AtomicBool>,
+    /// `native_social_ready` came since the last hand-over to FFXI: a connection that
+    /// recovers (`native_pol_status` back to 0) is at that main menu again (07d §5.5).
+    social_seen: AtomicBool,
+    /// The one `native_play_pending` went to the loader (07d §4.3).
+    play_pending_sent: AtomicBool,
 }
 impl NativeAuth {
     pub fn new(
@@ -93,14 +103,18 @@ impl NativeAuth {
             })),
             directory,
             snapshot: Mutex::new(Snapshot::default()),
+            control_errors: Mutex::new(BTreeMap::new()),
             cache_dirty: AtomicBool::new(false),
             status: AtomicI32::new(0),
             social_only: false,
             start_pending: AtomicBool::new(false),
             invisible_login: false,
+            viewer_gaps: false,
             auto_away_minutes: super::default_auto_away(),
             auto_login: super::AutoLogin::default(),
             game_running: Arc::new(AtomicBool::new(true)),
+            social_seen: AtomicBool::new(false),
+            play_pending_sent: AtomicBool::new(false),
         })
     }
     pub fn set_social_only(&mut self, social_only: bool) {
@@ -113,6 +127,7 @@ impl NativeAuth {
         self.start_pending.store(deferred, Ordering::Release);
     }
     pub fn set_invisible_login(&mut self, invisible: bool) { self.invisible_login = invisible; }
+    pub fn set_viewer_gaps(&mut self, gaps: bool) { self.viewer_gaps = gaps; }
     /// 0 = off, else one of the Viewer's 10..60-minute choices.
     pub fn set_auto_away(&mut self, minutes: u8) {
         self.auto_away_minutes = if super::AUTO_AWAY_CHOICES.contains(&minutes) { minutes } else { super::default_auto_away() };
@@ -147,6 +162,7 @@ impl SignedIn for NativeAuth {
             let mut snapshot = self.snapshot.lock().unwrap_or_else(|e| e.into_inner()).clone();
             snapshot.game_running = Some(false);
             snapshot.session_error = Some(message.to_owned());
+            self.control_errors.lock().unwrap_or_else(|e| e.into_inner()).insert("start_game", message.to_owned());
             snapshot.social.ready = false;
             let _ = self.publish(snapshot);
         }
@@ -155,6 +171,8 @@ impl SignedIn for NativeAuth {
     fn native_session_state(&self, game: bool) -> Result<(), String> {
         // Until a Play's start is decided, the idle report must not look like a closed game.
         if !game && self.start_pending() { return Ok(()); }
+        if game { self.social_seen.store(false, Ordering::Release); }
+        self.control_errors.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.game_running.store(game, Ordering::Release);
         let mut snapshot = self.snapshot.lock().unwrap_or_else(|e| e.into_inner()).clone();
         snapshot.game_running = Some(game);
@@ -169,27 +187,52 @@ impl SignedIn for NativeAuth {
         self.publish(snapshot).map(|_| ())
     }
     fn native_control_result(&self, action: &str, code: i32) -> Result<(), String> {
+        let category = match action {
+            "visible" | "away" | "invisible" => "presence",
+            "groups" => "groups",
+            "start_game" => "start_game",
+            "sign_out" => "sign_out",
+            _ => return Err(t("Invalid native POL control action.").into()),
+        };
         let mut snapshot = self.snapshot.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        snapshot.session_error = (code < 0).then(|| {
-            // The action is a protocol name; each one gets its own sentence.
+        let mut errors = self.control_errors.lock().unwrap_or_else(|e| e.into_inner());
+        if code < 0 && code != -261 {
             let args: [(&str, &dyn std::fmt::Display); 1] = [("code", &code)];
-            match action {
+            let message = match category {
                 "start_game" => tf("PlayOnline could not start the game ({code}).", &args),
                 "sign_out" => tf("PlayOnline could not sign out ({code}).", &args),
-                "visible" | "away" | "invisible" => tf("PlayOnline could not change your online status ({code}).", &args),
-                _ => tf("PlayOnline could not accept {action} ({code}).", &[("action", &action), ("code", &code)]),
-            }
-        });
+                "presence" => tf("PlayOnline could not change your online status ({code}).", &args),
+                _ => tf("PlayOnline could not change your group status ({code}).", &args),
+            };
+            errors.insert(category, message);
+        } else {
+            errors.remove(category);
+        }
+        // Account and group jobs complete independently. A successful sibling
+        // must not hide a failure that still needs the user's attention.
+        snapshot.session_error = (!errors.is_empty()).then(|| errors.values().cloned().collect::<Vec<_>>().join(" "));
+        drop(errors);
         self.publish(snapshot).map(|_| ())
     }
     fn take_native_control(&self) -> Option<(crate::session_worker::NativeControl, bool)> {
         crate::session_worker::take_native_control(&self.directory)
+    }
+    fn take_controller_settings(&self) -> Option<Vec<u8>> {
+        crate::session_worker::take_controller_settings(&self.directory)
+    }
+    fn controller_result(&self, request_id: u64, ok: bool, message: &str) -> Result<(), String> {
+        crate::session_worker::publish_controller_result(&self.directory, request_id, ok, message)
     }
     fn take_native_batch(&self) -> Option<Vec<u8>> {
         crate::session_worker::take_native_batch(&self.directory)
     }
     fn native_command_listener(&self) -> Option<crate::session_worker::CommandWake> {
         crate::session_worker::listen_for_commands()
+    }
+    fn take_play_pending(&self) -> bool {
+        // Consume the note either way; only a pre-sign-in has Viewer pauses to skip.
+        let noted = crate::session_worker::take_play_pending(&self.directory);
+        noted && self.viewer_gaps && !self.play_pending_sent.swap(true, Ordering::AcqRel)
     }
     fn take_native_activity(&self) -> bool {
         // Consume the note either way; only an idle Viewer session uses it.
@@ -222,6 +265,7 @@ impl SignedIn for NativeAuth {
         line.ok()
     }
     fn native_social_ready(&self) -> Result<(), String> {
+        self.social_seen.store(true, Ordering::Release);
         if self.status.load(Ordering::Acquire) < 0 { return Ok(()); }
         let mut snapshot = self.snapshot.lock().unwrap_or_else(|e| e.into_inner()).clone();
         snapshot.social = crate::social::State { ready: true, ..Default::default() };
@@ -252,12 +296,6 @@ impl SignedIn for NativeAuth {
         self.publish(snapshot).map(|_| ())
     }
     fn session_line(&self, install_dir: &Path) -> Result<Zeroizing<Vec<u8>>, String> {
-        let input = self
-            .input
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
-            .ok_or(t("Native POL credentials were already handed to the game host."))?;
         let install = install_dir
             .to_str()
             .ok_or(t("The game folder's path is not valid Unicode."))?;
@@ -268,43 +306,16 @@ impl SignedIn for NativeAuth {
             .map_err(|_| t("Could not encode character login settings."))?;
         let pol = serde_json::to_string(&pol.as_ref().map(|p| p.to_string_lossy().into_owned()))
             .map_err(|_| t("Could not encode the PlayOnline folder."))?;
-        let head=format!("{{\"type\":\"session\",\"v\":1,\"region\":\"US\",\"lang\":\"US\",\"start_game\":{},\"keep_session\":false,\"invisible_login\":{},\"auto_away_minutes\":{},\"auto_login\":{},\"pol_install_dir\":{},\"install_dir\":{},\"native_auth\":{{", !self.idle_first(), self.invisible_login, self.auto_away_minutes, auto_login, pol, serde_json::to_string(install).map_err(|_| t("Could not encode the game folder."))?);
-        // Preallocate all secret fields, preventing discarded allocation copies.
-        let fields: [(&str, &[u8]); 5] = [
-            ("pol_id", input.pol_id.as_bytes()),
-            ("pol_password", input.pol_password.as_bytes()),
-            ("se_id", input.se_id.as_bytes()),
-            ("se_secret", &*input.se_secret),
-            ("otp", input.otp.as_bytes()),
-        ];
-        let capacity = head.len()
-            + fields
-                .iter()
-                .map(|(k, v)| k.len() + 6 + v.len().div_ceil(3) * 4)
-                .sum::<usize>()
-            + 80;
-        let mut line = Zeroizing::new(Vec::with_capacity(capacity));
-        line.extend_from_slice(head.as_bytes());
-        for (index, (name, value)) in fields.iter().enumerate() {
-            if index != 0 {
-                line.push(b',');
-            }
-            line.push(b'"');
-            line.extend_from_slice(name.as_bytes());
-            line.extend_from_slice(b"\":");
-            if *name == "otp" && value.is_empty() {
-                line.extend_from_slice(b"null");
-            } else {
-                line.push(b'"');
-                pipe::base64_into(&mut line, value);
-                line.push(b'"');
-            }
-        }
-        line.extend_from_slice(b",\"profile_key\":\"");
-        line.extend_from_slice(input.key.as_bytes());
-        line.extend_from_slice(b"\"}}\n");
-        debug_assert!(line.len() <= capacity);
-        Ok(line)
+        let head=format!("{{\"type\":\"session\",\"v\":1,\"region\":\"US\",\"lang\":\"US\",\"start_game\":{},\"keep_session\":false,\"invisible_login\":{},\"viewer_gaps\":{},\"auto_away_minutes\":{},\"auto_login\":{},\"pol_install_dir\":{},\"install_dir\":{},\"native_auth\":{{", !self.idle_first(), self.invisible_login, self.viewer_gaps, self.auto_away_minutes, auto_login, pol, serde_json::to_string(install).map_err(|_| t("Could not encode the game folder."))?);
+        self.line_with_credentials(head)
+    }
+    /// pol-spec 07d §1.2: what a parked host gets at Play instead of `session`: the per-Play
+    /// flags and the credentials, nothing the `park` line already gave (region, folders,
+    /// auto-login, FFXI settings). One use, like `session_line`.
+    fn credentials_line(&self) -> Result<Zeroizing<Vec<u8>>, String> {
+        let head = format!("{{\"type\":\"credentials\",\"start_game\":{},\"keep_session\":false,\"invisible_login\":{},\"viewer_gaps\":{},\"auto_away_minutes\":{},\"native_auth\":{{",
+            !self.idle_first(), self.invisible_login, self.viewer_gaps, self.auto_away_minutes);
+        self.line_with_credentials(head)
     }
     fn forward_presence(&self, _: &[u8]) -> Result<bool, String> {
         Err("This session's presence is owned by the native PlayOnline core.".into())
@@ -351,6 +362,10 @@ impl SignedIn for NativeAuth {
                 snapshot.social.id = None;
                 snapshot.social.action = None;
                 snapshot.social.pending_header = None;
+            } else if self.social_seen.load(Ordering::Acquire) && snapshot.game_running == Some(false) {
+                // Recovered at the main menu it had reached: Play and messages work again
+                // without waiting for a `native_social_ready` that already came (08 §4 item 1).
+                snapshot.social.ready = true;
             }
             snapshot.error = (code < 0).then(|| t("The native PlayOnline connection ended.").into());
             let _ = self.publish(snapshot);
@@ -365,9 +380,128 @@ impl SignedIn for NativeAuth {
     }
 }
 
+impl NativeAuth {
+    /// `head` (ending in `"native_auth":{`) plus the one-use credentials and `}}\n`.
+    fn line_with_credentials(&self, head: String) -> Result<Zeroizing<Vec<u8>>, String> {
+        let input = self
+            .input
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .ok_or(t("Native POL credentials were already handed to the game host."))?;
+        // Preallocate all secret fields, preventing discarded allocation copies.
+        let fields: [(&str, &[u8]); 5] = [
+            ("pol_id", input.pol_id.as_bytes()),
+            ("pol_password", input.pol_password.as_bytes()),
+            ("se_id", input.se_id.as_bytes()),
+            ("se_secret", &*input.se_secret),
+            ("otp", input.otp.as_bytes()),
+        ];
+        let capacity = head.len()
+            + fields
+                .iter()
+                .map(|(k, v)| k.len() + 6 + v.len().div_ceil(3) * 4)
+                .sum::<usize>()
+            + 80;
+        let mut line = Zeroizing::new(Vec::with_capacity(capacity));
+        line.extend_from_slice(head.as_bytes());
+        for (index, (name, value)) in fields.iter().enumerate() {
+            if index != 0 {
+                line.push(b',');
+            }
+            line.push(b'"');
+            line.extend_from_slice(name.as_bytes());
+            line.extend_from_slice(b"\":");
+            if *name == "otp" && value.is_empty() {
+                line.extend_from_slice(b"null");
+            } else {
+                line.push(b'"');
+                pipe::base64_into(&mut line, value);
+                line.push(b'"');
+            }
+        }
+        line.extend_from_slice(b",\"profile_key\":\"");
+        line.extend_from_slice(input.key.as_bytes());
+        line.extend_from_slice(b"\"}}\n");
+        debug_assert!(line.len() <= capacity);
+        Ok(line)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn controller_commands_use_the_live_game_channel_without_changing_social_state() {
+        #[link(name = "kernel32")]
+        unsafe extern "system" { fn GetTickCount64() -> u64; }
+        let fixture = Fixture::new();
+        fixture.auth.native_session_state(true).unwrap();
+        let directory = &fixture.auth.directory;
+        let before = std::fs::read(directory.join("friends.json")).unwrap();
+        let cache: serde_json::Value = serde_json::from_slice(&before).unwrap();
+        std::fs::write(directory.join("session.json"), serde_json::to_vec(&serde_json::json!({
+            "worker": cache["worker"], "state": {"Progress": "Fixture game"},
+        })).unwrap()).unwrap();
+        fixture.auth.controller_result(0, true, "Ready.").unwrap();
+        std::fs::write(directory.join("controller-settings.json"), serde_json::to_vec(&serde_json::json!({
+            "worker": cache["worker"], "request_id": 17, "deadline_ms": unsafe { GetTickCount64() } + 1000,
+            "settings": {"padmode000": "1,0,0,0,0,1", "padsin000": "0,1,2,3"},
+        })).unwrap()).unwrap();
+        let frame: serde_json::Value = serde_json::from_slice(&fixture.auth.take_controller_settings().unwrap()).unwrap();
+        assert_eq!(frame["type"], "controller_settings");
+        assert_eq!(frame["request_id"], 17);
+        assert!(fixture.auth.take_controller_settings().is_none());
+        fixture.auth.controller_result(17, true, "Applied.").unwrap();
+        let result: serde_json::Value = serde_json::from_slice(&std::fs::read(directory.join("controller-settings-result-17.json")).unwrap()).unwrap();
+        assert_eq!(result["worker"], cache["worker"]);
+        assert_eq!(std::fs::read(directory.join("friends.json")).unwrap(), before);
+    }
+
+    /// 07d §5.5 step 4 (08 §4 item 1): -1025 then 0 at the main menu brings `social.ready`
+    /// back, so a Play there no longer waits 90 s and fails; never without a prior ready.
+    #[test]
+    fn a_recovered_connection_restores_main_menu_readiness_only_after_a_ready() {
+        let fixture = Fixture::new();
+        fixture.auth.native_session_state(false).unwrap();
+        fixture.auth.native_status(-1025);
+        fixture.auth.native_status(0);
+        assert!(!fixture.cached().social.ready, "no native_social_ready yet: still signing in");
+        fixture.auth.native_social_ready().unwrap();
+        assert!(fixture.cached().social.ready);
+        fixture.auth.native_status(-1025);
+        let lost = fixture.cached();
+        assert!(!lost.social.ready && lost.error.is_some());
+        fixture.auth.native_status(0);
+        let back = fixture.cached();
+        assert!(back.social.ready && back.error.is_none() && back.game_running == Some(false));
+        // Handed to FFXI: that readiness belonged to the earlier main menu.
+        fixture.auth.native_session_state(true).unwrap();
+        fixture.auth.native_status(-1025);
+        fixture.auth.native_session_state(false).unwrap();
+        fixture.auth.native_status(0);
+        assert!(!fixture.cached().social.ready);
+    }
+
+    /// 07d §4.3: one `native_play_pending` per pre-sign-in; the note is consumed either way.
+    #[test]
+    fn a_play_pending_note_reaches_only_a_pre_sign_in_once() {
+        let mut fixture = Fixture::new();
+        std::fs::create_dir_all(&fixture.auth.directory).unwrap();
+        let directory = fixture.auth.directory.clone();
+        let note = || crate::session_worker::save_play_pending_for_test(&directory);
+        note();
+        assert!(!fixture.auth.take_play_pending(), "a cold Play has no Viewer pauses");
+        assert!(!fixture.auth.take_play_pending(), "consumed");
+        fixture.auth.viewer_gaps = true;
+        note();
+        assert!(fixture.auth.take_play_pending());
+        note();
+        assert!(!fixture.auth.take_play_pending(), "once per session");
+        let _ = std::fs::remove_dir_all(&fixture.auth.directory);
+    }
 
     #[test]
     fn session_lifetime_survives_friend_updates_and_reports_control_failures() {
@@ -387,6 +521,28 @@ mod tests {
         fixture.auth.receive_native_friends(&friend_blob(), None).unwrap();
         assert_eq!(fixture.cached().game_running, Some(true));
         assert_eq!(fixture.cached().own_mode, Some(4));
+    }
+
+    #[test]
+    fn presence_and_group_results_keep_independent_failures() {
+        let fixture = Fixture::new();
+        fixture.auth.native_session_state(false).unwrap();
+        fixture.auth.native_control_result("visible", -2046).unwrap();
+        fixture.auth.native_control_result("groups", -261).unwrap();
+        assert_eq!(fixture.cached().session_error.as_deref(), Some("PlayOnline could not change your online status (-2046)."));
+        fixture.auth.native_control_result("groups", -263).unwrap();
+        fixture.auth.native_control_result("away", 1).unwrap();
+        fixture.auth.receive_native_friends(&friend_blob(), None).unwrap();
+        assert_eq!(fixture.cached().session_error.as_deref(), Some("PlayOnline could not change your group status (-263)."));
+        let event = pipe::parse_event(br#"{"type":"native_control_result","action":"groups","code":1}"#).unwrap();
+        let mut pipe = pipe::LoaderPipe::create().unwrap();
+        let mut log = super::super::SessionLog::default();
+        assert!(matches!(super::super::handle_event(event, &mut pipe, &fixture.auth, &mut log), super::super::Step::Continue));
+        assert!(fixture.cached().session_error.is_none());
+        fixture.auth.native_control_result("groups", -263).unwrap();
+        fixture.auth.native_session_state(true).unwrap();
+        fixture.auth.native_control_result("visible", 1).unwrap();
+        assert!(fixture.cached().session_error.is_none());
     }
 
     #[test]
@@ -520,8 +676,10 @@ mod tests {
             Self { auth: NativeAuth {
                 input: Mutex::new(None), directory,
                 snapshot: Mutex::new(Snapshot::default()),
+                control_errors: Mutex::new(BTreeMap::new()),
                 cache_dirty: AtomicBool::new(false),
-                status: AtomicI32::new(0), social_only: false, start_pending: AtomicBool::new(false), invisible_login: false, auto_away_minutes: 10, auto_login: super::super::AutoLogin::default(), game_running: Arc::new(AtomicBool::new(true)),
+                status: AtomicI32::new(0), social_only: false, start_pending: AtomicBool::new(false), invisible_login: false, viewer_gaps: false, auto_away_minutes: 10, auto_login: super::super::AutoLogin::default(), game_running: Arc::new(AtomicBool::new(true)),
+                social_seen: AtomicBool::new(false), play_pending_sent: AtomicBool::new(false),
             } }
         }
         fn cached(&self) -> Snapshot {
@@ -697,5 +855,53 @@ mod tests {
         auth.native_session_state(true).unwrap();
         auth.native_session_state(false).unwrap();
         assert!(!auth.game_running.load(Ordering::Acquire));
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// pol-spec 07c §4: the loader restores the Viewer's pauses only for a pre-sign-in;
+    /// never for a cold Play, nor a batch's own sign-in (social-only, gaps off).
+    /// pol-spec 07d §1.2: a parked host's `credentials` line has the session line's credentials
+    /// and per-Play flags, none of the host fields the `park` line carried, and is one-use.
+    #[test]
+    fn the_credentials_line_carries_only_credentials_and_play_flags_once() {
+        let directory = std::env::temp_dir().join(format!("crystal-credentials-{}", backend::unique_id().unwrap()));
+        let make = || {
+            let mut auth = NativeAuth::new(&play_account(), Zeroizing::new("123456".into()), directory.clone()).unwrap();
+            auth.set_deferred_start(true);
+            auth.set_auto_away(20);
+            auth
+        };
+        let session: serde_json::Value = serde_json::from_slice(&make().session_line(Path::new(r"C:\Games\FFXI")).unwrap()).unwrap();
+        let auth = make();
+        let line = auth.credentials_line().unwrap();
+        assert!(line.ends_with(b"}}\n"));
+        let value: serde_json::Value = serde_json::from_slice(&line).unwrap();
+        assert_eq!(value["type"], "credentials");
+        assert_eq!(value["native_auth"], session["native_auth"]);
+        for flag in ["start_game", "keep_session", "invisible_login", "viewer_gaps", "auto_away_minutes"] {
+            assert_eq!(value[flag], session[flag], "{flag}");
+        }
+        for host in ["v", "region", "lang", "install_dir", "pol_install_dir", "auto_login", "ffxi_settings"] {
+            assert!(value.get(host).is_none(), "{host} belongs in the park line");
+        }
+        assert!(auth.credentials_line().is_err() && auth.session_line(Path::new(r"C:\Games\FFXI")).is_err(), "one use");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn only_a_pre_sign_in_asks_for_the_viewer_pauses() {
+        let directory = std::env::temp_dir().join(format!("crystal-gaps-{}", backend::unique_id().unwrap()));
+        for (social_only, gaps, expected) in [(true, true, true), (true, false, false), (false, true, false), (false, false, false)] {
+            let plan = super::super::Plan { tool: super::super::Tool::Windower, settings: Default::default(), social_only,
+                invisible_login: false, auto_away_minutes: 10, auto_login: Default::default(), viewer_gaps: gaps, trigger: Default::default() };
+            let mut auth = NativeAuth::new(&play_account(), Zeroizing::new(String::new()), directory.clone()).unwrap();
+            super::super::configure(&mut auth, &plan);
+            let value: serde_json::Value = serde_json::from_slice(&auth.session_line(Path::new(r"C:\Games\FFXI")).unwrap()).unwrap();
+            assert_eq!(value["viewer_gaps"], expected, "social_only {social_only}, gaps {gaps}");
+            assert_eq!(value["start_game"], false, "every launch signs in idle");
+        }
+        // Older window processes send no field: a cold Play.
+        let plan: super::super::Plan = serde_json::from_value(serde_json::json!({"tool": super::super::Tool::Windower, "settings": super::super::ToolSettings::default(), "social_only": true})).unwrap();
+        assert!(!plan.viewer_gaps);
         let _ = std::fs::remove_dir_all(&directory);
     }}

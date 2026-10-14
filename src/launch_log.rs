@@ -256,6 +256,60 @@ pub fn append_history(history: &Path, label: &str, outcome: &str, log: Option<&P
     }
 }
 
+/// Append `[time] [launcher] <line>` lines to an existing launch log (the pre-signed and
+/// batch paths add their trigger and W20 lines to the session's log; 07d §4.2, 08 §4
+/// item 6). One append per line, flattened, like `SessionLog::line`; best effort.
+pub fn append_launcher_lines(log: &Path, lines: &[String]) {
+    if lines.is_empty() { return; }
+    if let Ok(mut file) = OpenOptions::new().append(true).open(log) {
+        let time = chrono::Local::now().format("%H:%M:%S");
+        for line in lines {
+            let flat: String = line.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+            let _ = file.write_all(format!("[{time}] [launcher] {flat}\n").as_bytes());
+        }
+    }
+}
+
+/// A sign-in that failed because the network was not there (07d §5.5): the W2U's
+/// "network not ready" verdict (any language), or polcore's -19 during the member login,
+/// as at 18:58 when DNS failed during a VPN start (08 §1 row 8). Such a failure never
+/// reached a password check, so retrying once the network is back costs no extra login.
+pub fn network_failure(message: &str) -> bool {
+    crate::viewer::is_network_not_ready_message(message) || message.contains("POL result -19)")
+}
+
+/// A sign-in that PlayOnline's member login refused: a verdict on the account, such as its
+/// password, or a one-time code it asked for and was not given. The loader's words are the
+/// same for both (only POL's result number differs, and none is known to mean "a code is
+/// needed"), so a refused sign-in that went without a code may be an account that now uses one.
+/// Only the loader's member-login stage counts: its network-level connection fails before any
+/// password or code is sent, a cancelled login gave no verdict, and a network failure (-19) is
+/// none either. An older loader names no stage, so none of its failures count.
+pub fn sign_in_refused(message: &str) -> bool {
+    message.contains("Native PlayOnline member login failed (state ") && !network_failure(message)
+}
+
+/// A sign-in that ended because its worker or game host went away before reporting a
+/// result (no password, OTP or version verdict was given), so the same Play can be started
+/// again (07d §5.4).
+pub fn transient_failure(message: &str) -> bool {
+    use crate::i18n::Lang;
+    const ENDED: [&str; 5] = [
+        "The background session worker ended before starting the game.",
+        "The background session worker ended.",
+        "The background session worker ended unexpectedly. Check the game's connection.",
+        "The background session ended before starting the game.",
+        "Game exited during startup",
+    ];
+    [Lang::En, Lang::Ja].into_iter().any(|lang| ENDED.iter().any(|text| {
+        let shown = crate::i18n::t_in(lang, text);
+        // "Game exited during startup" alone, never "… with code N" or a loader error.
+        if *text == "Game exited during startup" {
+            message.split_once(" (").map_or(message, |(head, _)| head).trim_end_matches('.') == shown
+        } else { message.starts_with(shown) }
+    }))
+}
+
 /// Split a launch error such as `"Client exited (...). Log: C:\x\a.stderr.log"` into the
 /// message and the log path it points at.
 pub fn split_log(error: &str) -> (&str, Option<PathBuf>) {
@@ -453,6 +507,69 @@ mod tests {
         );
         assert!(!line.contains('\n') && !line.contains('\r'));
         assert!(history_line("t", "a", "b", None).ends_with("| b | -"));
+    }
+
+    /// 07d §5.4-5.5: only a missing network or a host that went away without a verdict
+    /// may start the same sign-in again; a refused password, an OTP, an update or a
+    /// loader error never does.
+    #[test]
+    fn retryable_failures_are_network_or_a_vanished_host_only() {
+        crate::i18n::set(crate::i18n::Lang::En);
+        assert!(network_failure("Game loader error during startup: Native PlayOnline login failed (state 39, POL result -19). (Windower via crystal-loader)."));
+        assert!(!network_failure("Game loader error during startup: Native PlayOnline login failed (state 39, POL result -1036). (Windower via crystal-loader)."));
+        assert!(!network_failure("Game loader error during startup: Native PlayOnline login failed (state 39, POL result -190)."));
+        for message in ["The background session worker ended before starting the game.", "The background session worker ended.",
+            "Game exited during startup (Windower via crystal-loader).", "The background session ended before starting the game."] {
+            assert!(transient_failure(message), "{message}");
+        }
+        for message in ["Game exited during startup with code 0 (Windower via crystal-loader).",
+            "Game loader error during startup: Native PlayOnline login failed (state -1036, POL result -1036). (Windower via crystal-loader).",
+            "Enter a six-digit one-time code, or leave it empty.", "Sign-in failed"] {
+            assert!(!transient_failure(message), "{message}");
+        }
+    }
+
+    /// Owner decision 2026-10-13: a code-less sign-in the member login refused may be an account
+    /// that now uses a one-time code. A network failure, a vanished host, a login that never
+    /// started or a loader error is no refusal. Review finding: neither is a failure of the
+    /// network-level connection before any password is sent (POL down or unreachable), a
+    /// cancelled login, nor an older loader's unnamed stage.
+    #[test]
+    fn member_login_refusals_are_told_apart_from_other_failures() {
+        for message in ["Game loader error during startup: Native PlayOnline member login failed (state 39, POL result -1036). (Windower via crystal-loader).",
+            "Game loader error during startup: Native PlayOnline member login failed (state -1036, POL result -1036). (Windower via crystal-loader)."] {
+            assert!(sign_in_refused(message), "{message}");
+        }
+        for message in ["Game loader error during startup: Native PlayOnline member login failed (state 39, POL result -19). (Windower via crystal-loader).",
+            "Game loader error during startup: Native PlayOnline network connection failed (state -1025, POL result -1036). (Windower via crystal-loader).",
+            "Game loader error during startup: Native PlayOnline network connection failed (state 30, POL result 0). (Windower via crystal-loader).",
+            "Game loader error during startup: Native PlayOnline login was cancelled at state -1 (POL result -1036). (Windower via crystal-loader).",
+            "Game loader error during startup: Native PlayOnline login failed (state 39, POL result -1036). (Windower via crystal-loader).",
+            "Game loader error during startup: Native PlayOnline login could not start (mode 1, POL result -3).",
+            "Game loader error during startup: Native PlayOnline login timed out at state 23.",
+            "The background session worker ended before starting the game.",
+            "Game loader error during startup: FFXiMain.dll not found", "Sign-in failed"] {
+            assert!(!sign_in_refused(message), "{message}");
+        }
+        // Either stage's -19 is still the network failure that is retried.
+        assert!(network_failure("Game loader error during startup: Native PlayOnline network connection failed (state -19, POL result -19). (Windower via crystal-loader)."));
+        assert!(network_failure("Game loader error during startup: Native PlayOnline member login failed (state 39, POL result -19). (Windower via crystal-loader)."));
+    }
+
+    #[test]
+    fn launcher_lines_append_flattened_to_an_existing_log_only() {
+        let dir = std::env::temp_dir().join(format!("xi-launch-lines-{}", crate::backend::unique_id().unwrap()));
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("a.crystal.log");
+        append_launcher_lines(&log, &["never created".into()]);
+        assert!(!log.exists(), "only an existing session log is appended to");
+        fs::write(&log, "[00:00:00] [launcher] first\n").unwrap();
+        append_launcher_lines(&log, &["launch trigger: pre-signed Play".into(), "two\nlines".into()]);
+        let text = fs::read_to_string(&log).unwrap();
+        assert_eq!(text.lines().count(), 3);
+        assert!(text.lines().nth(1).unwrap().ends_with("[launcher] launch trigger: pre-signed Play"));
+        assert!(text.lines().nth(2).unwrap().ends_with("[launcher] two lines"));
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

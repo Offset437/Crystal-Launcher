@@ -83,8 +83,17 @@ pub enum Milestone {
     Hello,
     /// The session line reached the loader.
     SessionSent,
+    /// A parked host got its `credentials` line (pol-spec 07d §1.2): replaces
+    /// ToolStarted/Hello/SessionSent on the parked path.
+    CredentialsSent,
     /// The loader reported `started` (GameStart called).
     GameStarted,
+    /// This sign-in's Viewer check (W2U :54000) closed and was answered (pol-spec 07c §4).
+    ViewerChecked,
+    /// The loader's `native_main_menu`: the Viewer presence publish completed.
+    MainMenu,
+    /// The FFXI version check (W20 :53001) returned its verdict.
+    GameChecked,
     /// A native client process was spawned.
     ClientSpawned,
     /// The native client's login marker appeared.
@@ -100,7 +109,11 @@ impl Milestone {
             Self::ToolStarted => "tool process started",
             Self::Hello => "loader hello",
             Self::SessionSent => "session delivered",
+            Self::CredentialsSent => "credentials delivered",
             Self::GameStarted => "game started",
+            Self::ViewerChecked => "W2U done",
+            Self::MainMenu => "main menu reached",
+            Self::GameChecked => "W20 done",
             Self::ClientSpawned => "client process spawned",
             Self::LoginAccepted => "login accepted",
         }
@@ -132,20 +145,138 @@ impl Milestone {
             Self::ToolStarted => "tool",
             Self::Hello => "hello",
             Self::SessionSent => "session",
+            Self::CredentialsSent => "credentials",
             Self::GameStarted => "game started",
+            Self::ViewerChecked => "W2U",
+            Self::MainMenu => "main menu",
+            Self::GameChecked => "W20",
             Self::ClientSpawned => "client started",
             Self::LoginAccepted => "login accepted",
         }
     }
 }
 
+/// What started a launch (pol-spec 07d §4.2): one `launch trigger: <name>` line per launch
+/// log, right after `launch clock`, so measurements can be split by path.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum LaunchTrigger {
+    /// The Play button on an account that is not signed in (cold).
+    #[default]
+    Play,
+    /// "Sign accounts in when Crystal opens" (Settings → System), for each account known to
+    /// sign in without a one-time code.
+    StartupSignIn,
+    /// The one retry of a startup sign-in that failed on the network (07d §5.5).
+    StartupRetry,
+    /// The explicit sign-in ("Connect").
+    Connect,
+    /// A Play that adopted this account's parked host.
+    ParkedPlay,
+    /// An explicit sign-in that adopted this account's parked host.
+    ParkedConnect,
+    /// A Play on a session already at its main menu (W20 + StartGame only).
+    PreSignedPlay,
+    /// A Play queued during a pre-sign-in (started together once its main menu is idle).
+    QueuedPlay,
+    /// A multi-account Play (the batch coordinator).
+    BatchPlay,
+    /// A queued Play re-issued cold after its pre-sign-in failed (07d §5.4).
+    ReissuedPlay,
+    /// A pre-signed account signed back in after its game closed (owner, 2026-10-12).
+    SignInAfterGame,
+    /// The one retry of that sign-in after it failed on the network.
+    SignInAfterGameRetry,
+}
+impl LaunchTrigger {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Play => "Play",
+            Self::StartupSignIn => "startup sign-in",
+            Self::StartupRetry => "startup sign-in retry",
+            Self::Connect => "Connect",
+            Self::ParkedPlay => "parked Play",
+            Self::ParkedConnect => "parked Connect",
+            Self::PreSignedPlay => "pre-signed Play",
+            Self::QueuedPlay => "queued Play",
+            Self::BatchPlay => "batch Play",
+            Self::ReissuedPlay => "re-issued Play",
+            Self::SignInAfterGame => "sign-in after game",
+            Self::SignInAfterGameRetry => "sign-in after game retry",
+        }
+    }
+    /// The launch-log line.
+    pub(crate) fn line(self) -> String { format!("launch trigger: {}", self.name()) }
+    /// A sign-in Crystal starts by itself, without a code (owner decision 2026-10-13): at its
+    /// start, after a game closed, or the one network retry of either.
+    pub(crate) fn is_presign(self) -> bool {
+        matches!(self, Self::StartupSignIn | Self::StartupRetry | Self::SignInAfterGame | Self::SignInAfterGameRetry)
+    }
+}
+
+/// TCP timer quanta that a lost packet adds to one step (08 §1 row 1): Windows' SYN (or
+/// DNS) retry, Square Enix's SYN-ACK retransmission, its data retransmission, and that
+/// one doubled. (low, high) in seconds.
+const LOSS_QUANTA: [(f64, f64, &str); 4] = [
+    (1.0, 1.0, "1.0 s SYN/DNS retry"),
+    (3.36, 3.36, "3.36 s SYN-ACK retransmission"),
+    (4.1, 4.55, "4.1-4.55 s server retransmission"),
+    (8.2, 9.1, "8.2-9.1 s doubled server retransmission"),
+];
+const LOSS_SLACK: f64 = 0.15;
+
+/// A "possible packet loss" note when `actual` exceeds the step's `clean` value by one
+/// quantum, or by two, ±0.15 s (07d §4.5). The same format is written by the loader
+/// for its own request steps. `None` when it does not fit.
+pub(crate) fn possible_loss(step: &str, actual: Duration, clean: Duration) -> Option<String> {
+    let excess = actual.as_secs_f64() - clean.as_secs_f64();
+    let fits = |low: f64, high: f64| excess >= low - LOSS_SLACK && excess <= high + LOSS_SLACK;
+    let label = LOSS_QUANTA.iter().find(|(low, high, _)| fits(*low, *high)).map(|(.., name)| (*name).to_owned())
+        .or_else(|| LOSS_QUANTA.iter().flat_map(|a| LOSS_QUANTA.iter().map(move |b| (a, b)))
+            .find(|(a, b)| fits(a.0 + b.0, a.1 + b.1)).map(|(a, b)| format!("{} + {}", a.2, b.2)))?;
+    Some(format!("possible packet loss: {step} took {:.2} s, {excess:+.2} s over its clean {:.2} s ({label})",
+        actual.as_secs_f64(), clean.as_secs_f64()))
+}
+
+/// Clean W2U/W20 step durations on this PC (07d §4.5 table: resolve warm, connect and
+/// reply one RTT each).
+const CHECK_CLEAN: [(&str, Duration); 3] = [
+    ("resolve", Duration::from_millis(3)),
+    ("connect", Duration::from_millis(180)),
+    ("reply", Duration::from_millis(170)),
+];
+
+/// The launch-log lines for one stock version check on any path (07d §2.4, §4.5):
+/// `<check>: <phases>.` (when there are phases), then a loss note for each attempt step
+/// that overshoots its clean value by a TCP timer quantum. `check` is
+/// `Viewer check (W2U)` or `FFXI check (W20)`.
+pub(crate) fn check_lines(check: &str, timing: &crate::patch::CheckTiming) -> Vec<String> {
+    let mut lines: Vec<String> = timing.phases().map(|phases| format!("{check}: {phases}.")).into_iter().collect();
+    let short = check.rsplit_once('(').map_or(check, |(_, name)| name.trim_end_matches(')'));
+    let several = timing.attempts.len() > 1;
+    for (index, attempt) in timing.attempts.iter().enumerate() {
+        for ((name, clean), actual) in CHECK_CLEAN.iter().zip([attempt.resolve, attempt.connect, attempt.reply]) {
+            let Some(actual) = actual else { continue };
+            let step = if several { format!("{short} attempt {} {name}", index + 1) } else { format!("{short} {name}") };
+            lines.extend(possible_loss(&step, actual, *clean));
+        }
+    }
+    lines
+}
+
 /// Phases reported as their own duration. Native POL signs in after the tool
 /// starts; older routes sign in first, so their actual timestamps set the order.
-const PHASES: [Milestone; 5] = [
+/// The stock checks and the main menu (pol-spec 07c §5.1) split the native sign-in:
+/// W2U before the member login, the main-menu publish after it, then W20.
+const PHASES: [Milestone; 9] = [
     Milestone::SignInDone,
     Milestone::ToolStarted,
     Milestone::Hello,
     Milestone::SessionSent,
+    Milestone::CredentialsSent,
+    Milestone::ViewerChecked,
+    Milestone::MainMenu,
+    Milestone::GameChecked,
     Milestone::ClientSpawned,
 ];
 /// How far a launch got, best first; the best one reached is reported as a total from the click.
@@ -177,9 +308,24 @@ impl Timeline {
         Self { start, marks: Vec::new(), written: 0 }
     }
 
+    /// When counting started (the Play click).
+    pub(crate) fn started(&self) -> Instant {
+        self.start
+    }
+
+    /// Matches the game host's read-only title timestamp on the same PC.
+    pub(crate) fn start_host_micros(&self) -> Option<u64> {
+        let stamp = MonotonicStamp::capture(self.start)?;
+        u64::try_from(stamp.ticks as u128 * 1_000_000 / stamp.frequency as u128).ok()
+    }
+
     /// Record a milestone now.
     pub fn mark(&mut self, milestone: Milestone) {
         self.push(self.start.elapsed(), Some(milestone), milestone.log_label().to_owned());
+    }
+    /// Record a milestone reached at `at` on another thread (W20 finishes on its own).
+    pub fn mark_at(&mut self, milestone: Milestone, at: Instant) {
+        self.push(at.saturating_duration_since(self.start), Some(milestone), milestone.log_label().to_owned());
     }
     /// Record a sign-in stage now. The name comes from the sign-in library's progress text;
     /// it is flattened and capped so nothing odd can reach a log line.
@@ -395,6 +541,30 @@ mod tests {
     }
 
     #[test]
+    fn native_play_summary_shows_the_stock_checks_and_the_main_menu() {
+        let mut play = timeline(&[
+            (200, Milestone::ToolStarted),
+            (2800, Milestone::Hello),
+            (2810, Milestone::SessionSent),
+            (4000, Milestone::ViewerChecked),
+            (10000, Milestone::SignInDone),
+            (11500, Milestone::MainMenu),
+            (11900, Milestone::GameChecked),
+            (12400, Milestone::GameStarted),
+        ]);
+        assert_eq!(play.summary(), "tool 0.2s, hello 2.6s, session 0.0s, W2U 1.2s, sign-in 6.0s, main menu 1.5s, W20 0.4s, game started 12.4s");
+        assert_eq!(play.row_summary(), "Signed in 10.0s · game started 12.4s");
+        let lines = play.unwritten_lines();
+        for label in ["W2U done", "main menu reached", "W20 done"] {
+            assert!(lines.iter().any(|line| line.ends_with(label)), "{label}: {lines:?}");
+        }
+        // A check finished on its own thread keeps its own instant.
+        let mut t = Timeline::begin_at(Instant::now() - Duration::from_secs(2));
+        t.mark_at(Milestone::GameChecked, t.start + Duration::from_millis(1500));
+        assert_eq!(t.elapsed_at(Milestone::GameChecked), Some(Duration::from_millis(1500)));
+    }
+
+    #[test]
     fn summary_stops_where_the_launch_stopped() {
         let unconfirmed = timeline(&[(2800, Milestone::SignInDone), (3200, Milestone::ToolStarted), (5100, Milestone::Hello)]);
         assert_eq!(unconfirmed.summary(), "sign-in 2.8s, tool 0.4s, hello 1.9s");
@@ -492,5 +662,48 @@ mod tests {
         assert_eq!(text.lines().count(), 2);
         assert!(text.lines().next().unwrap().contains("[launcher] timing +2.80s (+2.80s) sign-in done"));
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// pol-spec 07d §4.5: the excesses measured on 2026-10-12 (08 §1 row 1).
+    #[test]
+    fn possible_loss_matches_tcp_timer_quanta_only() {
+        let s = Duration::from_secs_f64;
+        assert_eq!(possible_loss("status", s(5.25), s(1.15)).as_deref(),
+            Some("possible packet loss: status took 5.25 s, +4.10 s over its clean 1.15 s (4.1-4.55 s server retransmission)"));
+        assert!(possible_loss("member connect", s(4.40), s(1.04)).unwrap().ends_with("(3.36 s SYN-ACK retransmission)"));
+        assert!(possible_loss("W2U connect", s(1.18), s(0.18)).unwrap().ends_with("(1.0 s SYN/DNS retry)"));
+        // 18:59 characters +12.1 s = 4.05 + 8.1: two quanta (the pair named is the first that fits).
+        assert!(possible_loss("characters", s(13.25), s(1.1)).unwrap().contains(" + 8.2-9.1 s doubled server retransmission)"));
+        for (actual, clean) in [(1.30, 1.15), (2.6, 1.15), (2.9, 1.15), (7.0, 1.15)] {
+            assert_eq!(possible_loss("lists", s(actual), s(clean)), None, "{actual}");
+        }
+    }
+
+    /// 07d §2.4, §4.5: the phases line (whatever `phases()` words) and then one loss note per
+    /// overshooting step; attempts are numbered only when there were several.
+    #[test]
+    fn check_lines_give_the_phases_then_loss_notes_per_step() {
+        use crate::patch::{Attempt, CheckTiming};
+        let ms = Duration::from_millis;
+        let clean = Attempt { resolve: Some(ms(3)), connect: Some(ms(180)), reply: Some(ms(164)), close: Some(ms(104)), ..Default::default() };
+        let lost = Attempt { connect: Some(ms(1180)), ..clean.clone() };
+        let one = CheckTiming { attempts: vec![lost.clone()], ..Default::default() };
+        let phases = |timing: &CheckTiming, check: &str| timing.phases().map(|p| format!("{check}: {p}.")).into_iter().collect::<Vec<_>>();
+        let mut expected = phases(&one, "Viewer check (W2U)");
+        expected.push("possible packet loss: W2U connect took 1.18 s, +1.00 s over its clean 0.18 s (1.0 s SYN/DNS retry)".into());
+        assert_eq!(check_lines("Viewer check (W2U)", &one), expected);
+        let two = CheckTiming { attempts: vec![clean.clone(), Attempt { reply: Some(ms(4440)), ..clean.clone() }], ..Default::default() };
+        let lines = check_lines("FFXI check (W20)", &two);
+        assert_eq!(lines.last().unwrap(), "possible packet loss: W20 attempt 2 reply took 4.44 s, +4.27 s over its clean 0.17 s (4.1-4.55 s server retransmission)");
+        assert_eq!(lines.len(), phases(&two, "FFXI check (W20)").len() + 1);
+        assert_eq!(check_lines("FFXI check (W20)", &CheckTiming { attempts: vec![clean], ..Default::default() }).iter()
+            .filter(|line| line.starts_with("possible packet loss")).count(), 0);
+    }
+
+    #[test]
+    fn launch_triggers_have_fixed_names_and_default_to_play() {
+        assert_eq!(LaunchTrigger::default(), LaunchTrigger::Play);
+        assert_eq!(LaunchTrigger::ParkedPlay.line(), "launch trigger: parked Play");
+        assert_eq!(serde_json::to_string(&LaunchTrigger::StartupSignIn).unwrap(), "\"startup_sign_in\"");
     }
 }

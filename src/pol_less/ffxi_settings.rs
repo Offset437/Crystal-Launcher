@@ -191,6 +191,47 @@ fn xml_profiles(xml: &[u8]) -> Result<Vec<XmlProfile>, String> {
     Ok(profiles)
 }
 
+/// What settings.xml says, independent of how it is written: every element, attribute and
+/// non-blank text in order, digested. Windower's exit save rewrites the file (new mtime)
+/// from its start-up snapshot; that is no edit (park fingerprint, 07d §1.5). `None` while the
+/// file doesn't parse or ends early (a save in progress).
+pub(crate) fn settings_digest(xml: &[u8]) -> Option<u64> {
+    use quick_xml::events::Event;
+    use std::hash::{Hash, Hasher};
+    let mut reader = quick_xml::Reader::from_reader(xml);
+    let mut buffer = Vec::new();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut depth = 0usize;
+    let element = |kind: u8, e: &quick_xml::events::BytesStart, hasher: &mut std::collections::hash_map::DefaultHasher| -> Option<()> {
+        kind.hash(hasher);
+        e.name().as_ref().hash(hasher);
+        for attribute in e.attributes() {
+            let attribute = attribute.ok()?;
+            (attribute.key.as_ref(), attribute.value.as_ref()).hash(hasher);
+        }
+        Some(())
+    };
+    loop {
+        match reader.read_event_into(&mut buffer).ok()? {
+            Event::Start(e) => { depth += 1; element(0, &e, &mut hasher)?; }
+            Event::Empty(e) => element(1, &e, &mut hasher)?,
+            Event::End(e) => { depth = depth.checked_sub(1)?; (2u8, e.name().as_ref()).hash(&mut hasher); }
+            Event::Text(text) => {
+                let text: &[u8] = &text;
+                let text = text.trim_ascii();
+                if !text.is_empty() { (3u8, text).hash(&mut hasher); }
+            }
+            Event::CData(text) => (4u8, &*text as &[u8]).hash(&mut hasher),
+            Event::GeneralRef(name) => (5u8, &*name as &[u8]).hash(&mut hasher),
+            Event::Eof => break,
+            // The declaration, comments and processing instructions say nothing to Windower.
+            _ => {}
+        }
+        buffer.clear();
+    }
+    (depth == 0).then(|| hasher.finish())
+}
+
 /// `Profile.Get(name)` after `Profile.Load`: the profile matching `name` ignoring case, the
 /// unnamed default for "". Refuse a missing explicit choice instead of accepting
 /// Windower's fallback, which would silently replace the user's chosen layout.
@@ -350,9 +391,11 @@ fn apply_menu(values: &mut Vec<(&'static str, Value)>, (w, h): (u32, u32)) {
     values.extend([("0037", Value::Dword(w)), ("0038", Value::Dword(h))]);
 }
 
-pub(crate) fn menu_settings(size: (u32, u32)) -> WindowerSettings {
+pub(crate) fn menu_settings(size: Option<(u32, u32)>) -> WindowerSettings {
     let mut values = Vec::new();
-    apply_menu(&mut values, size);
+    // An empty object prepares live controller updates without overriding the
+    // initial registry or a launch tool's own controller configuration.
+    if let Some(size) = size { apply_menu(&mut values, size); }
     WindowerSettings { json: to_json(&values), count: values.len(), note: None }
 }
 
@@ -563,7 +606,10 @@ mod tests {
 
     #[test]
     fn retained_menu_settings_for_other_launch_methods_only_set_the_menu_size() {
-        let ashita: serde_json::Value = serde_json::from_str(&menu_settings((1024, 576)).json).unwrap();
+        let ashita: serde_json::Value = serde_json::from_str(&menu_settings(Some((1024, 576))).json).unwrap();
         assert_eq!(ashita, serde_json::json!({"0037":1024,"0038":576}));
+        let stock = menu_settings(None);
+        assert_eq!(stock.json, "{}");
+        assert_eq!(stock.count, 0);
     }
 }

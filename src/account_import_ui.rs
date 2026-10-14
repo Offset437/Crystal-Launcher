@@ -126,7 +126,6 @@ impl App {
                     self.editor = Some(Editor {
                         game_install: key.as_ref().and_then(|key| self.settings.account_installs.get(key)).cloned().unwrap_or_default(),
                         dat_overlays: key.as_ref().and_then(|key| self.settings.account_overlays.get(key)).cloned().unwrap_or_default(),
-                        startup_signin: key.as_ref().is_some_and(|key| self.settings.account_startup_signin.contains(key)),
                         auto_login, key, account,
                     });
                     state.open = false;

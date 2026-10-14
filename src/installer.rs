@@ -86,7 +86,8 @@ fn client() -> Result<Client, String> {
                 attempt.error(t("Installer redirect left the official HTTPS download host"))
             }
         }))
-        .user_agent("XI-Launcher/0.1 official-installer")
+        // Square Enix's download host sees a browser, as for a player downloading it.
+        .user_agent(crate::services::browser_user_agent())
         .build()
         .map_err(|e| e.to_string())
 }

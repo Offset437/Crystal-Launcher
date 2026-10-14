@@ -35,7 +35,19 @@ fn open(path: &Path) -> Option<File> {
     OpenOptions::new().create(true).append(true).open(path).ok()
 }
 
+// Tests read this thread's lines (no file is opened under test).
+#[cfg(test)]
+thread_local! { static CAPTURE: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) }; }
+#[cfg(test)]
+pub(crate) fn capture(work: impl FnOnce()) -> Vec<String> {
+    CAPTURE.with(|lines| *lines.borrow_mut() = Some(Vec::new()));
+    work();
+    CAPTURE.with(|lines| lines.borrow_mut().take().unwrap())
+}
+
 pub fn write(msg: std::fmt::Arguments<'_>) {
+    #[cfg(test)]
+    CAPTURE.with(|lines| { if let Some(lines) = lines.borrow_mut().as_mut() { lines.push(msg.to_string()); } });
     let mut guard = SINK.lock().unwrap_or_else(|e| e.into_inner());
     let Some(f) = guard.as_mut() else { return };
     // SAFETY: GetLocalTime only writes the SYSTEMTIME it is given.

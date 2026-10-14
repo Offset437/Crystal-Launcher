@@ -1,6 +1,6 @@
 [package]
 name = "xi-launcher"
-version = "1.0.8"
+version = "1.0.9"
 edition = "2021"
 license = "GPL-3.0-only"
 publish = false
@@ -42,7 +42,11 @@ windows-sys = { version = "=0.61.2", features = [
     "Win32_System_Pipes", "Win32_System_IO", # session pipe
     "Win32_Globalization",
     "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinSock", # stock-shaped version-check sockets (stock_socket.rs)
+    "Win32_NetworkManagement_Dns", # DnsQuery_W(DNS_QUERY_BYPASS_CACHE) for W2U retries (dns.rs)
+    "Win32_Devices_DeviceAndDriverInstallation", "Win32_Devices_Properties",
 ] }
+windows = { version = "=0.58.0", features = ["Devices_Power", "Gaming_Input", "Foundation_Collections", "System_Power"] }
 zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] } # read the pinned release zip (inflate only, no zopfli)
 
 [build-dependencies]

@@ -4,6 +4,7 @@
 
 use crate::i18n::t;
 use std::{
+    fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -56,6 +57,11 @@ pub(crate) fn candidates(tool: Tool) -> Vec<PathBuf> {
 
 pub(crate) fn is_install(tool: Tool, folder: &Path) -> bool {
     tool.product().is_some_and(|product| crate::discovery::is_install(product, folder))
+}
+
+/// Validate a discovered hint without starting a new inventory scan.
+pub(crate) fn validated_folder(tool: Tool, folder: &Path) -> Option<PathBuf> {
+    crate::discovery::validated_folder(tool.product()?, folder)
 }
 
 /// A valid configured folder wins; a stale path copied from another PC falls
@@ -401,9 +407,58 @@ pub(crate) fn windower_command(
     Ok(command)
 }
 
+/// What Windower's update chain may rewrite before it injects (pol-spec 07d §4.6; 08 §1
+/// row 2): its update records, the add-on tree, and its own binaries and plugins.
+const WINDOWER_UPDATED: [&str; 6] = [r"updates\manifest.xml", r"updates\resources.xml", r"updates\addons.json", r"updates\addons", "Hook.dll", "Windower.exe"];
+
+/// (relative name, size and mtime in ns; `None` when missing) for each file Windower's update
+/// chain touches, plugins included, in a fixed order. Local metadata only.
+pub(crate) fn windower_files(windower: &Path) -> Vec<(String, Option<(u64, u128)>)> {
+    let stamp = |path: &Path| fs::metadata(path).ok().map(|m| (m.len(),
+        m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos())));
+    let mut files: Vec<_> = WINDOWER_UPDATED.iter().map(|name| (name.to_string(), stamp(&windower.join(name)))).collect();
+    let mut plugins: Vec<_> = fs::read_dir(windower.join("plugins")).into_iter().flatten().flatten()
+        .filter(|entry| entry.path().extension().is_some_and(|e| e.eq_ignore_ascii_case("dll")))
+        .map(|entry| (format!(r"plugins\{}", entry.file_name().to_string_lossy()), stamp(&entry.path())))
+        .collect();
+    plugins.sort();
+    files.extend(plugins);
+    files
+}
+
+/// The names whose size or mtime differ (added and removed included), in snapshot order.
+pub(crate) fn windower_changes(before: &[(String, Option<(u64, u128)>)], after: &[(String, Option<(u64, u128)>)]) -> Vec<String> {
+    let mut changed: Vec<String> = after.iter().filter(|file| !before.contains(file)).map(|(name, _)| name.clone()).collect();
+    changed.extend(before.iter().filter(|(name, _)| !after.iter().any(|(other, _)| other == name)).map(|(name, _)| name.clone()));
+    changed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 07d §4.6: only what changed between the spawn and the hello is named.
+    #[test]
+    fn windower_update_snapshot_names_changed_files_only() {
+        let root = std::env::temp_dir().join(format!("crystal-windower-files-{}", crate::backend::unique_id().unwrap()));
+        fs::create_dir_all(root.join(r"updates\addons")).unwrap();
+        fs::create_dir_all(root.join("plugins")).unwrap();
+        for file in [r"updates\manifest.xml", "Hook.dll", "Windower.exe", r"plugins\Timestamp.dll", r"plugins\readme.txt"] {
+            fs::write(root.join(file), b"v1").unwrap();
+        }
+        let before = windower_files(&root);
+        assert_eq!(before.len(), WINDOWER_UPDATED.len() + 1, "plugins: DLLs only");
+        assert!(windower_changes(&before, &windower_files(&root)).is_empty());
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(root.join("Hook.dll"), b"v2 longer").unwrap();
+        fs::write(root.join(r"updates\addons.json"), b"{}").unwrap();
+        fs::write(root.join(r"plugins\New.dll"), b"x").unwrap();
+        fs::remove_file(root.join(r"plugins\Timestamp.dll")).unwrap();
+        fs::write(root.join(r"plugins\readme.txt"), b"changed text").unwrap();
+        assert_eq!(windower_changes(&before, &windower_files(&root)),
+            vec![r"updates\addons.json", "Hook.dll", r"plugins\New.dll", r"plugins\Timestamp.dll"]);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     const PIPE: &str = r"\\.\pipe\crystal-loader-00112233445566778899aabbccddeeff";
 

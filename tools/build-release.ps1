@@ -10,6 +10,7 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 $originalTarget = $env:CARGO_TARGET_DIR
 $originalLoader = $env:CRYSTAL_LOADER_EXE
+$originalEncodedRustFlags = $env:CARGO_ENCODED_RUSTFLAGS
 $appTarget = if ($originalTarget) { [IO.Path]::GetFullPath($originalTarget, $root) } else { Join-Path $root 'target' }
 $loaderTarget = if ($LoaderTargetDir) { [IO.Path]::GetFullPath($LoaderTargetDir, $root) }
     elseif ($originalTarget) { $appTarget } else { Join-Path $root 'crystal-loader\target' }
@@ -21,6 +22,16 @@ if ($InstallerCompiler -and [IO.Path]::GetFileName($out) -cne 'Crystal-Launcher.
 if ($Offline) { $offlineArgs = @('--offline') }
 
 try {
+    # Keep local user and build paths out of distributed executables.
+    [string[]]$buildRustFlags = @()
+    if ($originalEncodedRustFlags) { $buildRustFlags = $originalEncodedRustFlags.Split([char]31) }
+    elseif ($env:RUSTFLAGS) { $buildRustFlags = $env:RUSTFLAGS -split '\s+' }
+    $buildUserProfile = [Environment]::GetFolderPath('UserProfile')
+    if ($buildUserProfile) { $buildRustFlags += "--remap-path-prefix=$buildUserProfile=build" }
+    $buildRustFlags += "--remap-path-prefix=$root=crystal-launcher"
+    $buildRustFlags += "--remap-path-prefix=$appTarget=target"
+    $buildRustFlags += "--remap-path-prefix=$loaderTarget=host-target"
+    $env:CARGO_ENCODED_RUSTFLAGS = [string]::Join([char]31, $buildRustFlags)
     $env:CARGO_TARGET_DIR = $loaderTarget
     Push-Location (Join-Path $root 'crystal-loader')
     try {
@@ -67,4 +78,5 @@ try {
 } finally {
     $env:CARGO_TARGET_DIR = $originalTarget
     $env:CRYSTAL_LOADER_EXE = $originalLoader
+    $env:CARGO_ENCODED_RUSTFLAGS = $originalEncodedRustFlags
 }

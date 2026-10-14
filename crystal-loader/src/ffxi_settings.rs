@@ -119,6 +119,8 @@ struct Store {
 
 static STORE: Mutex<Option<Store>> = Mutex::new(None);
 static FFXIMAIN_DONE: AtomicBool = AtomicBool::new(false);
+static REGISTRY_DONE: AtomicBool = AtomicBool::new(false);
+static REGISTRY_SLOTS: [AtomicUsize; 6] = [const { AtomicUsize::new(0) }; 6];
 static KEY_LOGGED: AtomicBool = AtomicBool::new(false);
 
 fn store() -> std::sync::MutexGuard<'static, Option<Store>> {
@@ -136,10 +138,10 @@ fn reg_data(name: &str, value: &SettingValue, ansi: &dyn Fn(&str) -> Vec<u8>) ->
     }
 }
 
-/// Makes the values available to the wrappers. Empty settings install nothing (and no hook
-/// is ever placed).
+/// Empty settings track the key while delegating all values to the prior
+/// registry/tool functions. Live controller changes can add overrides later.
 pub fn install(settings: Option<FfxiSettings>) {
-    let Some(settings) = settings.filter(|s| !s.is_empty()) else { return };
+    let Some(settings) = settings else { return };
     install_with(&settings, &to_ansi);
 }
 
@@ -151,6 +153,59 @@ fn install_with(settings: &FfxiSettings, ansi: &dyn Fn(&str) -> Vec<u8>) {
 /// True when the session carried settings to serve.
 pub fn active() -> bool {
     store().is_some()
+}
+
+pub(crate) fn controller_ready() -> bool {
+    if !REGISTRY_DONE.load(Ordering::Acquire) || !active() { return false; }
+    let wrappers = [w_open_key as *const () as usize, w_open_key_ex as *const () as usize,
+        w_create_key_ex as *const () as usize, w_query_value_ex as *const () as usize,
+        w_set_value_ex as *const () as usize, w_close_key as *const () as usize];
+    REGISTRY_SLOTS.iter().zip(wrappers).all(|(slot, wrapper)| import_matches(slot.load(Ordering::Acquire), wrapper))
+}
+
+fn import_matches(slot: usize, expected: usize) -> bool {
+    use windows_sys::Win32::System::{Diagnostics::Debug::ReadProcessMemory, Threading::GetCurrentProcess};
+    let mut current = 0usize;
+    let mut count = 0;
+    let size = std::mem::size_of::<usize>();
+    // A later injector must not make the stock reload bypass our overrides.
+    slot != 0 && unsafe { ReadProcessMemory(GetCurrentProcess(), slot as *const c_void,
+        (&mut current as *mut usize).cast(), size, &mut count) != 0 }
+        && count == size && current == expected
+}
+
+/// Replace only the live controller's process-local values. The game's
+/// already-open registry handle remains tracked; reinstalling the whole store
+/// here would lose it and make the reload fall through to global settings.
+pub(crate) fn update_controller_values(settings: &FfxiSettings, key: usize) -> Result<(), &'static str> {
+    if !controller_ready() {
+        return Err("This session cannot reload controller settings; restart the game from Crystal.");
+    }
+    let mut guard = store();
+    let state = guard.as_mut().ok_or("This session has no controller settings override; restart the game from Crystal.")?;
+    update_controller_store(state, settings, key)
+}
+
+fn update_controller_store(state: &mut Store, settings: &FfxiSettings, key: usize) -> Result<(), &'static str> {
+    if !state.keys.contains(&key) {
+        return Err("The game's controller settings handle is no longer available.");
+    }
+    // Keep this boundary narrow even if a future caller omits its validation.
+    if settings.entries.iter().any(|(name, value)| {
+        !["padmode000", "padsin000", "padguid000"].iter().any(|known| name.eq_ignore_ascii_case(known))
+            || !matches!(value, SettingValue::Text(text) if text.is_ascii())
+    }) {
+        return Err("The live request contains unsupported controller settings.");
+    }
+    let values: Vec<_> = settings.entries.iter().map(|(name, value)| reg_data(name, value, &|s| s.as_bytes().to_vec())).collect();
+    for value in values {
+        if let Some(old) = state.values.iter_mut().find(|old| old.name.eq_ignore_ascii_case(&value.name)) {
+            *old = value;
+        } else {
+            state.values.push(value);
+        }
+    }
+    Ok(())
 }
 
 fn to_ansi(s: &str) -> Vec<u8> {
@@ -512,11 +567,13 @@ unsafe fn redirect(base: usize, dll: &str, wanted: &[(&str, usize, usize)]) -> u
         let (_, wrapper, index) = wanted[w];
         let current = view[s].1;
         if current == wrapper {
+            if index < REGISTRY_SLOTS.len() { REGISTRY_SLOTS[index].store(slots[s].slot as usize, Ordering::Release); }
             done += 1;
             continue;
         }
         ORIGINAL[index].store(current, Ordering::Release);
         if write_slot(slots[s].slot, wrapper) {
+            if index < REGISTRY_SLOTS.len() { REGISTRY_SLOTS[index].store(slots[s].slot as usize, Ordering::Release); }
             done += 1;
         }
     }
@@ -571,6 +628,7 @@ pub fn apply_to_ffximain() -> bool {
     // SAFETY: FFXiMain.dll is loaded (GetModuleHandle found it).
     let n = unsafe { redirect(base, "ADVAPI32.dll", &wanted) };
     if n == wanted.len() {
+        REGISTRY_DONE.store(true, Ordering::Release);
         FFXIMAIN_DONE.store(true, Ordering::Release);
         log!("ffxi_settings: FFXiMain's registry imports redirected ({n}/{})", wanted.len());
     } else {
@@ -598,6 +656,37 @@ pub fn hook_ffxi_dll(base: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_controller_rejects_an_import_replaced_by_another_owner() {
+        let slot = AtomicUsize::new(123);
+        let address = &slot as *const AtomicUsize as usize;
+        assert!(import_matches(address, 123));
+        slot.store(456, Ordering::Release);
+        assert!(!import_matches(address, 123));
+        assert!(!import_matches(0, 123));
+    }
+
+    #[test]
+    fn live_controller_update_keeps_open_handles_and_unrelated_values() {
+        let value = |name, text: &str| reg_data(name, &SettingValue::Text(text.into()), &|s| s.as_bytes().to_vec());
+        let mut state = Store { values: vec![value("0042", "other"), value("padmode000", "old"), value("padexsin000", "extended")],
+            keys: vec![123, 456], reads: 7, writes: 2 };
+        let settings = FfxiSettings::new(vec![("PADMODE000".into(), SettingValue::Text("1,0,0,0,1,0".into())),
+            ("padsin000".into(), SettingValue::Text("1,2".into()))]).unwrap();
+        update_controller_store(&mut state, &settings, 123).unwrap();
+        assert_eq!(state.keys, vec![123, 456]);
+        assert_eq!((state.reads, state.writes), (7, 2));
+        assert_eq!(state.values.len(), 4);
+        assert_eq!(state.values[0], value("0042", "other"));
+        assert_eq!(state.values[2], value("padexsin000", "extended"));
+        assert_eq!(state.values[1], value("PADMODE000", "1,0,0,0,1,0"));
+        let before = state.values.clone();
+        assert!(update_controller_store(&mut state, &settings, 999).is_err());
+        let unrelated = FfxiSettings::new(vec![("0001".into(), SettingValue::Dword(1920))]).unwrap();
+        assert!(update_controller_store(&mut state, &unrelated, 123).is_err());
+        assert_eq!(state.values, before);
+    }
 
     static COM_CALLS: AtomicUsize = AtomicUsize::new(0);
     unsafe extern "system" fn fake_com(_clsid: *const GUID, _outer: *mut c_void, _ctx: u32, _iid: *const GUID, _out: *mut *mut c_void) -> HRESULT {
@@ -736,6 +825,21 @@ mod tests {
         ORIGINAL[I_QUERY].store(fake_query as *const () as usize, Ordering::SeqCst);
         ORIGINAL[I_SET].store(fake_set as *const () as usize, Ordering::SeqCst);
         ORIGINAL[I_CLOSE].store(fake_close as *const () as usize, Ordering::SeqCst);
+        *store() = None;
+        install(Some(FfxiSettings::default()));
+        assert!(active(), "an empty session prepares later live updates");
+        let mut tracked: HKEY = std::ptr::null_mut();
+        let sub = b"SOFTWARE\\PlayOnlineUS\\SquareEnix\\FinalFantasyXI\0";
+        assert_eq!(unsafe { w_create_key_ex(HKEY_LOCAL_MACHINE, sub.as_ptr(), 0, std::ptr::null(), 0,
+            0xF003F, std::ptr::null(), &mut tracked, std::ptr::null_mut()) }, 0);
+        assert!(store().as_ref().unwrap().keys.contains(&(tracked as usize)));
+        let queries = FAKE_QUERIES.load(Ordering::SeqCst);
+        assert_eq!(read_dword(tracked as usize, b"0001\0"), (0, REG_DWORD, 7));
+        assert_eq!(FAKE_QUERIES.load(Ordering::SeqCst), queries + 1);
+        let sets = FAKE_SETS.load(Ordering::SeqCst);
+        let value = 1600u32.to_le_bytes();
+        assert_eq!(unsafe { w_set_value_ex(tracked, b"0001\0".as_ptr(), 0, REG_DWORD, value.as_ptr(), 4) }, 0);
+        assert_eq!(FAKE_SETS.load(Ordering::SeqCst), sets + 1, "empty scope preserves ordinary writes");
         let settings = FfxiSettings::new(vec![
             ("0001".into(), SettingValue::Dword(1920)),
             ("0028".into(), SettingValue::Dword(0xBF80_0000)),

@@ -134,7 +134,7 @@ async fn official_download_staging_and_cache_resume() {
     let staged = root.join("staged");
     fs::create_dir(&staged).unwrap();
     let planned: Vec<_> = (0..manifest.files.len()).map(|index|
-        Planned { index, action: Action::Direct, original: None }).collect();
+        Planned { index, action: Action::Direct, original: None, keep: false }).collect();
     let encoded: u64 = manifest.files.iter().map(|h| h.current().direct_len).sum();
     let decoded: u64 = manifest.files.iter().map(|h| h.current().sig.len).sum();
     let op = Operation::new();

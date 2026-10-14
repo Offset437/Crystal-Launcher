@@ -81,7 +81,7 @@ pub(crate) fn view(app: &App) -> Element<'_, Message> {
         Tab::Controller => crate::gamepad::view(app),
         // Launch tools above the Windows components check.
         Tab::System => column![crate::self_update::view(app), crate::controller_nav::settings(app),
-            crate::launch_tools::view(app), crate::prereqs::view(app), ownership_notice(app)]
+            sign_in_switch(app), crate::launch_tools::view(app), crate::prereqs::view(app), ownership_notice(app)]
             .spacing(14.0 * s)
             .into(),
     };
@@ -127,6 +127,28 @@ fn ownership_notice(app: &App) -> Element<'_, Message> {
         text("FINAL FANTASY — registered trademark of Square Enix Holdings Co., Ltd.").font(BODY).size(12.0 * s).color(c.sub),
         text(t("Code licensing does not grant rights to game artwork or trademarks. See the included LICENSE and THIRD_PARTY.md.")).font(BODY).size(12.0 * s).color(c.sub),
     ].spacing(8.0 * s).padding([12.0 * s, 0.0]).into()
+}
+
+/// The one switch for Crystal's own sign-ins (owner decision 2026-10-13): every account it knows
+/// signs in without a one-time password is signed in when Crystal opens and again after its
+/// game closes (`Settings::presigns`). Character auto-select stays per account, in its editor.
+fn sign_in_switch(app: &App) -> Element<'_, Message> {
+    let c = colors(app.settings.light_theme);
+    column![
+        crate::controller_nav::toggler(app.settings.auto_sign_in)
+            .label(t("Sign accounts in when Crystal opens"))
+            .on_toggle(Message::AutoSignIn)
+            .font(BODY)
+            .text_size(13)
+            .size(18),
+        text(t("Accounts that sign in without a one-time password sign in to PlayOnline in the background when Crystal opens and again after their game closes, so Play starts FFXI without another sign-in."))
+            .font(BODY).size(12).color(c.sub),
+        text(t("Crystal learns this from each account's sign-ins: a new account joins after its first Play without a one-time password. Accounts that use one sign in only when you press Play."))
+            .font(BODY).size(12).color(c.sub),
+    ]
+    .spacing(10)
+    .padding([12, 0])
+    .into()
 }
 
 /// Privacy mode, under the language: like it, it applies to every page. The

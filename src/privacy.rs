@@ -6,8 +6,9 @@
 //! IDs, character and friend names (and other PlayOnline handles on mail),
 //! message subjects and bodies, and the Windows user name inside paths.
 //!
-//! Blurred text keeps its place, length and shape. Widget operations report
-//! one `▒` per character, so the original cannot be found, selected or copied.
+//! Blurred text uses the same neutral placeholder for every value, so its
+//! layout and glyphs do not reveal the original length or shape. Widget
+//! operations report a fixed stand-in that cannot be found, selected or copied.
 //! Text fields and drop-down labels use bullet masking instead.
 use iced::advanced::{layout, renderer, widget, Layout, Widget};
 use iced::widget::text::Text;
@@ -51,6 +52,9 @@ const BLUR_TEXT_PX: f32 = 12.5;
 const SPREAD: f32 = 0.7;
 /// The centre copy's alpha: no single copy reads as text.
 const PEAK_ALPHA: f32 = 0.09;
+/// Neither the drawn text nor the widget-tree text depends on the private value.
+const MASKED_TEXT: &str = "••••••••";
+const HIDDEN_TEXT: &str = "▒▒▒▒▒▒▒▒";
 
 /// The Gaussian's standard deviation for text of `size` px.
 pub(crate) fn blur_sigma(size: f32) -> f32 {
@@ -83,23 +87,21 @@ pub(crate) fn blur_taps(sigma: f32) -> Vec<Tap> {
     taps
 }
 
-/// What blurred text reports to the widget tree in place of itself: one `▒`
-/// per character. Never drawn and never the text.
-pub(crate) fn hidden(text: &str) -> String {
-    "\u{2592}".repeat(text.chars().count().max(1))
+/// What blurred text reports to the widget tree, independent of its value.
+pub(crate) fn hidden(_text: &str) -> String {
+    HIDDEN_TEXT.to_owned()
 }
 
-/// A text field's or drop-down's value where blur cannot apply: bullets, as
-/// many as the value has characters (at most 12), so lengths still differ.
+/// A text field's or drop-down's nonempty value where blur cannot apply:
+/// always eight bullets. Empty fields retain their ordinary placeholders.
 pub(crate) fn mask(value: &str) -> String {
     if !on() || value.is_empty() {
         return value.to_owned();
     }
-    "•".repeat(value.chars().count().clamp(4, 12))
+    MASKED_TEXT.to_owned()
 }
 
-/// Text drawn blurred. It lays out exactly as the wrapped `Text` would, then
-/// draws its paragraph as faint copies spread over a Gaussian.
+/// A neutral placeholder drawn blurred with the wrapped `Text`'s formatting.
 pub(crate) struct Blurred<'a> {
     text: Text<'a>,
     color: Option<Color>,
@@ -120,7 +122,26 @@ impl<M> Widget<M, Theme, iced::Renderer> for Blurred<'_> {
         <Text<'_> as Widget<M, Theme, iced::Renderer>>::size(&self.text)
     }
     fn layout(&mut self, tree: &mut widget::Tree, renderer: &iced::Renderer, limits: &layout::Limits) -> layout::Node {
-        <Text<'_> as Widget<M, Theme, iced::Renderer>>::layout(&mut self.text, tree, renderer, limits)
+        // Text has no public content/format accessors. Its layout exposes the
+        // paragraph's formatting; discard the original node and replace its
+        // content before drawing or operating on the tree. Recompute the node
+        // as well, so the original's width and wrapping cannot affect layout.
+        let size = <Text<'_> as Widget<M, Theme, iced::Renderer>>::size(&self.text);
+        let _ = <Text<'_> as Widget<M, Theme, iced::Renderer>>::layout(&mut self.text, tree, renderer, limits);
+        let paragraph = tree.state.downcast_mut::<TextState>();
+        let text = paragraph.as_text();
+        let format = widget::text::Format {
+            width: size.width,
+            height: size.height,
+            size: Some(text.size),
+            font: Some(text.font),
+            line_height: text.line_height,
+            align_x: text.align_x,
+            align_y: text.align_y,
+            shaping: text.shaping,
+            wrapping: text.wrapping,
+        };
+        widget::text::layout(paragraph, renderer, limits, MASKED_TEXT, format)
     }
     fn draw(
         &self,
@@ -159,7 +180,8 @@ impl<'a, M: 'a> From<Blurred<'a>> for Element<'a, M> {
 }
 
 /// `content` shown as `text` (built with its font, size and colour as usual),
-/// blurred while privacy mode is on. `size` is the text's size and `color`
+/// replaced by a fixed blurred placeholder while privacy mode is on.
+/// `size` is the text's size and `color`
 /// its colour (`None`: the parent's, as a button label takes the button's).
 pub(crate) fn name<'a, M: 'a>(text: Text<'a>, content: &str, size: f32, color: impl Into<Option<Color>>) -> Element<'a, M> {
     if !on() {
@@ -292,29 +314,36 @@ fn starts_with_ignore_case(text: &str, prefix: &str) -> bool {
 pub(crate) mod testing {
     //! Collects the text a view reports to the widget tree, as a screen
     //! reader or a test selector would see it.
-    use iced::advanced::widget::{Operation, Tree};
+    use iced::advanced::widget::{self, Operation, Tree};
     use iced::advanced::{layout, Layout};
     use iced::{Element, Rectangle, Size};
 
-    struct Texts(Vec<String>);
+    pub(super) struct Texts(pub(super) Vec<(String, Rectangle)>);
     impl Operation for Texts {
         fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation<()>)) {
             operate(self);
         }
-        fn text(&mut self, _id: Option<&iced::advanced::widget::Id>, _bounds: Rectangle, text: &str) {
-            self.0.push(text.to_owned());
+        fn text(&mut self, _id: Option<&iced::advanced::widget::Id>, bounds: Rectangle, text: &str) {
+            self.0.push((text.to_owned(), bounds));
+        }
+        fn text_input(&mut self, _id: Option<&iced::advanced::widget::Id>, bounds: Rectangle, state: &mut dyn widget::operation::TextInput) {
+            self.0.push((state.text().to_owned(), bounds));
         }
     }
 
-    /// Every text `element` lays out at `size`, in tree order.
-    pub(crate) fn texts<M>(mut element: Element<'_, M>, size: Size) -> Vec<String> {
+    pub(super) fn renderer() -> iced::Renderer {
         use iced::advanced::renderer::Headless;
-        let renderer = tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(<iced::Renderer as Headless>::new(
+        tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(<iced::Renderer as Headless>::new(
             crate::ui::BODY,
             iced::Pixels(14.0),
             Some("tiny-skia"),
         ))
-        .expect("a headless renderer");
+        .expect("a headless renderer")
+    }
+
+    /// Every text and its laid-out bounds, in tree order.
+    pub(crate) fn text_bounds<M>(mut element: Element<'_, M>, size: Size) -> Vec<(String, Rectangle)> {
+        let renderer = renderer();
         let mut tree = Tree::new(&element);
         let node = element.as_widget_mut().layout(&mut tree, &renderer, &layout::Limits::new(Size::ZERO, size));
         let mut texts = Texts(Vec::new());
@@ -322,18 +351,52 @@ pub(crate) mod testing {
         texts.0
     }
 
+    /// Every text `element` lays out at `size`, in tree order.
+    pub(crate) fn texts<M>(element: Element<'_, M>, size: Size) -> Vec<String> {
+        text_bounds(element, size).into_iter().map(|(text, _)| text).collect()
+    }
+
+    /// Focuses an input and delivers typing through its real widget callback.
+    pub(crate) fn type_text<M>(mut element: Element<'_, M>, text: &str) -> Vec<M> {
+        struct Focus;
+        impl Operation for Focus {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation<()>)) {
+                operate(self);
+            }
+            fn focusable(&mut self, _id: Option<&widget::Id>, _bounds: Rectangle, state: &mut dyn widget::operation::Focusable) {
+                state.focus();
+            }
+        }
+        let renderer = renderer();
+        let mut tree = Tree::new(&element);
+        let size = Size::new(500.0, 200.0);
+        let node = element.as_widget_mut().layout(&mut tree, &renderer, &layout::Limits::new(Size::ZERO, size));
+        element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut Focus);
+        let event = iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+            key: iced::keyboard::Key::Character(text.into()),
+            modified_key: iced::keyboard::Key::Character(text.into()),
+            physical_key: iced::keyboard::key::Physical::Code(iced::keyboard::key::Code::KeyX),
+            location: iced::keyboard::Location::Standard,
+            modifiers: iced::keyboard::Modifiers::empty(),
+            text: Some(text.into()),
+            repeat: false,
+        });
+        let mut messages = Vec::new();
+        element.as_widget_mut().update(&mut tree, &event, Layout::new(&node), iced::mouse::Cursor::Unavailable,
+            &renderer, &mut iced::advanced::clipboard::Null, &mut iced::advanced::Shell::new(&mut messages), &Rectangle::with_size(size));
+        messages
+    }
+
     /// With privacy on, none of `secrets` is readable anywhere in `texts`,
-    /// and each one that `blurred` lists is there as its `▒` stand-in.
+    /// and there is a fixed stand-in for every identity `blurred` lists.
     pub(crate) fn assert_blurred(texts: &[String], secrets: &[&str], blurred: &[&str]) {
         for secret in secrets {
             if let Some(text) = texts.iter().find(|t| t.to_lowercase().contains(&secret.to_lowercase())) {
                 panic!("{secret:?} is readable in {text:?} with privacy mode on");
             }
         }
-        for name in blurred {
-            let hidden = super::hidden(name);
-            assert!(texts.iter().any(|t| *t == hidden), "{name:?} is not drawn blurred (no {hidden:?}) in {texts:#?}");
-        }
+        let count = texts.iter().filter(|t| t.as_str() == super::HIDDEN_TEXT).count();
+        assert!(count >= blurred.len(), "expected {} blurred identities, found {count} in {texts:#?}", blurred.len());
     }
 }
 
@@ -342,9 +405,75 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hidden_text_reports_its_length_and_nothing_else() {
-        assert_eq!(hidden("Alyria"), "▒▒▒▒▒▒");
-        assert_eq!(hidden(""), "▒");
+    fn hidden_text_never_reports_the_original_length() {
+        for name in ["", "Al", "Alyria", "An exceptionally long account name", "アリス", "e\u{301}🐉"] {
+            assert_eq!(hidden(name), "▒▒▒▒▒▒▒▒");
+        }
+    }
+
+    #[test]
+    fn private_names_have_identical_layout_and_neutral_paragraphs() {
+        use iced::advanced::text::Paragraph as _;
+        use iced::alignment::{Horizontal, Vertical};
+        use iced::widget::text::{LineHeight, Wrapping};
+
+        set(true);
+        let renderer = testing::renderer();
+        let names = ["", "Al", "An exceptionally long account name", "アリスドラゴン", "e\u{301}🐉", "One\nTwo\nThree"];
+        for font in [crate::ui::BODY, crate::ui::SEMI, iced::Font::with_name("Consolas")] {
+            for size in [12.5, 24.0] {
+                for bounds in [Size::new(500.0, 200.0), Size::new(24.0, 200.0)] {
+                    let mut expected = None;
+                    for name_value in names {
+                        let text = iced::widget::text(name_value).font(font).size(size).line_height(1.45)
+                            .align_x(Horizontal::Right).align_y(Vertical::Center).wrapping(Wrapping::WordOrGlyph);
+                        let mut element: Element<'_, ()> = name(text, name_value, size, Color::WHITE);
+                        let mut tree = widget::Tree::new(&element);
+                        let node = element.as_widget_mut().layout(&mut tree, &renderer, &layout::Limits::new(Size::ZERO, bounds));
+                        let paragraph = tree.state.downcast_ref::<TextState>();
+                        assert_eq!(paragraph.content(), MASKED_TEXT, "only neutral glyphs may be drawn");
+                        assert_eq!(paragraph.raw().font(), font);
+                        assert_eq!(paragraph.raw().size(), iced::Pixels(size));
+                        assert_eq!(paragraph.raw().line_height(), LineHeight::Absolute(iced::Pixels(size * 1.45)));
+                        assert_eq!(paragraph.raw().align_x(), Horizontal::Right.into());
+                        assert_eq!(paragraph.raw().align_y(), Vertical::Center);
+                        assert_eq!(paragraph.raw().wrapping(), Wrapping::WordOrGlyph);
+                        let result = (node.bounds(), paragraph.min_bounds());
+                        let mut texts = testing::Texts(Vec::new());
+                        element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut texts);
+                        assert_eq!(texts.0, [(HIDDEN_TEXT.to_owned(), node.bounds())]);
+                        if let Some(expected) = expected {
+                            assert_eq!(result, expected, "private layout changed for {name_value:?}");
+                        } else {
+                            expected = Some(result);
+                        }
+                    }
+                }
+            }
+        }
+        set(false);
+    }
+
+    #[test]
+    fn toggling_privacy_relayouts_existing_text_and_preserves_explicit_dimensions() {
+        let renderer = testing::renderer();
+        let limits = layout::Limits::new(Size::ZERO, Size::new(500.0, 200.0));
+        let value = "An exceptionally long account name";
+        let build = || name::<()>(iced::widget::text(value).font(crate::ui::BODY).size(14).width(200).height(40).center(), value, 14.0, Color::WHITE);
+        set(false);
+        let mut element = build();
+        let mut tree = widget::Tree::new(&element);
+        for privacy in [false, true, false] {
+            set(privacy);
+            element = build();
+            tree.diff(&element);
+            let node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+            assert_eq!(node.size(), Size::new(200.0, 40.0));
+            assert_eq!(tree.state.downcast_ref::<TextState>().content(), if privacy { MASKED_TEXT } else { value });
+            let mut texts = testing::Texts(Vec::new());
+            element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut texts);
+            assert_eq!(texts.0, [(if privacy { HIDDEN_TEXT } else { value }.to_owned(), node.bounds())]);
+        }
     }
 
     #[test]
@@ -374,10 +503,15 @@ mod tests {
         assert_eq!(mask("ABC12345"), "ABC12345");
         assert_eq!(mask_path(r"C:\Users\Jane\FFXI"), r"C:\Users\Jane\FFXI");
         set(true);
-        assert_eq!(mask("ABC12345"), "••••••••");
+        for value in ["Al", "ABC12345", "An exceptionally long account name", "アリスドラゴン", "e\u{301}🐉"] {
+            assert_eq!(mask(value), "••••••••");
+        }
         assert_eq!(mask(""), "");
         // Whole locations are hidden, not just the user name; the fields are read-only meanwhile.
-        assert_eq!(mask_path(r"C:\Users\Jane\Downloads\FFXI"), r"C:\••••••••••••");
+        assert_eq!(mask_path(r"C:\Users\Jane\Downloads\FFXI"), r"C:\••••••••");
+        assert_eq!(mask_path(r"C:\Al"), mask_path(r"C:\An exceptionally long user\FFXI"));
+        assert_eq!(mask_path(r"C:\アリス\FFXI"), r"C:\••••••••");
+        assert_eq!(unmask_path(r"C:\Users\••••••••\FFXI".to_owned()), r"C:\Users\Jane\FFXI");
         assert!(!mask_path(r"D:\Games\FFXI").contains("Games"));
         assert!(mask_path(r"D:\Games\FFXI").starts_with(r"D:\"));
         assert_eq!(mask_path(""), "");

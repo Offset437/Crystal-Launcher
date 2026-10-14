@@ -67,7 +67,8 @@ const LIST_MAX: usize = 200;
 const MAX_BODY: usize = 0x102000;
 /// Body follows the header at +0xa8 in every send buffer (app 100513b0).
 const BODY_AT: usize = 0xa8;
-const MAIL_FRAMES: u32 = 3600;
+/// The Viewer's 3600-frame mail limits at their stock cold wall time (112.5 s; 07d §6 S1 D).
+const MAIL_FRAMES: u32 = native_jobs::MAIL_FRAMES;
 const MAIL_ATTEMPTS: u32 = 3;
 const LIST_PENDING: Duration = Duration::from_secs(60);
 const LIST_RETRY: Duration = Duration::from_secs(30);
@@ -144,8 +145,8 @@ pub unsafe extern "C" fn mail_arrived(record: usize) {
 
 /// Whether `mail_arrived` accepts messages. Owners that register it through
 /// slot 871 enable it while the Viewer owns the core (between games).
-/// Messages already queued stay queued for the next `idle_frame`; run one
-/// before handing the core to a game so their receipts are not delayed.
+/// Messages already queued stay queued for the owner's next delivery frame.
+/// Remove the native callback before disabling acceptance at game handoff.
 pub fn set_listening(listening: bool) {
     mail().listening.store(listening, Ordering::Release);
     if !listening {
@@ -197,6 +198,13 @@ pub struct Service {
     list_errors: u32,
     /// app list state 6: re-list when this passes (10056b6a, 30 s).
     list_retry: Option<Instant>,
+}
+
+/// Incoming mail progresses independently of a list, send or status request.
+/// The owner services it after each native pump, including while another job
+/// is pending. It never starts a list or pumps the core itself.
+#[derive(Default)]
+pub(crate) struct PushDelivery {
     /// Receipts waiting for 333 (send job state 7, retried every frame).
     receipts: Vec<Zeroizing<Vec<u64>>>,
     /// Pushed messages whose local save failed; retried on later frames.
@@ -209,6 +217,10 @@ struct StoredHeader {
     read: bool,
 }
 impl Service {
+    #[cfg(test)]
+    pub(crate) fn retry_mail_now(&mut self) {
+        self.list_retry = Some(Instant::now());
+    }
     #[cfg(test)]
     fn contains(&self, header: &[u8; HEADER_LEN]) -> bool {
         self.headers.iter().any(|h| &h.header == header)
@@ -506,9 +518,12 @@ fn pack_message(api: &Api, m: &Message, subject: &[u8], text: &[u8]) -> Result<(
 /// app 10055f00 states 2-5 for one composed message (single recipient).
 fn send_job(api: &Api, buffer: &mut [u64], frame: &mut dyn FnMut() -> bool) -> i32 {
     let (mut state, mut ticket, mut frames, mut failures, mut error) = (2, -1, 0u32, 0u32, 0);
+    // 07d §4.7: request lines; the end line (with the latest error) on return.
+    let mut request = native_jobs::RequestLog::start("mail-send");
     loop {
         match state {
             2 => {
+                request.attempts += 1;
                 let started = api.one(324, buffer.as_mut_ptr() as usize);
                 if started < 0 {
                     error = started;
@@ -520,6 +535,7 @@ fn send_job(api: &Api, buffer: &mut [u64], frame: &mut dyn FnMut() -> bool) -> i
             3 => {
                 frames += 1;
                 let polled = api.one(325, ticket as usize);
+                (request.polls, request.result) = (request.polls + 1, polled);
                 if polled > 0 {
                     return polled;
                 }
@@ -530,7 +546,7 @@ fn send_job(api: &Api, buffer: &mut [u64], frame: &mut dyn FnMut() -> bool) -> i
                     (error, state) = (native_jobs::TIMED_OUT, 4);
                 }
             }
-            4 => match error {
+            4 => match { request.result = error; error } {
                 -256 => state = 2,
                 // 1005373b, 10052131 and 10052272 end the job: the message
                 // is returned or marked undeliverable, never retried.
@@ -555,6 +571,7 @@ fn send_job(api: &Api, buffer: &mut [u64], frame: &mut dyn FnMut() -> bool) -> i
             if state == 3 {
                 cancel(api, ticket);
             }
+            request.result = native_jobs::ABORTED;
             return native_jobs::ABORTED;
         }
     }
@@ -882,6 +899,11 @@ impl Download {
         matches!(self.state, 1 | 6).then_some(self.ticket)
     }
     fn retry(&mut self, api: &Api, reissue: u8, wait: u8) {
+        // No new attempt once Play is requested; the server keeps the message.
+        if crate::native_auth::play_requested() {
+            self.outcome = Some(Fetched::Failed(self.error));
+            return;
+        }
         if self.error == -256 {
             self.state = reissue;
             return;
@@ -923,6 +945,7 @@ impl Download {
             }
             2 => self.retry(api, 0, 3),
             7 => self.retry(api, 5, 8),
+            3 | 8 if crate::native_auth::play_requested() => self.outcome = Some(Fetched::Failed(self.error)),
             3 | 8 => {
                 self.frames += 1;
                 if self.frames >= MAIL_FRAMES {
@@ -964,10 +987,15 @@ impl Service {
     /// At initial sign-in only, the list can poll faster: its pending/retry
     /// limits use wall time. Keep downloads and acknowledgements on the
     /// ordinary frame so their 3600-frame deadlines retain their duration.
-    pub fn social_entry_with_list_frame(&mut self, api: &Api, list_frame: &mut dyn FnMut() -> bool, frame: &mut dyn FnMut() -> bool) {
+    /// Returns the owner frame the list finished on: the Viewer's mail →
+    /// presence pause counts frames from the list response, not from the end
+    /// of the transfers.
+    pub fn social_entry_with_list_frame(&mut self, api: &Api, list_interval: Duration, frame: &mut dyn FnMut(Duration) -> bool) -> u64 {
         self.begin_social_entry(api);
-        let Some(listed) = self.list(api, list_frame) else { return };
-        self.download_listed(api, &listed, frame);
+        let listed = self.list(api, &mut || frame(list_interval));
+        let at = crate::native_auth::owner_frames();
+        if let Some(listed) = listed { self.download_listed(api, &listed, &mut || frame(native_jobs::FRAME)); }
+        at
     }
 
     fn begin_social_entry(&mut self, api: &Api) {
@@ -984,14 +1012,19 @@ impl Service {
     }
 
     /// Called once per idle owner frame, between games only.
+    /// A due retry is a new attempt, so none starts once Play is requested;
+    /// the wait is kept for the next main-menu entry, which lists anyway.
     pub fn idle_frame(&mut self, api: &Api, frame: &mut dyn FnMut() -> bool) {
-        self.flush_pushed(api, true);
+        if crate::native_auth::play_requested() { return; }
         if self.list_retry.is_some_and(|at| Instant::now() >= at) {
             self.list_retry = None;
             self.mail_cycle(api, frame);
         }
     }
 
+}
+
+impl PushDelivery {
     /// Store queued pushes, and with `receipts` also answer them and send due
     /// receipts. Owners call it without receipts when the member session is
     /// already gone (sign-out after loss), so nothing pushed is lost locally.
@@ -1026,6 +1059,9 @@ impl Service {
             self.receipts.retain_mut(|buffer| api.one(333, buffer.as_mut_ptr() as usize) < 0);
         }
     }
+}
+
+impl Service {
 
     fn mail_cycle(&mut self, api: &Api, frame: &mut dyn FnMut() -> bool) {
         let Some(listed) = self.list(api, frame) else { return };
@@ -1033,6 +1069,12 @@ impl Service {
     }
 
     fn download_listed(&mut self, api: &Api, listed: &[u8], frame: &mut dyn FnMut() -> bool) {
+        // Transfers are new requests: none start once Play is requested (the
+        // listed messages stay on the server for the next main-menu entry).
+        if crate::native_auth::play_requested() {
+            log!("native POL mail transfers not started: Play requested");
+            return;
+        }
         // app 1005641d: every new record (header +0x3e bit 15) not already queued.
         let mut jobs: Vec<Box<Download>> = Vec::new();
         for record in listed.chunks_exact(RECORD_LEN).filter(|r| u16_at(r, 0x3e) & 0x8000 != 0) {
@@ -1073,18 +1115,24 @@ impl Service {
     /// app 10056b40 states 2, 3 and 5. Returns the listed records, or None
     /// when nothing was listed (a retry is then scheduled as the Viewer does).
     fn list(&mut self, api: &Api, frame: &mut dyn FnMut() -> bool) -> Option<Zeroizing<Vec<u8>>> {
+        // 07d §4.7: one start/end pair over the reissues; its end line on return.
+        let mut request: Option<native_jobs::RequestLog> = None;
         'issue: loop {
             // 1001cf90: the Viewer issues nothing without a connected member.
             if api.zero(838) != 3 {
                 return None;
             }
             let mut buffer = Zeroizing::new(vec![0u64; LIST_MAX * RECORD_LEN / 8]);
+            let request = request.get_or_insert_with(|| native_jobs::RequestLog::start("mail-list"));
+            request.attempts += 1;
             let ticket = unsafe {
                 api.f::<unsafe extern "C" fn(usize, u32) -> i32>(329)(buffer.as_mut_ptr() as usize, LIST_MAX as u32)
             };
+            request.result = ticket;
             if ticket < 0 {
                 if transient_list_error(ticket) {
-                    if !frame() || !frame() {
+                    // A re-list is a new attempt: none once Play is requested.
+                    if !frame() || !frame() || crate::native_auth::play_requested() {
                         return None;
                     }
                     continue 'issue;
@@ -1101,16 +1149,18 @@ impl Service {
             loop {
                 if !frame() {
                     cancel(api, ticket);
+                    request.result = native_jobs::ABORTED;
                     return None;
                 }
                 let polled = api.one(330, ticket as usize);
+                (request.polls, request.result) = (request.polls + 1, polled);
                 if polled > 0 {
                     // Core 10027ac0 clears bit 15 of every record past the count.
                     return Some(Zeroizing::new(bytes_of(&buffer).to_vec()));
                 }
                 if polled < 0 {
                     if transient_list_error(polled) {
-                        if !frame() {
+                        if !frame() || crate::native_auth::play_requested() {
                             return None;
                         }
                         continue 'issue;
@@ -1125,6 +1175,7 @@ impl Service {
                 if started.elapsed() > LIST_PENDING {
                     // 10056d41: cancel after 60 s, then the 30 s retry wait.
                     cancel(api, ticket);
+                    request.result = native_jobs::TIMED_OUT;
                     self.list_retry = Some(Instant::now() + LIST_RETRY);
                     return None;
                 }
@@ -1220,7 +1271,7 @@ fn remove_entry(api: &Api, alternate: bool, slot: u16, uid: u64, frame: &mut dyn
         Ok(code) if code < 0 => code,
         Ok(_) => native_jobs::run(
             api,
-            native_jobs::Request { start: &mut || api.zero(1034), poll: 1035, policy: native_jobs::Policy::Normal },
+            native_jobs::Request { name: "friend-remove", start: &mut || api.zero(1034), poll: 1035, policy: native_jobs::Policy::Normal },
             frame,
         ),
     }
@@ -1349,6 +1400,7 @@ mod tests {
         receipts: Vec<Vec<u8>>,
         receipt_results: Vec<i32>,
         put_polls: Vec<i32>,
+        pending_push: Option<[u8; RECORD_LEN]>,
     }
     static CORE: Mutex<Option<Core>> = Mutex::new(None);
     fn with<R>(f: impl FnOnce(&mut Core) -> R) -> R {
@@ -1511,6 +1563,14 @@ mod tests {
         with(|c| if c.put_polls.is_empty() { 1 } else { c.put_polls.remove(0) })
     }
     unsafe extern "C" fn get_friends() -> i32 { note(163, 0); 0 }
+    unsafe extern "C" fn pump() -> i32 {
+        note(818, 0);
+        if let Some(record) = with(|c| c.pending_push.take()) {
+            mail_arrived(record.as_ptr() as usize);
+        }
+        0
+    }
+    unsafe extern "C" fn no_error() -> i32 { 0 }
 
     fn fake(core: Core) -> (Api, PathBuf) {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
@@ -1531,6 +1591,7 @@ mod tests {
             (325, send_poll as *const ()), (333, receipt_sink as *const ()), (188, remove_a as *const ()),
             (186, remove_b as *const ()), (1034, put_friends as *const ()), (1035, put_friends_poll as *const ()),
             (163, get_friends as *const ()),
+            (818, pump as *const ()), (1103, no_error as *const ()),
         ] {
             table[slot] = function as usize;
         }
@@ -1588,9 +1649,16 @@ mod tests {
     fn startup_list_cadence_does_not_accelerate_mail_download_or_acknowledgement_frames() {
         let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let (api, dir) = fake(Core { listed: vec![listed(5, true, 0x45, 1)], ..Default::default() });
-        Service::default().social_entry_with_list_frame(&api,
-            &mut || { note(4000, 1); true },
-            &mut || { note(4001, 20); true });
+        let mut first_transfer = None;
+        let list_done = Service::default().social_entry_with_list_frame(&api, Duration::from_millis(1),
+            &mut |interval| {
+                crate::native_auth::count_owner_frame_for_test();
+                note(if interval == Duration::from_millis(1) { 4000 } else { 4001 }, interval.as_millis() as u64);
+                if interval != Duration::from_millis(1) { first_transfer.get_or_insert_with(crate::native_auth::owner_frames); }
+                true
+            });
+        // The mail → presence pause counts frames from the list response (07c §5.4), not after the transfers.
+        assert!(list_done < first_transfer.unwrap());
         let calls = calls();
         assert_eq!(calls.iter().filter(|c| c.0 == 4000).count(), 1, "only the list uses the fast callback");
         assert_eq!(calls.iter().filter(|c| c.0 == 4001).count(), 4, "download, save and acknowledgement retain ordinary frames");
@@ -1600,6 +1668,21 @@ mod tests {
         assert!(position(&calls, (327, 5)) < position(&calls, (322, 5)));
         assert!(calls.iter().filter(|c| c.0 == 1322).all(|c| c.1 == 1), "stored before acknowledgement");
         assert_eq!(std::fs::read(dir.join("in-5.bin")).unwrap(), b"Hi\x07There\0");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn play_during_the_mail_list_polls_it_to_its_end_and_starts_no_transfer_or_cancel() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let (api, dir) = fake(Core { listed: vec![listed(5, true, 0x45, 1)], ..Default::default() });
+        // Play arrives on the first frame, while the list ticket is in Poll (07c §6 S1).
+        let mut play = None;
+        Service::default().social_entry(&api, &mut || { play.get_or_insert_with(crate::native_auth::TestPlay::requested); true });
+        assert!(play.is_some());
+        drop(play);
+        let calls = calls();
+        assert!(position(&calls, (329, 200)) < position(&calls, (330, 7)), "polled to its end");
+        assert!(!calls.iter().any(|c| matches!(c.0, 328 | 326 | 322)), "no cancel and no new transfer: {calls:?}");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1692,6 +1775,40 @@ mod tests {
     }
 
     #[test]
+    fn a_push_is_saved_and_receipted_while_another_request_is_pending() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let body = b"Hi\x07There\0".to_vec();
+        let mut record = listed(7, true, 0xaaaa, 3);
+        record[0x4c..0x50].copy_from_slice(&(body.as_ptr() as u32).to_le_bytes());
+        let (api, dir) = fake(Core {
+            friends: vec![entry(0x77, 0, 0)],
+            put_polls: vec![0, 0, 1],
+            receipt_results: vec![-2, 0],
+            pending_push: Some(record),
+            ..Default::default()
+        });
+        set_listening(true);
+        let mut delivery = PushDelivery::default();
+        let mut frames = 0;
+        let result = remove_entry(&api, false, 0, 0x77, &mut || {
+            frames += 1;
+            let running = crate::native_auth::owner_frame(&api, &mut delivery);
+            assert_eq!(std::fs::read(dir.join("in-7.bin")).unwrap(), body,
+                "incoming storage must not wait for the pending friend commit");
+            assert_eq!(with(|c| c.receipts.len()), frames.min(2),
+                "a rejected receipt retries on the next owner frame");
+            running
+        });
+        assert_eq!(result, 1);
+        assert!(frames >= 3);
+        assert!(position(&calls(), (818, 0)) < position(&calls(), (1035, 4)));
+        assert!(delivery.receipts.is_empty());
+        assert_eq!(mail().drops.load(Ordering::Acquire), 0);
+        set_listening(false);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn normal_send_is_kind_0_through_270_and_272_with_the_viewer_fixup() {
         let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let viewer = (1000u64 << 33) | (1 << 13) | (1 << 11) | (1 << 12);
@@ -1768,8 +1885,8 @@ mod tests {
         set_listening(false);
         unsafe { mail_arrived(record.as_ptr() as usize) };
         assert_eq!(mail().pushed.lock().unwrap().len(), 1);
-        let mut service = Service::default();
-        service.idle_frame(&api, &mut || true);
+        let mut delivery = PushDelivery::default();
+        delivery.flush_pushed(&api, true);
         assert_eq!(std::fs::read(dir.join("in-7.bin")).unwrap(), body);
         let receipt = with(|c| c.receipts[0].clone());
         assert_eq!(u64_at(&receipt, 0), 0xbbbb);
@@ -1781,8 +1898,8 @@ mod tests {
         assert_eq!(u16_at(&receipt, 0x3e), 0xd000);
         assert_eq!(u16_at(&receipt, 0x40), 1000);
         assert_eq!(&receipt[BODY_AT..BODY_AT + 2], b"\x07\0");
-        service.idle_frame(&api, &mut || true); // -2 then accepted
-        service.idle_frame(&api, &mut || true);
+        delivery.flush_pushed(&api, true); // -2 then accepted
+        delivery.flush_pushed(&api, true);
         assert_eq!(with(|c| c.receipts.len()), 2);
         set_listening(false);
         std::fs::remove_dir_all(dir).unwrap();
@@ -1807,27 +1924,27 @@ mod tests {
         unsafe { mail_arrived(record.as_ptr() as usize) };
         // A directory where the message file goes makes the local save fail.
         std::fs::create_dir_all(dir.join("in-7.bin")).unwrap();
-        let mut service = Service::default();
-        service.idle_frame(&api, &mut || true);
+        let mut delivery = PushDelivery::default();
+        delivery.flush_pushed(&api, true);
         assert_eq!(with(|c| c.receipts.len()), 1, "stock receipts before saving");
-        assert_eq!(service.unsaved.len(), 1, "kept for another save attempt");
+        assert_eq!(delivery.unsaved.len(), 1, "kept for another save attempt");
         std::fs::remove_dir_all(dir.join("in-7.bin")).unwrap();
-        service.idle_frame(&api, &mut || true);
+        delivery.flush_pushed(&api, true);
         assert_eq!(std::fs::read(dir.join("in-7.bin")).unwrap(), body);
-        assert!(service.unsaved.is_empty());
+        assert!(delivery.unsaved.is_empty());
         assert_eq!(with(|c| c.receipts.len()), 1, "a retried save never answers twice");
 
         // Signing out after a loss stores the last push without answering it.
         std::fs::remove_file(dir.join("in-7.bin")).unwrap();
         unsafe { mail_arrived(record.as_ptr() as usize) };
-        service.flush_pushed(&api, false);
+        delivery.flush_pushed(&api, false);
         assert_eq!(std::fs::read(dir.join("in-7.bin")).unwrap(), body);
         assert_eq!(with(|c| c.receipts.len()), 1);
         // A push the receiver cannot copy is counted for the owner's log.
         bytes_of_mut(&mut record)[0x4c..0x50].copy_from_slice(&0u32.to_le_bytes());
         unsafe { mail_arrived(record.as_ptr() as usize) };
         assert_eq!(mail().drops.load(Ordering::Acquire), 1);
-        service.flush_pushed(&api, false);
+        delivery.flush_pushed(&api, false);
         assert_eq!(mail().drops.load(Ordering::Acquire), 0);
         set_listening(false);
         std::fs::remove_dir_all(dir).unwrap();

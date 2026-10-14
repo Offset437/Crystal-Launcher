@@ -10,6 +10,7 @@ use crate::{
 use crate::i18n::t;
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::BTreeMap,
     fs::{self, File, OpenOptions},
     io::{self, BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
@@ -87,6 +88,20 @@ enum Event {
     Started(Started),
     Failed(String),
     Finished(Option<ExitReport>),
+    /// A park worker's host is parked (pol-spec 07d §1.4 step 5). Stdout only: never in
+    /// session.json, which a park worker writes only from frame 2.
+    Parked { loader_pid: u32, tool_pid: Option<u32>, polcore_ms: Option<u64>, hello_ms: u64 },
+    /// The park failed or its host ended before Play; the worker exits.
+    ParkFailed(String),
+}
+
+/// Frame 1 of a park worker (07d §1.4): what to park, no credentials. `account` has its
+/// passwords cleared; its POL ID stays for the account's key and folders.
+#[derive(Serialize, Deserialize)]
+struct ParkRequest {
+    config: Config,
+    account: Account,
+    plan: Plan,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -100,6 +115,12 @@ struct Record {
     authenticated: bool,
     #[serde(default)]
     native_batch: bool,
+    /// The session's sign-in took a one-time code (spent now), so a reopened window still
+    /// signs nothing back in by itself after its game. Every worker since writes it; older
+    /// workers' records (1.0.8 and before) do not say (`None`), so a reopened window learns
+    /// nothing from them about whether the account needs a code.
+    #[serde(default)]
+    otp_used: Option<bool>,
     /// A signed-in host keeps its injected tool until it signs out.
     #[serde(default)]
     launch_tool: Option<Tool>,
@@ -237,6 +258,21 @@ pub(crate) fn publish_authenticated(directory: &Path) -> Result<(), String> {
     })
 }
 
+/// The account's last sign-in reached authentication (its record's milestone): a host or
+/// worker lost after that already had its login taken, so its loss is no reason to sign in
+/// again by itself (07d §5.4). A missing or unreadable record says no.
+pub(crate) fn reached_authentication(config: &Config, account: &Account) -> bool {
+    read_record(&record_path(config, account)).is_some_and(|record| record.authenticated)
+}
+
+#[cfg(test)]
+pub(crate) fn save_authenticated_record_for_test(config: &Config, account: &Account) {
+    let worker = identity(std::process::id()).unwrap();
+    fs::create_dir_all(config.account_directory(account)).unwrap();
+    save_record(&record_path(config, account), &Record { worker, state: Event::Failed("fixture".into()), social_only: true,
+        authenticated: true, native_batch: false, otp_used: Some(false), launch_tool: None }).unwrap();
+}
+
 /// Published only after the verified loader hello reports this capability.
 pub(crate) fn publish_native_batch(directory: &Path, supported: bool) -> Result<(), String> {
     let worker = identity(std::process::id()).ok_or("Could not identify the session worker.")?;
@@ -335,6 +371,208 @@ impl NativeControl {
 struct ControlRequest { worker: Identity, action: NativeControl, #[serde(default = "yes")] groups: bool }
 fn yes() -> bool { true }
 
+const CONTROLLER_FRAME_LIMIT: usize = 4096;
+const CONTROLLER_READY_LIMIT: Duration = Duration::from_secs(2);
+const CONTROLLER_RESULT_LIMIT: Duration = Duration::from_secs(5);
+const CONTROLLER_MESSAGE_LIMIT: usize = 512;
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ControllerRequest {
+    worker: Identity,
+    request_id: u64,
+    settings: BTreeMap<String, String>,
+    /// GetTickCount64 is shared by the sender, worker and native game host.
+    deadline_ms: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ControllerResult { worker: Identity, request_id: u64, ok: bool, message: String }
+
+fn controller_values_valid(settings: &BTreeMap<String, String>) -> bool {
+    (2..=3).contains(&settings.len()) && settings.contains_key("padmode000") && settings.contains_key("padsin000")
+        && settings.iter().all(|(name, value)| {
+        matches!(name.as_str(), "padmode000" | "padsin000" | "padguid000")
+            && (name == "padguid000" || !value.is_empty())
+            && value.len() <= 1024 && value.bytes().all(|byte| (32..=126).contains(&byte))
+    })
+}
+
+fn controller_message_valid(message: &str) -> bool {
+    message.len() <= CONTROLLER_MESSAGE_LIMIT && !message.chars().any(char::is_control)
+}
+
+#[cfg(windows)]
+fn controller_clock_ms() -> u64 {
+    #[link(name = "kernel32")]
+    unsafe extern "system" { fn GetTickCount64() -> u64; }
+    // SAFETY: this process-independent clock takes no pointers or handles.
+    unsafe { GetTickCount64() }
+}
+#[cfg(not(windows))]
+fn controller_clock_ms() -> u64 { 0 }
+
+fn controller_result_path(directory: &Path, request_id: u64) -> PathBuf {
+    directory.join(if request_id == 0 { "controller-settings-ready.json".to_owned() }
+        else { format!("controller-settings-result-{request_id}.json") })
+}
+
+fn read_controller_result(directory: &Path, worker: Identity, request_id: u64) -> Option<ControllerResult> {
+    let result: ControllerResult = serde_json::from_slice(&read_bounded(&controller_result_path(directory, request_id), CONTROLLER_FRAME_LIMIT)?).ok()?;
+    (result.worker == worker && result.request_id == request_id && controller_message_valid(&result.message)).then_some(result)
+}
+
+fn controller_session(session: &BackgroundSession) -> Result<(), String> {
+    if !session.active() { return Err("The game session ended before controller settings could be confirmed.".into()); }
+    if session.game_running() != Some(true) { return Err("Start FFXI before applying controller settings to this account.".into()); }
+    Ok(())
+}
+
+fn owned_controller_session(directory: &Path) -> Option<BackgroundSession> {
+    let worker = identity(std::process::id())?;
+    let session = BackgroundSession { path: directory.join("session.json"), worker };
+    session.active().then_some(session)
+}
+
+fn controller_command_lock(directory: &Path) -> Result<File, String> {
+    let until = Instant::now() + Duration::from_millis(150);
+    loop {
+        match exclusive(&directory.join("controller-settings.lock")) {
+            Ok(lock) => return Ok(lock),
+            Err(error) if matches!(error.raw_os_error(), Some(32 | 33)) && Instant::now() < until =>
+                std::thread::sleep(Duration::from_millis(5)),
+            Err(_) => return Err("Could not access the controller settings command.".into()),
+        }
+    }
+}
+
+fn no_live_controller_settings() -> &'static str {
+    "This session does not support live controller settings. Close FFXI and launch it again with the current Crystal build."
+}
+
+struct PendingControllerRequest { directory: PathBuf, worker: Identity, request_id: u64 }
+impl Drop for PendingControllerRequest {
+    fn drop(&mut self) {
+        let Ok(_lock) = controller_command_lock(&self.directory) else { return };
+        let path = self.directory.join("controller-settings.json");
+        let request = read_bounded(&path, CONTROLLER_FRAME_LIMIT).and_then(|bytes| serde_json::from_slice::<ControllerRequest>(&bytes).ok());
+        if request.is_some_and(|request| request.worker == self.worker && request.request_id == self.request_id) {
+            let _ = fs::remove_file(path);
+        }
+        if read_controller_result(&self.directory, self.worker, self.request_id).is_some() {
+            let _ = fs::remove_file(controller_result_path(&self.directory, self.request_id));
+        }
+    }
+}
+
+/// Live game settings use their own command channel; POL social/control jobs
+/// neither block this request nor receive its values.
+/// Use the session selected by the UI; a replacement worker is never retargeted.
+pub(crate) fn request_controller_settings_for_session(session: &BackgroundSession, settings: BTreeMap<String, String>) -> Result<(), String> {
+    request_controller_settings_for_session_within(session, settings, CONTROLLER_READY_LIMIT, CONTROLLER_RESULT_LIMIT)
+}
+
+#[cfg(test)]
+#[cfg(test)]
+fn request_controller_settings_within(config: &Config, account: &Account, settings: BTreeMap<String, String>, ready_limit: Duration, result_limit: Duration) -> Result<(), String> {
+    if !controller_values_valid(&settings) { return Err("Invalid live controller settings.".into()); }
+    let session = find(config, account).ok_or("This account has no active game session.")?;
+    request_controller_settings_for_session_within(&session, settings, ready_limit, result_limit)
+}
+
+fn request_controller_settings_for_session_within(session: &BackgroundSession, settings: BTreeMap<String, String>, ready_limit: Duration, result_limit: Duration) -> Result<(), String> {
+    if !controller_values_valid(&settings) { return Err("Invalid live controller settings.".into()); }
+    controller_session(session)?;
+    let directory = session.path.parent().ok_or("The selected game session has no account directory.")?;
+    // The consumer never acquires this delivery lock. Holding the short command
+    // lock while awaiting a reply would prevent it from consuming the request.
+    let _delivery = exclusive(&directory.join("controller-settings-delivery.lock"))
+        .map_err(|_| "Another controller settings request is already running.")?;
+    let until_ready = Instant::now() + ready_limit;
+    loop {
+        controller_session(session)?;
+        if let Some(ready) = read_controller_result(&directory, session.worker, 0) {
+            if !ready.ok { return Err(no_live_controller_settings().into()); }
+            break;
+        }
+        if Instant::now() >= until_ready { return Err(no_live_controller_settings().into()); }
+        std::thread::sleep(Duration::from_millis(10).min(until_ready.saturating_duration_since(Instant::now())));
+    }
+    let random = crate::pol_less::pipe::random_hex().map_err(|_| "Could not identify the controller settings request.")?;
+    let request_id = u64::from_str_radix(&random[..16], 16).unwrap_or(0).max(1);
+    let deadline_ms = controller_clock_ms().checked_add(u64::try_from(result_limit.as_millis()).unwrap_or(u64::MAX))
+        .filter(|deadline| *deadline != 0).ok_or("Could not time the controller settings request.")?;
+    let request = ControllerRequest { worker: session.worker, request_id, settings, deadline_ms };
+    let bytes = serde_json::to_vec(&request).map_err(|_| "Could not encode live controller settings.")?;
+    if bytes.len() > CONTROLLER_FRAME_LIMIT { return Err("Live controller settings are too large.".into()); }
+    let _pending = PendingControllerRequest { directory: directory.to_path_buf(), worker: session.worker, request_id };
+    {
+        let _lock = controller_command_lock(&directory)?;
+        controller_session(session)?;
+        let path = directory.join("controller-settings.json");
+        if let Some(bytes) = read_bounded(&path, CONTROLLER_FRAME_LIMIT) {
+            if serde_json::from_slice::<ControllerRequest>(&bytes).ok().is_some_and(|old|
+                old.worker == session.worker && old.request_id != request_id && old.deadline_ms > controller_clock_ms()) {
+                return Err("Wait for the previous controller settings request to finish.".into());
+            }
+        }
+        save_json(&path, &request)?;
+    }
+    wake::signal(session.worker);
+    loop {
+        controller_session(session)?;
+        if let Some(result) = read_controller_result(&directory, session.worker, request_id) {
+            controller_session(session)?;
+            return if result.ok { Ok(()) } else { Err(if result.message.is_empty() {
+                "The game could not apply controller settings.".to_owned()
+            } else { result.message }) };
+        }
+        if controller_clock_ms() >= deadline_ms {
+            return Err("The game did not confirm controller settings in time.".into());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Consume exactly this worker's one-shot command while its game is running.
+pub(crate) fn take_controller_settings(directory: &Path) -> Option<Vec<u8>> {
+    let _lock = exclusive(&directory.join("controller-settings.lock")).ok()?;
+    let path = directory.join("controller-settings.json");
+    let request: ControllerRequest = serde_json::from_slice(&read_bounded(&path, CONTROLLER_FRAME_LIMIT)?).ok()?;
+    let session = owned_controller_session(directory)?;
+    if request.worker != session.worker { return None; }
+    if request.request_id == 0 || request.deadline_ms == 0 || request.deadline_ms <= controller_clock_ms()
+        || request.deadline_ms.saturating_sub(controller_clock_ms()) > CONTROLLER_RESULT_LIMIT.as_millis() as u64
+        || !controller_values_valid(&request.settings) {
+        let _ = fs::remove_file(&path);
+        return None;
+    }
+    controller_session(&session).ok()?;
+    let mut frame = serde_json::to_vec(&serde_json::json!({
+        "type": "controller_settings", "request_id": request.request_id,
+        "settings": request.settings, "deadline_ms": request.deadline_ms,
+    })).ok()?;
+    if frame.len() >= CONTROLLER_FRAME_LIMIT { return None; }
+    frame.push(b'\n');
+    // A denied deletion must never deliver the same command twice.
+    fs::remove_file(&path).ok()?;
+    controller_session(&session).ok()?;
+    (request.deadline_ms > controller_clock_ms()).then_some(frame)
+}
+
+/// id 0 announces capability; every other reply is scoped to a single request.
+pub(crate) fn publish_controller_result(directory: &Path, request_id: u64, ok: bool, message: &str) -> Result<(), String> {
+    if !controller_message_valid(message) { return Err("Invalid controller settings result.".into()); }
+    let _lock = controller_command_lock(directory)?;
+    let session = owned_controller_session(directory).ok_or("The controller settings result belongs to an inactive worker.")?;
+    save_json(&controller_result_path(directory, request_id), &ControllerResult {
+        worker: session.worker, request_id, ok, message: message.to_owned(),
+    })?;
+    if !session.active() { return Err("The game session ended before controller settings could be confirmed.".into()); }
+    Ok(())
+}
+
 #[derive(Serialize, Deserialize)]
 pub(crate) struct SocialRequest {
     worker: Identity,
@@ -408,6 +646,7 @@ pub(crate) fn request_native_status(config: &Config, account: &Account, action: 
     request_session_control(&session, action, groups)
 }
 
+fn no_native_controls() -> &'static str { t("This session does not support native PlayOnline controls. Launch it using the current build.") }
 fn request_session_control(session: &BackgroundSession, action: NativeControl, groups: bool) -> Result<(), String> {
     let directory = session.path.parent().ok_or(t("This account has no active PlayOnline session."))?;
     let _batch = exclusive(&directory.join("batch.lock"))
@@ -417,8 +656,7 @@ fn request_session_control(session: &BackgroundSession, action: NativeControl, g
     let _command = exclusive(&directory.join("native-social.lock"))
         .map_err(|_| t("Another PlayOnline request is being submitted."))?;
     if !session.active() { return Err(t("This account has no active PlayOnline session.").into()); }
-    let snapshot = read_friend_cache(directory, session.worker)
-        .ok_or(t("This session does not support native PlayOnline controls. Launch it using the current build."))?;
+    let snapshot = read_friend_cache(directory, session.worker).ok_or(no_native_controls())?;
     if snapshot.game_running != Some(false) {
         return Err(t("Close FFXI before starting another game or signing out of PlayOnline.").into());
     }
@@ -429,6 +667,78 @@ fn request_session_control(session: &BackgroundSession, action: NativeControl, g
     save_json(&directory.join("native-control.json"), &ControlRequest { worker: session.worker, action, groups })?;
     wake::signal(session.worker);
     Ok(())
+}
+
+/// How long a Play on a signed-in session waits for its Viewer main menu: the
+/// pre-sign-in's restored UI pauses (≤ 2.65 s, 07c §8.6) and an in-flight social
+/// request, whose stock policy limit is 60 s.
+const MAIN_MENU_LIMIT: Duration = Duration::from_secs(90);
+
+/// "Main menu reached and idle" as processes without the loader pipe see it (07c §2):
+/// FFXI closed, `social.ready` (the loader sends `native_social_ready` only after
+/// `native_main_menu`), no social request in flight and no command still queued.
+fn main_menu_idle(directory: &Path, worker: Identity) -> bool {
+    read_friend_cache(directory, worker).is_some_and(|s| s.game_running == Some(false) && s.social.ready && !s.social.busy)
+        && !directory.join("native-social.json").exists() && !directory.join("native-control.json").exists()
+}
+
+/// A Play on a session already signed in (07c §5.3): wait for its main menu, run the stock
+/// FFXI check (`check`, W20 :53001), then StartGame. The Viewer's Play button exists only at
+/// an idle main menu, so a busy or still-publishing session queues rather than refuses, and
+/// nothing is cancelled. A start refused because a request began during the check waits for
+/// idle again within the same bound. `Ok(note)`: the worker has the StartGame.
+pub(crate) fn start_signed_in(config: &Config, account: &Account, waiting: &mut dyn FnMut(&str),
+    check: impl FnOnce() -> Result<String, String>) -> Result<String, String> {
+    start_signed_in_within(config, account, MAIN_MENU_LIMIT, waiting, check)
+}
+
+fn start_signed_in_within(config: &Config, account: &Account, limit: Duration, waiting: &mut dyn FnMut(&str),
+    check: impl FnOnce() -> Result<String, String>) -> Result<String, String> {
+    let deadline = Instant::now() + limit;
+    let session = find(config, account).ok_or(t("This account has no active PlayOnline session."))?;
+    let directory = config.account_directory(account);
+    // Pauses still to come in a pre-sign-in are skipped; nothing to do once they are over.
+    let _ = note_play_pending(config, account);
+    let mut announced = false;
+    let mut idle = || -> Result<(), String> {
+        loop {
+            if !session.active() { return Err(t("This account has no active PlayOnline session.").into()); }
+            if session.game_running() == Some(true) {
+                return Err(t("Close FFXI before starting another game or signing out of PlayOnline.").into());
+            }
+            // A cache that can never show the main menu: the old immediate refusal, not 90 s
+            // and a misleading timeout. A missing one is normal before the first publish.
+            if friend_cache(&directory, session.worker).is_err() { return Err(no_native_controls().into()); }
+            if main_menu_idle(&directory, session.worker) { return Ok(()); }
+            if Instant::now() >= deadline {
+                return Err(t("PlayOnline did not return to its main menu in time, so FFXI was not started.").into());
+            }
+            if !announced {
+                waiting(t("Waiting for the PlayOnline main menu before starting FFXI…"));
+                announced = true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    idle()?;
+    let note = check()?;
+    // Only a refusal that idle can end is retried (a request began during the check, or a
+    // cache read raced its replacement); any other failure, such as a control file that
+    // cannot be written, is reported at once.
+    let transient = [t("Wait for the current PlayOnline request to finish."), t("Another PlayOnline request is being submitted."),
+        no_native_controls(), t("Close FFXI before starting another game or signing out of PlayOnline."),
+        t("This account has no active PlayOnline session.")];
+    loop {
+        match request_session_control(&session, NativeControl::StartGame, true) {
+            Ok(()) => return Ok(note),
+            Err(error) if batch_pending(config, account) || Instant::now() >= deadline
+                || !transient.contains(&error.as_str()) => return Err(error),
+            Err(_) => {
+                std::thread::sleep(Duration::from_millis(20));
+                idle()?;
+            }
+        }
+    }
 }
 
 /// The action and its "also for my groups" choice.
@@ -462,14 +772,67 @@ pub(crate) fn take_native_activity(directory: &Path) -> bool {
     serde_json::from_slice::<Identity>(&bytes).ok() == identity(std::process::id())
 }
 
+/// A Play is queued behind this account's pre-sign-in (pol-spec 07d §4.3): its worker sends
+/// the loader `native_play_pending` once, so the Viewer pauses still to come are skipped.
+/// Harmless when the pauses are over. Local only.
+pub(crate) fn note_play_pending(config: &Config, account: &Account) -> Result<(), String> {
+    let session = find(config, account).ok_or(t("This account has no active PlayOnline session."))?;
+    save_json(&config.account_directory(account).join("native-play-pending.json"), &session.worker)?;
+    wake::signal(session.worker);
+    Ok(())
+}
+
+pub(crate) fn take_play_pending(directory: &Path) -> bool {
+    let path = directory.join("native-play-pending.json");
+    let Some(bytes) = read_bounded(&path, 1024) else { return false };
+    if fs::remove_file(&path).is_err() { return false; }
+    serde_json::from_slice::<Identity>(&bytes).ok() == identity(std::process::id())
+}
+
+/// How often, and how long at most, a sign-in that failed on the network waits for it to
+/// come back before its one retry (pol-spec 07d §5.5).
+pub(crate) const NETWORK_PROBE_EVERY: Duration = Duration::from_secs(3);
+pub(crate) const NETWORK_PROBE_LIMIT: Duration = Duration::from_secs(300);
+
+/// Block until the patch server's name resolves again (a fresh lookup that skips the DNS
+/// cache, every `NETWORK_PROBE_EVERY`) or `until`. DNS only, through the user's resolver:
+/// nothing reaches Square Enix. Unit tests never look anything up: the network is "back".
+pub(crate) fn wait_for_network(until: Instant) -> bool {
+    #[cfg(test)]
+    { let _ = (until, NETWORK_PROBE_EVERY); true }
+    #[cfg(not(test))]
+    loop {
+        let asked = Instant::now();
+        if crate::dns::resolve_fresh(crate::dns::VIEWER_PATCH_HOST, NETWORK_PROBE_EVERY).is_ok() { return true; }
+        if Instant::now() >= until { return false; }
+        std::thread::sleep(NETWORK_PROBE_EVERY.saturating_sub(asked.elapsed()).min(until.saturating_duration_since(Instant::now())));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn save_play_pending_for_test(directory: &Path) {
+    save_json(&directory.join("native-play-pending.json"), &identity(std::process::id()).unwrap()).unwrap();
+}
+
 fn read_friend_cache(directory: &Path, worker: Identity) -> Option<crate::friends::Snapshot> {
-    let bytes = read_bounded(&directory.join("friends.json"), 512 * 1024)?;
-    let cache: FriendCache = serde_json::from_slice(&bytes).ok()?;
-    (cache.worker == worker && cache.snapshot.entries.len() <= 300
+    friend_cache(directory, worker).ok().flatten()
+}
+
+const FRIEND_CACHE_LIMIT: usize = 512 * 1024;
+/// `Ok(None)`: missing, not readable just now, or another worker's file — the normal state
+/// before this worker's first publish. `Err`: present but unusable until rewritten
+/// (oversized, not a cache, or this worker's with out-of-bounds contents).
+fn friend_cache(directory: &Path, worker: Identity) -> Result<Option<crate::friends::Snapshot>, ()> {
+    let path = directory.join("friends.json");
+    if fs::metadata(&path).is_ok_and(|m| m.len() > FRIEND_CACHE_LIMIT as u64) { return Err(()); }
+    let Some(bytes) = read_bounded(&path, FRIEND_CACHE_LIMIT) else { return Ok(None) };
+    let cache: FriendCache = serde_json::from_slice(&bytes).map_err(|_| ())?;
+    if cache.worker != worker { return Ok(None); }
+    (cache.snapshot.entries.len() <= 300
         && cache.snapshot.entries.iter().all(|f| f.name.len() <= 256 && f.location.as_ref().is_none_or(|s| s.len() <= 256))
         && cache.snapshot.error.as_ref().is_none_or(|e| e.len() <= 4096)
         && cache.snapshot.session_error.as_ref().is_none_or(|e| e.len() <= 4096)
-        && cache.snapshot.social.valid()).then_some(cache.snapshot)
+        && cache.snapshot.social.valid()).then_some(Some(cache.snapshot)).ok_or(())
 }
 
 pub(crate) fn publish_friends(directory: &Path, snapshot: &crate::friends::Snapshot) -> Result<(), String> {
@@ -507,6 +870,21 @@ pub(crate) fn run() -> i32 {
     })
 }
 
+type Login<'a> = dyn FnOnce(&Config, Account, String, Option<Plan>, Instant, &mut dyn FnMut(&str)) -> Result<LaunchResult, String> + 'a;
+
+/// One length-prefixed JSON frame from the window (credentials travel only this way).
+fn read_frame<T: serde::de::DeserializeOwned>(input: &mut impl Read) -> Result<T, String> {
+    let mut length = [0u8; 4];
+    input.read_exact(&mut length).map_err(|_| t("Missing session request."))?;
+    let length = u32::from_le_bytes(length) as usize;
+    if length > MAX_FRAME {
+        return Err(t("Session request is too large.").into());
+    }
+    let mut bytes = Zeroizing::new(vec![0u8; length]);
+    input.read_exact(&mut bytes).map_err(|_| t("Incomplete session request."))?;
+    serde_json::from_slice(&bytes).map_err(|_| t("Invalid session request.").into())
+}
+
 fn run_with(
     login: impl FnOnce(
         &Config,
@@ -519,22 +897,23 @@ fn run_with(
 ) -> i32 {
     let result = (|| -> Result<(), String> {
         let mut stdin = io::stdin().lock();
-        let mut length = [0u8; 4];
-        stdin
-            .read_exact(&mut length)
-            .map_err(|_| t("Missing session request."))?;
-        let length = u32::from_le_bytes(length) as usize;
-        if length > MAX_FRAME {
-            return Err(t("Session request is too large.").into());
-        }
-        let mut bytes = Zeroizing::new(vec![0u8; length]);
-        stdin
-            .read_exact(&mut bytes)
-            .map_err(|_| t("Incomplete session request."))?;
-        let mut request: Request =
-            serde_json::from_slice(&bytes).map_err(|_| t("Invalid session request."))?;
-        drop(bytes);
+        let request: Request = read_frame(&mut stdin)?;
         drop(stdin);
+        serve(request, Box::new(login), &mut emit)
+    })();
+    match result {
+        Ok(()) => 0,
+        Err(error) => {
+            emit(&Event::Failed(error));
+            1
+        }
+    }
+}
+
+/// The session for one request, from the account's session lock to the game's end:
+/// today's worker, and a park worker from its frame 2.
+fn serve(mut request: Request, login: Box<Login<'_>>, emit: &mut dyn FnMut(&Event)) -> Result<(), String> {
+    {
         let path = record_path(&request.config, &request.account);
         let _account_lock = exclusive(&path.with_extension("lock")).map_err(|_| {
             t("This account already has a background session. Reopen Crystal to reconnect.")
@@ -549,21 +928,22 @@ fn run_with(
                 social_only: request.via.as_ref().is_some_and(|plan| plan.social_only),
                 authenticated: false,
                 native_batch: false,
+                otp_used: Some(!request.otp.is_empty()),
                 launch_tool: request.via.as_ref().map(|plan| plan.tool),
             },
         )?;
         let clicked = crate::launch_timing::MonotonicStamp::restore(request.clicked_clock, request.elapsed_ms);
-        let mut progress = |message: &str| {
-            emit(&Event::Progress(message.to_owned()));
+        let launch = {
+            let mut progress = |message: &str| emit(&Event::Progress(message.to_owned()));
+            login(
+                &request.config,
+                request.account.clone(),
+                std::mem::take(&mut request.otp),
+                request.via.clone(),
+                clicked,
+                &mut progress,
+            )
         };
-        let launch = login(
-            &request.config,
-            request.account.clone(),
-            std::mem::take(&mut request.otp),
-            request.via.clone(),
-            clicked,
-            &mut progress,
-        );
         drop(request); // Do not retain credentials for the lifetime of the game.
         let launch = match launch {
             Ok(launch) => launch,
@@ -587,15 +967,307 @@ fn run_with(
         let _ = update_record(&path, worker, |record| record.state = ended.clone());
         emit(&ended);
         Ok(())
-    })();
-    match result {
+    }
+}
+
+// ---- the park worker (`--session-worker --park`, pol-spec 07d §1.4) ----
+
+/// What a park worker drives: `pol_less::park::Parked`, or a fake in tests.
+pub(crate) trait ParkHost {
+    fn info(&self) -> crate::pol_less::park::ParkedInfo;
+    fn watch(&mut self, wait: Duration) -> Option<String>;
+    fn kill(self);
+    #[allow(clippy::too_many_arguments)]
+    fn play(self, config: &Config, plan: &Plan, account: Account, otp: Zeroizing<String>, clicked: Instant,
+        progress: &mut dyn FnMut(&str), cold: Box<dyn FnOnce(Account, Zeroizing<String>, &mut dyn FnMut(&str)) -> Result<LaunchResult, String> + '_>)
+        -> Result<LaunchResult, String>;
+}
+impl ParkHost for crate::pol_less::park::Parked {
+    fn info(&self) -> crate::pol_less::park::ParkedInfo { self.info }
+    fn watch(&mut self, wait: Duration) -> Option<String> { crate::pol_less::park::Parked::watch(self, wait) }
+    fn kill(self) { crate::pol_less::park::Parked::kill(self) }
+    fn play(self, config: &Config, plan: &Plan, account: Account, otp: Zeroizing<String>, clicked: Instant,
+        progress: &mut dyn FnMut(&str), cold: Box<dyn FnOnce(Account, Zeroizing<String>, &mut dyn FnMut(&str)) -> Result<LaunchResult, String> + '_>)
+        -> Result<LaunchResult, String> {
+        crate::pol_less::park::Parked::play(self, config, plan, account, otp, clicked, progress, cold)
+    }
+}
+
+/// Set when this park worker's stdin ends before frame 2 (the window closed the park).
+static PARK_CLOSED: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn run_park() -> i32 {
+    run_park_with(io::stdin(), |config, plan, account, closed| {
+        crate::pol_less::park::park(config, plan, account, closed, &mut |_| {})
+    }, emit, |config, account, otp, via, clicked, progress| {
+        backend::login_with_progress(config, account, otp, via, clicked, progress)
+    }, &PARK_CLOSED)
+}
+
+/// After a host parks, how often the worker looks for frame 2 and at the host: a Play's
+/// credentials leave within this of the window's staggered write (07a parity condition 3).
+const FRAME_POLL: Duration = Duration::from_millis(20);
+
+/// Frame 1, park, `Parked`; then frame 2 (the Play) or EOF, watching the host meanwhile.
+/// Stdin is read from frame 1 on: an EOF while still parking sets `closed`, and the park
+/// stops at its next step with Windower stopped first, never orphaned by a terminate (the
+/// window leaves a parking worker to exit on its own). EOF before frame 2 kills Windower and
+/// then the host; a host that ends while parked is `ParkFailed`. From frame 2 this is
+/// today's worker (`serve`), the parked host signing in.
+fn run_park_with<H: ParkHost>(
+    mut input: impl Read + Send + 'static,
+    park: impl FnOnce(&Config, &Plan, &Account, &'static AtomicBool) -> Result<H, String>,
+    mut emit: impl FnMut(&Event),
+    cold: impl Fn(&Config, Account, String, Option<Plan>, Instant, &mut dyn FnMut(&str)) -> Result<LaunchResult, String>,
+    closed: &'static AtomicBool,
+) -> i32 {
+    let parking: ParkRequest = match read_frame(&mut input) {
+        Ok(request) => request,
+        Err(error) => { emit(&Event::ParkFailed(error)); return 1; }
+    };
+    let (sender, frames) = std::sync::mpsc::channel();
+    let reader = std::thread::Builder::new().name("park-frame".into()).spawn(move || {
+        let frame = read_frame::<Request>(&mut input).ok();
+        if frame.is_none() { closed.store(true, Ordering::Release); }
+        let _ = sender.send(frame);
+    });
+    if reader.is_err() { emit(&Event::ParkFailed(t("Could not start Crystal's background session worker.").into())); return 1; }
+    let mut host = match park(&parking.config, &parking.plan, &parking.account, closed) {
+        Ok(host) => host,
+        Err(error) => { emit(&Event::ParkFailed(error)); return 1; }
+    };
+    let info = host.info();
+    emit(&Event::Parked { loader_pid: info.loader_pid, tool_pid: info.tool_pid, polcore_ms: info.polcore_ms, hello_ms: info.hello_ms });
+    let request = loop {
+        match frames.try_recv() {
+            Ok(Some(request)) => break request,
+            // The window closed the park (or died): nothing was sent, nothing will be.
+            Ok(None) | Err(std::sync::mpsc::TryRecvError::Disconnected) => { host.kill(); return 0; }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+        if let Some(why) = host.watch(FRAME_POLL) {
+            emit(&Event::ParkFailed(why));
+            host.kill();
+            return 1;
+        }
+    };
+    // The Play must be for the account, tool and profile this host was parked for.
+    let same = backend::account_key(&request.account) == backend::account_key(&parking.account)
+        && request.via.as_ref().is_some_and(|plan| crate::pol_less::park::ParkKey::for_plan(&request.account, plan)
+            == crate::pol_less::park::ParkKey::for_plan(&parking.account, &parking.plan));
+    let history = request.config.history_path();
+    let label = request.account.label.clone();
+    let login = Box::new(move |config: &Config, account: Account, otp: String, via: Option<Plan>, clicked: Instant, progress: &mut dyn FnMut(&str)| {
+        let Some(plan) = via.clone().filter(|_| same) else {
+            host.kill();
+            return cold(config, account, otp, via, clicked, progress);
+        };
+        // Host lost before the credentials went out: today's cold path, named as one.
+        let went_cold = std::cell::Cell::new(false);
+        let fallback = Box::new(|account: Account, otp: Zeroizing<String>, progress: &mut dyn FnMut(&str)| {
+            went_cold.set(true);
+            let mut plan = plan.clone();
+            plan.trigger = if plan.social_only { crate::launch_timing::LaunchTrigger::Connect } else { crate::launch_timing::LaunchTrigger::Play };
+            cold(config, account, otp.to_string(), Some(plan), clicked, progress)
+        });
+        let result = host.play(config, &plan, account, Zeroizing::new(otp), clicked, progress, fallback);
+        // Like `backend::login_with_progress`, a launch that ends in an error is recorded,
+        // once: the cold fallback (`backend::login_with_progress`) records its own.
+        if let (Err(error), false) = (&result, went_cold.get()) {
+            let (message, log) = crate::launch_log::split_log(error);
+            let message: String = message.chars().take(240).collect();
+            crate::launch_log::append_history(&history, &label, &message, log.as_deref());
+        }
+        result
+    });
+    match serve(request, login, &mut emit) {
         Ok(()) => 0,
-        Err(error) => {
-            emit(&Event::Failed(error));
-            1
+        Err(error) => { emit(&Event::Failed(error)); 1 }
+    }
+}
+
+/// The window's handle on one park worker (07d §1.5): its stdin (closing it ends the park),
+/// its events, and its identity for tracking after a Play.
+pub(crate) struct ParkWorker {
+    child: std::process::Child,
+    stdin: Option<std::process::ChildStdin>,
+    events: std::sync::mpsc::Receiver<Event>,
+    worker: Identity,
+    ended: bool,
+    /// It reported `Parked`: its host is up and reads frame 2 within FRAME_POLL.
+    parked: bool,
+}
+
+/// Start a park worker for `account` and `plan`; frame 1 carries no password and no OTP.
+pub(crate) fn spawn_park(config: &Config, account: &Account, plan: &Plan) -> Result<ParkWorker, String> {
+    let mut command = Command::new(std::env::current_exe().map_err(|_| t("Could not locate Crystal's session worker."))?);
+    command.arg("--session-worker").arg(crate::pol_less::park::PARK_ARG);
+    spawn_park_command(command, config, account, plan)
+}
+
+/// Frame 1: no password, no OTP; the plan's per-Play fields are not used before frame 2.
+fn park_frame(config: &Config, account: &Account, plan: &Plan) -> Result<Zeroizing<Vec<u8>>, String> {
+    let mut account = account.clone();
+    account.pol_password.zeroize();
+    account.se_password.zeroize();
+    let mut plan = plan.clone();
+    plan.trigger = Default::default();
+    Ok(Zeroizing::new(serde_json::to_vec(&ParkRequest { config: config.clone(), account, plan })
+        .map_err(|_| t("Could not prepare the session request."))?))
+}
+
+/// A park worker running `command` instead of Crystal (window tests).
+#[cfg(test)]
+pub(crate) fn spawn_test_park(command: Command, config: &Config, account: &Account, plan: &Plan) -> Result<ParkWorker, String> {
+    spawn_park_command(command, config, account, plan)
+}
+
+fn spawn_park_command(mut command: Command, config: &Config, account: &Account, plan: &Plan) -> Result<ParkWorker, String> {
+    let bytes = park_frame(config, account, plan)?;
+    command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+    }
+    let mut child = command.spawn().map_err(|_| t("Could not start Crystal's background session worker."))?;
+    let started = (|| -> Result<(Identity, std::process::ChildStdin, std::process::ChildStdout), String> {
+        let worker = identity(child.id()).ok_or(t("Could not identify Crystal's background session worker."))?;
+        let mut stdin = child.stdin.take().ok_or(t("Missing session progress pipe."))?;
+        stdin.write_all(&(bytes.len() as u32).to_le_bytes()).and_then(|_| stdin.write_all(&bytes))
+            .map_err(|_| t("Could not hand credentials to the background session worker."))?;
+        Ok((worker, stdin, child.stdout.take().ok_or(t("Missing session progress pipe."))?))
+    })();
+    let (worker, stdin, stdout) = match started {
+        Ok(started) => started,
+        Err(error) => { let _ = child.kill(); let _ = child.wait(); return Err(error); }
+    };
+    let (sender, events) = std::sync::mpsc::channel();
+    let reader = std::thread::Builder::new().name("park-events".into()).spawn(move || {
+        let mut output = BufReader::new(stdout);
+        loop {
+            let mut line = String::new();
+            match output.by_ref().take((MAX_FRAME + 1) as u64).read_line(&mut line) {
+                Ok(0) | Err(_) => return,
+                Ok(count) if count > MAX_FRAME => return,
+                Ok(_) => {}
+            }
+            let Some(event) = line.trim_end().strip_prefix(PREFIX).and_then(|json| serde_json::from_str::<Event>(json).ok()) else { continue };
+            if sender.send(event).is_err() { return; }
+        }
+    });
+    if reader.is_err() {
+        drop(stdin);
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(t("Could not start Crystal's background session worker.").into());
+    }
+    Ok(ParkWorker { child, stdin: Some(stdin), events, worker, ended: false, parked: false })
+}
+
+impl crate::pol_less::park::Worker for ParkWorker {
+    fn poll(&mut self) -> Option<crate::pol_less::park::Note> {
+        use crate::pol_less::park::{Note, ParkedInfo};
+        loop {
+            match self.events.try_recv() {
+                Ok(Event::Parked { loader_pid, tool_pid, polcore_ms, hello_ms }) => {
+                    self.parked = true;
+                    return Some(Note::Parked(ParkedInfo { loader_pid, tool_pid, polcore_ms, hello_ms }));
+                }
+                Ok(Event::ParkFailed(why)) => return Some(Note::Failed(why)),
+                Ok(_) => {}
+                Err(std::sync::mpsc::TryRecvError::Empty) => return None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    return (!std::mem::replace(&mut self.ended, true)).then_some(Note::Ended);
+                }
+            }
+        }
+    }
+    fn release(&mut self) { self.stdin = None; }
+    fn exited(&mut self) -> bool { !matches!(self.child.try_wait(), Ok(None)) }
+    fn terminate(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+    fn parked(&self) -> bool { self.parked }
+}
+
+impl ParkWorker {
+    /// Adopt this parked worker for a Play or Connect (07d §1.5): frame 2 with the credentials
+    /// and the click, then its progress exactly like `launch_command`. `Err(otp)`: the worker
+    /// is gone or would not take the frame, so nothing was delivered; launch cold instead.
+    /// Frame 2 goes only once the host has parked (a parked host reads it within FRAME_POLL),
+    /// and only at its slot in `deliveries`: the stagger spaces the credentials themselves,
+    /// not writes a still-parking worker would sit on (07a parity condition 3).
+    pub(crate) fn play(mut self, config: &Config, account: Account, otp: String, via: Plan, clicked: Instant,
+        deliveries: &Mutex<Option<Instant>>, mut progress: impl FnMut(&str)) -> Result<Result<LaunchResult, String>, String> {
+        use crate::pol_less::park::Worker;
+        let otp = Zeroizing::new(otp);
+        if self.exited() || self.stdin.is_none() { return Err(otp.to_string()); }
+        if !via.social_only && batch_pending(config, &account) {
+            return Ok(Err("This account is waiting for its batch to start.".into()));
+        }
+        let _launch_claim = if !via.social_only {
+            match exclusive(&config.account_directory(&account).join("batch.lock")) {
+                Ok(claim) => Some(claim),
+                Err(_) => return Ok(Err("This account is waiting for its batch to start.".into())),
+            }
+        } else { None };
+        // Still parking: its own limits bound this wait. A park that fails delivered nothing.
+        while !self.parked {
+            match self.events.recv() {
+                Ok(Event::Parked { .. }) => self.parked = true,
+                Ok(Event::ParkFailed(_)) | Err(_) => {
+                    let _ = self.child.wait();
+                    return Err(otp.to_string());
+                }
+                Ok(_) => {}
+            }
+        }
+        let wait = crate::pol_less::park::reserve_delivery(deliveries, Instant::now(), crate::pol_less::park::jitter());
+        if !wait.is_zero() { std::thread::sleep(wait); }
+        let path = record_path(config, &account);
+        let request = Request {
+            config: config.clone(),
+            account,
+            otp: otp.to_string(),
+            via: Some(via),
+            elapsed_ms: clicked.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            clicked_clock: crate::launch_timing::MonotonicStamp::capture(clicked),
+        };
+        let bytes = Zeroizing::new(serde_json::to_vec(&request).map_err(|_| otp.to_string())?);
+        drop(request);
+        if bytes.len() > MAX_FRAME { return Ok(Err(t("Session request is too large.").into())); }
+        let sent = self.stdin.as_mut().map_or(Err(io::ErrorKind::BrokenPipe.into()), |stdin| {
+            stdin.write_all(&(bytes.len() as u32).to_le_bytes()).and_then(|_| stdin.write_all(&bytes)).and_then(|_| stdin.flush())
+        });
+        drop(bytes);
+        if sent.is_err() { return Err(otp.to_string()); }
+        // From here the worker owns the session; its stdin no longer matters.
+        self.stdin = None;
+        // A park that fails (or a worker that ends) before frame 2 was taken up delivered
+        // nothing: the Play goes cold. The host reports progress before any credential leaves.
+        let mut otp = Some(otp);
+        loop {
+            match self.events.recv() {
+                Ok(Event::Progress(message)) => { otp = None; progress(&message) }
+                Ok(Event::Failed(error)) => {
+                    let _ = self.child.wait();
+                    return Ok(Err(error));
+                }
+                Ok(Event::Started(started)) => return Ok(track(path, self.worker, started)),
+                Ok(Event::Finished(_)) => return Ok(Err(t("The background session ended before starting the game.").into())),
+                Ok(Event::ParkFailed(_)) | Err(_) if otp.is_some() => {
+                    let _ = self.child.wait();
+                    return Err(otp.map(|otp| otp.to_string()).unwrap_or_default());
+                }
+                Ok(Event::Parked { .. } | Event::ParkFailed(_)) => {}
+                Err(_) => return Ok(Err(t("The background session worker ended before starting the game.").into())),
+            }
         }
     }
 }
+
 
 fn monitor(
     path: PathBuf,
@@ -704,6 +1376,12 @@ impl BackgroundSession {
         Ok(())
     }
 
+    /// The session's launch log, once its worker published `Started`.
+    pub(crate) fn log(&self) -> Option<PathBuf> {
+        read_record(&self.path).filter(|record| record.worker == self.worker)
+            .and_then(|record| match record.state { Event::Started(started) => Some(started.log), _ => None })
+    }
+
     fn active(&self) -> bool {
         identity(self.worker.pid) == Some(self.worker)
             && read_record(&self.path).is_some_and(|record| record.worker == self.worker
@@ -727,6 +1405,12 @@ impl BackgroundSession {
         }
     }
 
+    /// Whether this session's sign-in took a one-time code (see `Record::otp_used`); `None`
+    /// when its worker's record does not say (an older worker, or the record is unreadable).
+    pub(crate) fn otp_used(&self) -> Option<bool> {
+        read_record(&self.path).filter(|record| record.worker == self.worker).and_then(|record| record.otp_used)
+    }
+
     /// A reopened window can queue Play on a sign-in-only worker without starting another.
     pub(crate) fn preparing_social(&self) -> bool {
         identity(self.worker.pid) == Some(self.worker)
@@ -736,6 +1420,8 @@ impl BackgroundSession {
                 .is_some_and(|snapshot| snapshot.social.ready && snapshot.game_running.is_some())
     }
 
+    /// Status only: no Play gates on authentication (W20 waits for the main menu, 07c §5.2).
+    #[cfg(test)]
     fn authenticated(&self) -> bool {
         identity(self.worker.pid) == Some(self.worker)
             && read_record(&self.path).is_some_and(|record| record.worker == self.worker
@@ -784,8 +1470,10 @@ pub(crate) fn launch(
     progress: impl FnMut(&str),
 ) -> Result<LaunchResult, String> {
     let mut otp = Zeroizing::new(otp);
+    // Local readiness only: the Viewer's W2U goes out at Connect, inside this sign-in
+    // (pol-spec 07c §1, §3), never before it.
     if account.mode == backend::AccountMode::Retail && find(config, &account).is_none() {
-        crate::viewer::gate(&crate::viewer::status(false))?;
+        crate::viewer::gate(&crate::viewer::local_status())?;
     }
     launch_preflighted(config, account, std::mem::take(&mut *otp), via, clicked, progress)
 }
@@ -881,11 +1569,19 @@ fn launch_command(
         if let Some(plan) = &via { session.ensure_launch_tool(plan.tool)?; }
         if via.as_ref().is_some_and(|p| !p.social_only)
             && read_friend_cache(&config.account_directory(&account), session.worker).is_some_and(|s| s.game_running == Some(false)) {
-            // This session is already signed in (a worker record exists), so the stock FFXI
-            // check below still follows the sign-in; a fresh Play checks inside the worker.
-            let install = crate::pol_less::install_directory(config)?;
-            crate::patch::gate_before_start(&install)?;
-            request_native_control(config, &account, NativeControl::StartGame)?;
+            // This session is already signed in: its main menu, then the stock W20, then
+            // StartGame (07c §5.3). A fresh Play checks inside its own worker. The trigger
+            // and W20 lines go to the session's own log (07d §4.2, 08 §4 item 6).
+            let log = session.log();
+            let clock = crate::launch_timing::Timeline::begin_at(clicked);
+            if let Some(log) = &log {
+                crate::launch_log::append_launcher_lines(log, &crate::pol_less::launch_clock_lines(&clock, crate::launch_timing::LaunchTrigger::PreSignedPlay));
+            }
+            start_signed_in(config, &account, &mut progress, || {
+                let (verdict, timing) = crate::patch::gate_before_start_timed(&crate::pol_less::install_directory(config)?);
+                if let Some(log) = &log { crate::launch_log::append_launcher_lines(log, &crate::launch_timing::check_lines("FFXI check (W20)", &timing)); }
+                verdict
+            })?;
         }
         return session.reconnect(progress);
     }
@@ -978,6 +1674,8 @@ fn launch_command(
             Event::Finished(_) => {
                 return Err(t("The background session ended before starting the game.").into())
             }
+            // Only a park worker sends these, and only before its frame 2.
+            Event::Parked { .. } | Event::ParkFailed(_) => {}
         }
     }
 }
@@ -985,6 +1683,187 @@ fn launch_command(
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
+
+    fn controller_fixture(root: &Path, game_running: Option<bool>) -> (Config, Account, PathBuf, Identity) {
+        let config = config(root); let account = account();
+        let directory = config.account_directory(&account); fs::create_dir_all(&directory).unwrap();
+        let worker = identity(std::process::id()).unwrap();
+        save_record(&record_path(&config, &account), &Record { worker, state: Event::Progress("fixture game".into()),
+            social_only: false, authenticated: true, native_batch: false, otp_used: Some(false), launch_tool: None }).unwrap();
+        publish_friends(&directory, &crate::friends::Snapshot { game_running, ..Default::default() }).unwrap();
+        (config, account, directory, worker)
+    }
+
+    fn controller_values() -> BTreeMap<String, String> {
+        [("padmode000".to_owned(), "1,0,0,0,0,1".to_owned()), ("padsin000".to_owned(), "0,1,2,3".to_owned())].into()
+    }
+
+    #[test]
+    fn controller_settings_round_trip_without_taking_the_pol_social_lock() {
+        let fixture = Fixture::new();
+        let (config, account, directory, worker) = controller_fixture(&fixture.0, Some(true));
+        fs::write(directory.join("native-social.json"), b"unrelated social request").unwrap();
+        fs::write(directory.join("native-control.json"), b"unrelated POL control").unwrap();
+        let _social_lock = exclusive(&directory.join("native-social.lock")).unwrap();
+        let consumer_dir = directory.clone();
+        let consumer = std::thread::spawn(move || {
+            // Capability may arrive while the requester holds its delivery lock.
+            publish_controller_result(&consumer_dir, 0, true, "Controller settings are available.").unwrap();
+            let until = Instant::now() + Duration::from_secs(2);
+            let frame = loop {
+                if let Some(frame) = take_controller_settings(&consumer_dir) { break frame; }
+                assert!(Instant::now() < until, "the command must be consumable while the producer awaits its reply");
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            assert!(exclusive(&consumer_dir.join("controller-settings-delivery.lock")).is_err());
+            assert!(take_controller_settings(&consumer_dir).is_none(), "deliver exactly once");
+            let frame: serde_json::Value = serde_json::from_slice(&frame).unwrap();
+            assert_eq!(frame["type"], "controller_settings");
+            assert!(frame.get("worker").is_none());
+            assert_eq!(frame["settings"], serde_json::to_value(controller_values()).unwrap());
+            assert!(frame["deadline_ms"].as_u64().unwrap() > controller_clock_ms());
+            publish_controller_result(&consumer_dir, frame["request_id"].as_u64().unwrap(), true, "Controller settings applied.").unwrap();
+        });
+        request_controller_settings_within(&config, &account, controller_values(), Duration::from_secs(1), Duration::from_secs(1)).unwrap();
+        consumer.join().unwrap();
+        assert_eq!(fs::read(directory.join("native-social.json")).unwrap(), b"unrelated social request");
+        assert_eq!(fs::read(directory.join("native-control.json")).unwrap(), b"unrelated POL control");
+        assert!(!directory.join("controller-settings.json").exists());
+        assert!(read_controller_result(&directory, worker, 0).unwrap().ok);
+        assert!(!fs::read_dir(&directory).unwrap().any(|entry| entry.unwrap().file_name().to_string_lossy().starts_with("controller-settings-result-")));
+    }
+
+    #[test]
+    fn controller_settings_require_a_live_game_supported_worker_and_complete_values() {
+        let fixture = Fixture::new();
+        let (config, account, directory, worker) = controller_fixture(&fixture.0, Some(false));
+        let request = |values| request_controller_settings_within(&config, &account, values, Duration::from_millis(20), Duration::from_millis(50));
+        assert!(request(controller_values()).unwrap_err().contains("Start FFXI"));
+        publish_friends(&directory, &crate::friends::Snapshot { game_running: None, ..Default::default() }).unwrap();
+        assert!(request(controller_values()).is_err());
+        publish_friends(&directory, &crate::friends::Snapshot { game_running: Some(true), ..Default::default() }).unwrap();
+        for values in [BTreeMap::new(), [("padmode000".to_owned(), "1".to_owned())].into(),
+            [("padmode000".to_owned(), "".to_owned()), ("padsin000".to_owned(), "0".to_owned())].into(),
+            [("unrelated".to_owned(), "1".to_owned()), ("padsin000".to_owned(), "0".to_owned())].into()] {
+            assert!(request(values).unwrap_err().contains("Invalid live controller settings"));
+        }
+        let stale = Identity { created: worker.created + 1, ..worker };
+        save_json(&controller_result_path(&directory, 0), &ControllerResult { worker: stale, request_id: 0, ok: true, message: String::new() }).unwrap();
+        assert!(request(controller_values()).unwrap_err().contains("launch it again"), "an old worker cannot announce capability");
+        publish_controller_result(&directory, 0, false, "This host is unsupported.").unwrap();
+        assert!(request(controller_values()).unwrap_err().contains("launch it again"));
+        assert!(!directory.join("controller-settings.json").exists());
+        assert!(publish_controller_result(&directory, 0, true, &"x".repeat(CONTROLLER_MESSAGE_LIMIT + 1)).is_err());
+        assert!(publish_controller_result(&directory, 0, true, "bad\nmessage").is_err());
+    }
+
+    #[test]
+    fn controller_consumer_discards_expiry_and_requires_exact_process_creation_identity() {
+        let fixture = Fixture::new();
+        let (config, account, directory, worker) = controller_fixture(&fixture.0, Some(true));
+        let path = directory.join("controller-settings.json");
+        let stale = Identity { created: worker.created + 1, ..worker };
+        let mut request = ControllerRequest { worker: stale, request_id: 42, settings: controller_values(), deadline_ms: controller_clock_ms() + 1000 };
+        save_json(&path, &request).unwrap();
+        assert!(take_controller_settings(&directory).is_none());
+        assert!(path.exists(), "an old worker cannot delete another worker's command");
+        request.worker = worker;
+        request.deadline_ms = controller_clock_ms().saturating_sub(1);
+        save_json(&path, &request).unwrap();
+        assert!(take_controller_settings(&directory).is_none());
+        assert!(!path.exists(), "an expired owned command is discarded");
+        request.deadline_ms = controller_clock_ms() + 1000;
+        request.request_id = 0;
+        save_json(&path, &request).unwrap();
+        assert!(take_controller_settings(&directory).is_none());
+        request.request_id = 42;
+        save_json(&path, &request).unwrap();
+        let _publication = exclusive(&directory.join("controller-settings.lock")).unwrap();
+        assert!(take_controller_settings(&directory).is_none());
+        drop(_publication);
+        update_record(&record_path(&config, &account), worker, |record| record.state = Event::Finished(None)).unwrap();
+        assert!(take_controller_settings(&directory).is_none());
+        assert!(publish_controller_result(&directory, 42, true, "Applied.").is_err());
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn controller_timeout_removes_queued_commands_without_claiming_the_game_applied_them() {
+        let fixture = Fixture::new();
+        let (config, account, directory, _) = controller_fixture(&fixture.0, Some(true));
+        publish_controller_result(&directory, 0, true, "Ready.").unwrap();
+        let error = request_controller_settings_within(&config, &account, controller_values(), Duration::from_millis(20), Duration::from_millis(40)).unwrap_err();
+        assert!(error.contains("did not confirm"));
+        assert!(!directory.join("controller-settings.json").exists());
+        assert!(take_controller_settings(&directory).is_none());
+    }
+
+    #[test]
+    fn controller_wait_ignores_a_stale_success_and_returns_the_current_workers_refusal() {
+        let fixture = Fixture::new();
+        let (config, account, directory, worker) = controller_fixture(&fixture.0, Some(true));
+        publish_controller_result(&directory, 0, true, "Ready.").unwrap();
+        let reply_dir = directory.clone();
+        let consumer = std::thread::spawn(move || {
+            let command = reply_dir.join("controller-settings.json");
+            until(|| command.exists());
+            let frame = loop {
+                if let Some(frame) = take_controller_settings(&reply_dir) { break frame; }
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            let frame: serde_json::Value = serde_json::from_slice(&frame).unwrap();
+            let id = frame["request_id"].as_u64().unwrap();
+            let stale = Identity { created: worker.created + 1, ..worker };
+            save_json(&controller_result_path(&reply_dir, id), &ControllerResult { worker: stale, request_id: id, ok: true, message: "Applied.".into() }).unwrap();
+            std::thread::sleep(Duration::from_millis(30));
+            publish_controller_result(&reply_dir, id, false, "The game refused the controller reload.").unwrap();
+        });
+        let error = request_controller_settings_within(&config, &account, controller_values(), Duration::from_millis(50), Duration::from_secs(1)).unwrap_err();
+        consumer.join().unwrap();
+        assert_eq!(error, "The game refused the controller reload.");
+    }
+
+    #[test]
+    fn controller_wait_rejects_replaced_sessions_and_cleanup_preserves_foreign_commands() {
+        let fixture = Fixture::new();
+        let (config, account, directory, worker) = controller_fixture(&fixture.0, Some(true));
+        publish_controller_result(&directory, 0, true, "Ready.").unwrap();
+        let replaced_dir = directory.clone();
+        let replacement = std::thread::spawn(move || {
+            let command = replaced_dir.join("controller-settings.json");
+            until(|| command.exists());
+            let _lock = controller_command_lock(&replaced_dir).unwrap();
+            let pending: ControllerRequest = serde_json::from_slice(&read_bounded(&command, CONTROLLER_FRAME_LIMIT).unwrap()).unwrap();
+            let new_worker = Identity { created: worker.created + 1, ..worker };
+            save_json(&command, &ControllerRequest { worker: new_worker, ..pending }).unwrap();
+            save_record(&replaced_dir.join("session.json"), &Record { worker: new_worker, state: Event::Progress("replacement".into()),
+                social_only: false, authenticated: true, native_batch: false, otp_used: Some(false), launch_tool: None }).unwrap();
+        });
+        assert!(request_controller_settings_within(&config, &account, controller_values(), Duration::from_millis(50), Duration::from_secs(1)).unwrap_err().contains("session ended"));
+        replacement.join().unwrap();
+        let preserved: ControllerRequest = serde_json::from_slice(&fs::read(directory.join("controller-settings.json")).unwrap()).unwrap();
+        assert_ne!(preserved.worker, worker, "cleanup removes only its exact queued request");
+        assert!(read_controller_result(&directory, preserved.worker, 0).is_none());
+    }
+
+    #[test]
+    fn controller_settings_never_retarget_a_session_replaced_before_dispatch() {
+        let fixture = Fixture::new(); let config = config(&fixture.0); let account = account();
+        let launch = launch_command(child_command("session_worker::tests::worker_fixture", &fixture.0),
+            &config, account.clone(), String::new(), None, Instant::now(), |_| {}).unwrap();
+        let captured = find(&config, &account).unwrap();
+        fs::write(fixture.0.join("stop"), []).unwrap();
+        until(|| !launch.alive.load(Ordering::Acquire) && identity(captured.worker.pid) != Some(captured.worker));
+        let directory = config.account_directory(&account);
+        let replacement = identity(std::process::id()).unwrap();
+        save_record(&record_path(&config, &account), &Record { worker: replacement, state: Event::Progress("replacement game".into()),
+            social_only: false, authenticated: true, native_batch: false, otp_used: Some(false), launch_tool: None }).unwrap();
+        publish_friends(&directory, &crate::friends::Snapshot { game_running: Some(true), ..Default::default() }).unwrap();
+        publish_controller_result(&directory, 0, true, "Ready.").unwrap();
+        assert_eq!(find(&config, &account).unwrap().worker, replacement, "a different live worker is discoverable");
+        assert!(request_controller_settings_for_session(&captured, controller_values()).unwrap_err().contains("session ended"));
+        assert!(!directory.join("controller-settings.json").exists(), "the captured request must never reach its replacement");
+    }
 
     #[test]
     fn status_publication_supports_long_unicode_paths_and_replaces_existing_data() {
@@ -1005,6 +1884,29 @@ mod tests {
         assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
     }
 
+    /// Review finding: a reopened window learns that the session's sign-in spent a one-time
+    /// code, so it signs nothing back in after that game. A record from a worker before the
+    /// field (1.0.8) does not say either way, rather than "no code".
+    #[test]
+    fn a_reconnected_session_remembers_a_spent_one_time_code() {
+        let fixture = Fixture::new(); let config = config(&fixture.0); let account = account();
+        let worker = identity(std::process::id()).unwrap();
+        let path = record_path(&config, &account); fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let old = serde_json::json!({ "worker": worker, "state": Event::Progress("Fixture signing in".into()) });
+        let record: Record = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(record.otp_used, None, "older records do not say");
+        fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+        assert_eq!(find(&config, &account).unwrap().otp_used(), None);
+        for used in [false, true] {
+            save_record(&path, &Record { worker, state: Event::Progress("signed in".into()), social_only: true,
+                authenticated: true, native_batch: false, otp_used: Some(used), launch_tool: None }).unwrap();
+            assert_eq!(find(&config, &account).unwrap().otp_used(), Some(used));
+            // What every worker writes now reads back the same.
+            let text = fs::read_to_string(&path).unwrap();
+            assert!(text.contains(&format!("\"otp_used\":{used}")), "{text}");
+        }
+    }
+
     #[test]
     fn session_reuse_requires_the_original_launch_method_and_an_owned_live_worker() {
         let fixture = Fixture::new(); let config = config(&fixture.0); let account = account();
@@ -1016,7 +1918,7 @@ mod tests {
         assert!(old.launch_tool.is_none(), "older records remain readable");
         for stored in [None, Some(Tool::Windower), Some(Tool::Ashita), Some(Tool::Vanilla)] {
             let record = Record { worker, state: old.state.clone(), social_only: false,
-                authenticated: false, native_batch: false, launch_tool: stored };
+                authenticated: false, native_batch: false, otp_used: Some(false), launch_tool: stored };
             save_record(&path, &record).unwrap();
             let before = fs::read(&path).unwrap();
             let session = find(&config, &account).unwrap();
@@ -1039,10 +1941,10 @@ mod tests {
         let path = record_path(&config, &account); fs::create_dir_all(path.parent().unwrap()).unwrap();
         let worker = identity(std::process::id()).unwrap();
         save_record(&path, &Record { worker, state: Event::Progress("Fixture Windower host".into()),
-            social_only: true, authenticated: true, native_batch: true, launch_tool: Some(Tool::Windower) }).unwrap();
+            social_only: true, authenticated: true, native_batch: true, otp_used: Some(false), launch_tool: Some(Tool::Windower) }).unwrap();
         let original = fs::read(&path).unwrap();
         let plan = Plan { tool: Tool::Vanilla, settings: Default::default(),
-            social_only: false, invisible_login: false, auto_away_minutes: 10, auto_login: crate::pol_less::AutoLogin::default() };
+            social_only: false, invisible_login: false, auto_away_minutes: 10, auto_login: crate::pol_less::AutoLogin::default(), viewer_gaps: false, trigger: Default::default() };
         let error = launch_command(Command::new("must-not-spawn.exe"), &config, account.clone(), String::new(),
             Some(plan), Instant::now(), |_| panic!("must stop before reconnect")).err().unwrap();
         assert!(error.contains("before switching launch methods"), "{error}");
@@ -1057,7 +1959,7 @@ mod tests {
             let path = record_path(&config, &account); fs::create_dir_all(path.parent().unwrap()).unwrap();
             let worker = identity(std::process::id()).unwrap();
             save_record(&path, &Record { worker, state: Event::Progress("still authenticating".into()),
-                social_only: true, authenticated: false, native_batch: true, launch_tool: None }).unwrap();
+                social_only: true, authenticated: false, native_batch: true, otp_used: Some(false), launch_tool: None }).unwrap();
             let session = find(&config, &account).unwrap();
             let (progress_tx, progress_rx) = std::sync::mpsc::channel();
             let (result_tx, result_rx) = std::sync::mpsc::channel();
@@ -1074,7 +1976,7 @@ mod tests {
             } else {
                 save_record(&path, &Record { worker: Identity { created: worker.created + 1, ..worker },
                     state: Event::Started(Started { pid: worker.pid, detail: "replacement".into(), log: fixture.0.join("fixture.log"), timing: String::new() }),
-                    social_only: true, authenticated: true, native_batch: true, launch_tool: None }).unwrap();
+                    social_only: true, authenticated: true, native_batch: true, otp_used: Some(false), launch_tool: None }).unwrap();
 
             }
             let error = result_rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap_err();
@@ -1171,10 +2073,79 @@ mod tests {
         publish_native_batch(&directory, true).unwrap();
         assert!(!read_record(&path).unwrap().authenticated, "an ended session stays ended");
         assert!(!session.authenticated() && !session.supports_batch_start());
-        save_record(&path, &Record { worker: Identity { created: 0, ..worker }, state: Event::Progress("reused PID".into()), social_only: true, authenticated: true, native_batch: true, launch_tool: None }).unwrap();
+        save_record(&path, &Record { worker: Identity { created: 0, ..worker }, state: Event::Progress("reused PID".into()), social_only: true, authenticated: true, native_batch: true, otp_used: Some(false), launch_tool: None }).unwrap();
         assert!(publish_authenticated(&directory).is_err());
         assert!(publish_native_batch(&directory, true).is_err());
         assert!(!session.preparing_social() && !session.authenticated() && !session.supports_batch_start());
+    }
+
+    /// pol-spec 07c §5.3: a Play on a signed-in session waits (never refused) for its idle
+    /// main menu, then W20, then StartGame; a request that starts during W20 delays the start
+    /// until idle again rather than cancelling anything.
+    #[test]
+    fn signed_in_play_waits_for_the_idle_main_menu_then_checks_then_starts() {
+        use std::sync::atomic::AtomicUsize;
+        let fixture = Fixture::new();
+        let config = config(&fixture.0);
+        let account = account();
+        let directory = config.account_directory(&account);
+        let path = record_path(&config, &account);
+        let worker = identity(std::process::id()).unwrap();
+        fs::create_dir_all(&directory).unwrap();
+        save_record(&path, &Record { worker, state: Event::Progress("pre-sign-in".into()), social_only: true, authenticated: true, native_batch: true, otp_used: Some(false), launch_tool: None }).unwrap();
+        let mut snapshot = crate::friends::Snapshot { game_running: Some(false), ..Default::default() };
+        publish_friends(&directory, &snapshot).unwrap();
+        let checks = Arc::new(AtomicUsize::new(0));
+        let waiting = Arc::new(Mutex::new(Vec::new()));
+        let play = {
+            let (config, account, directory, checks, waiting) = (config.clone(), account.clone(), directory.clone(), checks.clone(), waiting.clone());
+            std::thread::spawn(move || start_signed_in_within(&config, &account, Duration::from_secs(10),
+                &mut |line| waiting.lock().unwrap().push(line.to_owned()), || {
+                    checks.fetch_add(1, Ordering::SeqCst);
+                    // A message submitted while W20 runs: the start must wait for it.
+                    fs::write(directory.join("native-social.json"), b"queued fixture request").unwrap();
+                    Ok("Fixture version matches.".into())
+                }))
+        };
+        let quiet = |why: &str| {
+            std::thread::sleep(Duration::from_millis(80));
+            assert_eq!(checks.load(Ordering::SeqCst), 0, "{why}");
+            assert!(!play.is_finished(), "{why}: queued, not refused");
+        };
+        quiet("idle before the main menu's social readiness");
+        snapshot.social.ready = true; snapshot.social.busy = true;
+        publish_friends(&directory, &snapshot).unwrap();
+        quiet("a social request in flight");
+        snapshot.social.busy = false;
+        publish_friends(&directory, &snapshot).unwrap();
+        until(|| checks.load(Ordering::SeqCst) == 1);
+        std::thread::sleep(Duration::from_millis(80));
+        assert!(!directory.join("native-control.json").exists(), "no start while the request is pending");
+        assert!(!play.is_finished());
+        fs::remove_file(directory.join("native-social.json")).unwrap();
+        assert_eq!(play.join().unwrap().unwrap(), "Fixture version matches.");
+        assert_eq!(take_native_control(&directory), Some((NativeControl::StartGame, true)));
+        assert_eq!(checks.load(Ordering::SeqCst), 1, "one W20 per Play");
+        assert_eq!(waiting.lock().unwrap().len(), 1, "one status line while queued");
+
+        // Bounded: a session that never reaches its main menu is not started and runs no W20.
+        snapshot.social.ready = false;
+        publish_friends(&directory, &snapshot).unwrap();
+        let error = start_signed_in_within(&config, &account, Duration::from_millis(100), &mut |_| {}, || panic!("no W20 before the main menu")).unwrap_err();
+        assert!(error.contains("main menu"), "{error}");
+        snapshot.game_running = Some(true);
+        publish_friends(&directory, &snapshot).unwrap();
+        let error = start_signed_in_within(&config, &account, Duration::from_secs(10), &mut |_| {}, || panic!("no W20 while FFXI runs")).unwrap_err();
+        assert!(error.contains("Close FFXI"), "{error}");
+        // A cache that can never show the main menu keeps the old immediate, specific refusal.
+        for unusable in [b"not a friend cache".to_vec(), vec![b' '; 512 * 1024 + 1]] {
+            fs::write(directory.join("friends.json"), unusable).unwrap();
+            let asked = Instant::now();
+            let error = start_signed_in_within(&config, &account, Duration::from_secs(10), &mut |_| {}, || panic!("no W20 without native controls")).unwrap_err();
+            assert!(error.contains("does not support native PlayOnline controls"), "{error}");
+            assert!(asked.elapsed() < Duration::from_secs(5));
+        }
+        update_record(&path, worker, |record| record.state = Event::Finished(None)).unwrap();
     }
 
     #[test]
@@ -1186,7 +2157,7 @@ mod tests {
         let path = record_path(&config, &account);
         let worker = identity(std::process::id()).unwrap();
         fs::create_dir_all(&directory).unwrap();
-        save_record(&path, &Record { worker, state: Event::Progress("fixture".into()), social_only: false, authenticated: false, native_batch: false, launch_tool: None }).unwrap();
+        save_record(&path, &Record { worker, state: Event::Progress("fixture".into()), social_only: false, authenticated: false, native_batch: false, otp_used: Some(false), launch_tool: None }).unwrap();
         let mut snapshot = crate::friends::Snapshot { game_running: Some(true), ..Default::default() };
         publish_friends(&directory, &snapshot).unwrap();
         assert!(request_native_control(&config, &account, NativeControl::SignOut).is_err());
@@ -1270,7 +2241,7 @@ mod tests {
         let worker = identity(std::process::id()).unwrap();
         fs::create_dir_all(&directory).unwrap();
         assert!(note_native_activity(&config, &account).is_err(), "no session");
-        save_record(&record_path(&config, &account), &Record { worker, state: Event::Progress("fixture".into()), social_only: false, authenticated: false, native_batch: false, launch_tool: None }).unwrap();
+        save_record(&record_path(&config, &account), &Record { worker, state: Event::Progress("fixture".into()), social_only: false, authenticated: false, native_batch: false, otp_used: Some(false), launch_tool: None }).unwrap();
         let mut snapshot = crate::friends::Snapshot { game_running: Some(true), ..Default::default() };
         publish_friends(&directory, &snapshot).unwrap();
         note_native_activity(&config, &account).unwrap();
@@ -1406,6 +2377,273 @@ mod tests {
         std::process::exit(code);
     }
 
+    // ---- the park worker (pol-spec 07d §1.4) ----
+
+    use crate::pol_less::park::{Note, ParkedInfo, Worker};
+
+    /// A parked host stand-in: records kills and the Play, and ends its session when told.
+    struct FakeHost { root: PathBuf, dies: bool }
+    impl ParkHost for FakeHost {
+        fn info(&self) -> ParkedInfo { ParkedInfo { loader_pid: 4242, tool_pid: Some(4343), polcore_ms: Some(400), hello_ms: 1900 } }
+        fn watch(&mut self, wait: Duration) -> Option<String> {
+            if self.dies { return Some("The parked game host ended.".into()); }
+            std::thread::sleep(wait.min(Duration::from_millis(20)));
+            None
+        }
+        fn kill(self) { fs::write(self.root.join("killed"), []).unwrap(); }
+        fn play(self, config: &Config, plan: &Plan, _account: Account, otp: Zeroizing<String>, _clicked: Instant,
+            progress: &mut dyn FnMut(&str), _cold: Box<dyn FnOnce(Account, Zeroizing<String>, &mut dyn FnMut(&str)) -> Result<LaunchResult, String> + '_>)
+            -> Result<LaunchResult, String> {
+            fs::write(self.root.join("credentials"), format!("{} {}", plan.trigger.name(), otp.as_str())).unwrap();
+            progress("Fixture parked sign-in");
+            let alive = Arc::new(AtomicBool::new(true));
+            let (tracked, root) = (alive.clone(), self.root.clone());
+            std::thread::spawn(move || {
+                while !root.join("stop").exists() { std::thread::sleep(Duration::from_millis(20)); }
+                tracked.store(false, Ordering::Release);
+            });
+            Ok(LaunchResult { pid: std::process::id(), detail: "Fixture parked start".into(), log: config.experiment.join("fixture.log"),
+                timing: String::new(), alive, game_running: Arc::new(AtomicBool::new(false)), outcome: Arc::new(Mutex::new(None)) })
+        }
+    }
+
+    /// A parked host lost after frame 2, before the credentials: its Play goes cold.
+    struct LostHost;
+    impl ParkHost for LostHost {
+        fn info(&self) -> ParkedInfo { ParkedInfo { loader_pid: 4242, tool_pid: None, polcore_ms: None, hello_ms: 0 } }
+        fn watch(&mut self, wait: Duration) -> Option<String> { std::thread::sleep(wait.min(Duration::from_millis(20))); None }
+        fn kill(self) {}
+        fn play(self, _: &Config, _: &Plan, account: Account, otp: Zeroizing<String>, _: Instant,
+            progress: &mut dyn FnMut(&str), cold: Box<dyn FnOnce(Account, Zeroizing<String>, &mut dyn FnMut(&str)) -> Result<LaunchResult, String> + '_>)
+            -> Result<LaunchResult, String> {
+            cold(account, otp, progress)
+        }
+    }
+
+    /// Finding: a parked Play that fell back cold and failed is one launch-history line, not
+    /// two (the cold launch records its own, as `backend::login_with_progress` does).
+    #[test]
+    fn a_failed_cold_fallback_is_recorded_once() {
+        let fixture = Fixture::new();
+        let config = config(&fixture.0);
+        let mut bytes = frame(&ParkRequest { config: config.clone(), account: account(), plan: park_plan() });
+        bytes.extend(frame(&play_request(&config, account(), crate::launch_timing::LaunchTrigger::ParkedPlay)));
+        let history = config.history_path();
+        let code = run_park_with(Feed { bytes, at: 0, hold: None }, |_, _, _, _| Ok(LostHost), |_| {}, |config, account, _, _, _, _| {
+            crate::launch_log::append_history(&config.history_path(), &account.label, "fixture cold refused", None);
+            Err("fixture cold refused".into())
+        }, closed_flag());
+        assert_eq!(code, 1);
+        let text = fs::read_to_string(history).unwrap();
+        assert_eq!(text.matches("fixture cold refused").count(), 1, "{text}");
+    }
+
+    fn frame(value: &impl Serialize) -> Vec<u8> {
+        let bytes = serde_json::to_vec(value).unwrap();
+        let mut framed = (bytes.len() as u32).to_le_bytes().to_vec();
+        framed.extend(bytes);
+        framed
+    }
+
+    /// Stdin that holds after its bytes until `release` is dropped (the window keeps it open).
+    struct Feed { bytes: Vec<u8>, at: usize, hold: Option<std::sync::mpsc::Receiver<()>> }
+    impl Read for Feed {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if self.at == self.bytes.len() {
+                if let Some(hold) = self.hold.take() { let _ = hold.recv(); }
+                return Ok(0);
+            }
+            let count = buffer.len().min(self.bytes.len() - self.at);
+            buffer[..count].copy_from_slice(&self.bytes[self.at..self.at + count]);
+            self.at += count;
+            Ok(count)
+        }
+    }
+
+    fn park_plan() -> Plan {
+        Plan { tool: Tool::Windower, settings: Default::default(), social_only: false, invisible_login: false, auto_away_minutes: 10,
+            auto_login: crate::pol_less::AutoLogin::default(), viewer_gaps: false, trigger: Default::default() }
+    }
+
+    fn play_request(config: &Config, account: Account, trigger: crate::launch_timing::LaunchTrigger) -> Request {
+        Request { config: config.clone(), account, otp: "123456".into(), via: Some(Plan { trigger, ..park_plan() }), elapsed_ms: 0, clicked_clock: None }
+    }
+
+    /// 07d §1.4: frame 1 never carries a password or OTP.
+    #[test]
+    fn the_park_frame_carries_no_secret() {
+        let fixture = Fixture::new();
+        let mut plan = park_plan();
+        plan.trigger = crate::launch_timing::LaunchTrigger::ParkedPlay;
+        let bytes = park_frame(&config(&fixture.0), &account(), &plan).unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(!text.contains("fixture-password-never-on-disk") && !text.contains("\"otp\""), "{text}");
+        let request: ParkRequest = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!((request.account.pol_id.as_str(), request.plan.trigger), ("fixture", crate::launch_timing::LaunchTrigger::Play));
+    }
+
+    /// 07d §1.4: `Parked` after the park; EOF before frame 2 kills the host and nothing else
+    /// happens; a host that ends while parked is `ParkFailed`; a failed park says why.
+    #[test]
+    fn a_park_worker_reports_parked_then_closes_on_eof_or_host_loss() {
+        let fixture = Fixture::new();
+        let config = config(&fixture.0);
+        let first = frame(&ParkRequest { config: config.clone(), account: account(), plan: park_plan() });
+        let mut events = Vec::new();
+        let code = run_park_with(Feed { bytes: first.clone(), at: 0, hold: None }, |_, _, _, _| Ok(FakeHost { root: fixture.0.clone(), dies: false }),
+            |event| events.push(event.clone()), |_, _, _, _, _, _| panic!("no Play"), closed_flag());
+        assert_eq!(code, 0);
+        assert!(matches!(events.as_slice(), [Event::Parked { loader_pid: 4242, tool_pid: Some(4343), polcore_ms: Some(400), hello_ms: 1900 }]), "{events:?}");
+        assert!(fixture.0.join("killed").exists() && !record_path(&config, &account()).exists(), "no session record before Play");
+        fs::remove_file(fixture.0.join("killed")).unwrap();
+        let (release, hold) = std::sync::mpsc::channel::<()>();
+        let mut events = Vec::new();
+        let code = run_park_with(Feed { bytes: first.clone(), at: 0, hold: Some(hold) }, |_, _, _, _| Ok(FakeHost { root: fixture.0.clone(), dies: true }),
+            |event| events.push(event.clone()), |_, _, _, _, _, _| panic!("no Play"), closed_flag());
+        drop(release);
+        assert_eq!(code, 1);
+        assert!(matches!(events.as_slice(), [Event::Parked { .. }, Event::ParkFailed(why)] if why.contains("ended")), "{events:?}");
+        assert!(fixture.0.join("killed").exists());
+        let mut events = Vec::new();
+        assert_eq!(run_park_with(Feed { bytes: first.clone(), at: 0, hold: None }, |_, _, _, _| Err::<FakeHost, _>(crate::pol_less::park::UNSUPPORTED.into()),
+            |event| events.push(event.clone()), |_, _, _, _, _, _| panic!("no Play"), closed_flag()), 1);
+        assert!(matches!(events.as_slice(), [Event::ParkFailed(why)] if why == crate::pol_less::park::UNSUPPORTED), "{events:?}");
+        // Finding: stdin ending while the park is still starting reaches the park itself, so it
+        // can stop Windower before its loader (no orphaned Windower.exe rewriting settings.xml).
+        let mut events = Vec::new();
+        let saw = std::cell::Cell::new(false);
+        assert_eq!(run_park_with(Feed { bytes: first, at: 0, hold: None }, |_, _, _, closed| {
+            let until = Instant::now() + Duration::from_secs(5);
+            while !closed.load(Ordering::Acquire) && Instant::now() < until { std::thread::sleep(Duration::from_millis(5)); }
+            saw.set(closed.load(Ordering::Acquire));
+            Err::<FakeHost, _>(crate::pol_less::park::ABORTED.into())
+        }, |event| events.push(event.clone()), |_, _, _, _, _, _| panic!("no Play"), closed_flag()), 1);
+        assert!(saw.get(), "the park saw the window close it");
+    }
+
+    /// 07d §1.4 frame 2: the parked host signs in as a normal worker (session record, Started,
+    /// Finished); a Play for another account goes cold and the host is killed.
+    #[test]
+    fn frame_two_signs_in_through_the_parked_host_or_goes_cold_for_another_key() {
+        use crate::launch_timing::LaunchTrigger;
+        let fixture = Fixture::new();
+        let config = config(&fixture.0);
+        fs::write(fixture.0.join("stop"), []).unwrap();
+        let mut bytes = frame(&ParkRequest { config: config.clone(), account: account(), plan: park_plan() });
+        bytes.extend(frame(&play_request(&config, account(), LaunchTrigger::ParkedPlay)));
+        let mut events = Vec::new();
+        let code = run_park_with(Feed { bytes, at: 0, hold: None }, |_, _, _, _| Ok(FakeHost { root: fixture.0.clone(), dies: false }),
+            |event| events.push(event.clone()), |_, _, _, _, _, _| panic!("the parked host was alive"), closed_flag());
+        assert_eq!(code, 0);
+        assert_eq!(fs::read_to_string(fixture.0.join("credentials")).unwrap(), "parked Play 123456");
+        assert!(matches!(events.as_slice(), [Event::Parked { .. }, Event::Progress(line), Event::Started(_), Event::Finished(None)] if line == "Fixture parked sign-in"), "{events:?}");
+        assert!(matches!(read_record(&record_path(&config, &account())).unwrap().state, Event::Finished(None)));
+        assert!(!fixture.0.join("killed").exists());
+        // Another account: never the parked host.
+        let mut other = account();
+        other.pol_id = "other".into();
+        let mut bytes = frame(&ParkRequest { config: config.clone(), account: account(), plan: park_plan() });
+        bytes.extend(frame(&play_request(&config, other, LaunchTrigger::ParkedPlay)));
+        let cold = std::cell::Cell::new(false);
+        let code = run_park_with(Feed { bytes, at: 0, hold: None }, |_, _, _, _| Ok(FakeHost { root: fixture.0.clone(), dies: false }),
+            |_| {}, |_, account, otp, _, _, _| { cold.set(account.pol_id == "other" && otp == "123456"); Err("fixture cold".into()) }, closed_flag());
+        assert_eq!(code, 1);
+        assert!(cold.get() && fixture.0.join("killed").exists());
+    }
+
+    #[test]
+    #[ignore = "executed only in a fixture subprocess"]
+    fn park_worker_fixture() {
+        let root = PathBuf::from(std::env::var_os("CRYSTAL_SESSION_FIXTURE").unwrap());
+        let code = run_park_with(io::stdin(), |_, _, _, closed| {
+            // `hold-park`: a park still starting (Windower's turn, hello, polcore) until
+            // `release-park`, or until the window closes it.
+            if root.join("hold-park").exists() {
+                fs::write(root.join("parking"), []).unwrap();
+                while !root.join("release-park").exists() {
+                    if closed.load(Ordering::Acquire) {
+                        fs::write(root.join("aborted"), []).unwrap();
+                        return Err(crate::pol_less::park::ABORTED.into());
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+            Ok(FakeHost { root: root.clone(), dies: false })
+        }, emit, |_, _, _, _, _, _| Err("fixture: no cold launch".into()), &PARK_CLOSED);
+        std::process::exit(code);
+    }
+
+    /// A fresh `closed` flag for one in-process `run_park_with`.
+    fn closed_flag() -> &'static AtomicBool { Box::leak(Box::new(AtomicBool::new(false))) }
+
+    /// 07d §1.5 adoption, across processes: the window's handle sees `Parked`, writes frame 2
+    /// and tracks the session; closing a worker before Play kills its host; a worker that is
+    /// gone hands the OTP back for a cold Play.
+    #[test]
+    fn the_window_adopts_closes_or_falls_back_from_a_park_worker() {
+        let fixture = Fixture::new();
+        let config = config(&fixture.0);
+        let parked = |worker: &mut ParkWorker| until(|| matches!(worker.poll(), Some(Note::Parked(ParkedInfo { loader_pid: 4242, .. }))));
+        let mut worker = spawn_park_command(child_command("session_worker::tests::park_worker_fixture", &fixture.0), &config, &account(), &park_plan()).unwrap();
+        parked(&mut worker);
+        let mut via = park_plan();
+        via.trigger = crate::launch_timing::LaunchTrigger::ParkedPlay;
+        let launch = worker.play(&config, account(), "123456".into(), via, Instant::now(), &Mutex::new(None), |_| {}).unwrap().unwrap();
+        assert!(launch.alive.load(Ordering::Acquire));
+        assert_eq!(fs::read_to_string(fixture.0.join("credentials")).unwrap(), "parked Play 123456");
+        fs::write(fixture.0.join("stop"), []).unwrap();
+        until(|| !launch.alive.load(Ordering::Acquire));
+        assert!(!fixture.0.join("killed").exists(), "a host that got credentials is never killed");
+        fs::remove_file(fixture.0.join("stop")).unwrap();
+        // Closed before Play: the worker kills its host and exits.
+        let mut worker = spawn_park_command(child_command("session_worker::tests::park_worker_fixture", &fixture.0), &config, &account(), &park_plan()).unwrap();
+        parked(&mut worker);
+        crate::pol_less::park::close_workers(vec![worker]);
+        assert!(fixture.0.join("killed").exists());
+        // Gone: the OTP comes back, nothing was delivered.
+        let mut worker = spawn_park_command(child_command("session_worker::tests::park_worker_fixture", &fixture.0), &config, &account(), &park_plan()).unwrap();
+        worker.terminate();
+        assert_eq!(worker.play(&config, account(), "654321".into(), park_plan(), Instant::now(), &Mutex::new(None), |_| panic!("no progress")).err().as_deref(), Some("654321"));
+    }
+
+    /// Finding: a Play that adopts a still-parking worker must not take its stagger slot (or
+    /// write frame 2) until that host has parked: the slot is where the credentials leave.
+    /// And closing a still-parking worker makes it abort its park itself, Windower first.
+    #[test]
+    fn a_still_parking_worker_takes_its_stagger_slot_once_parked_and_aborts_when_closed() {
+        let fixture = Fixture::new();
+        let config = config(&fixture.0);
+        fs::write(fixture.0.join("hold-park"), []).unwrap();
+        let worker = spawn_park_command(child_command("session_worker::tests::park_worker_fixture", &fixture.0), &config, &account(), &park_plan()).unwrap();
+        let deliveries = Arc::new(Mutex::new(None));
+        let mut via = park_plan();
+        via.trigger = crate::launch_timing::LaunchTrigger::ParkedPlay;
+        let (play_config, slots) = (config.clone(), deliveries.clone());
+        let play = std::thread::spawn(move || worker.play(&play_config, account(), "123456".into(), via, Instant::now(), &slots, |_| {})
+            .map(|launch| launch.map(|launch| launch.alive)));
+        until(|| fixture.0.join("parking").exists());
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(deliveries.lock().unwrap().is_none(), "no slot while the host is still parking");
+        assert!(!fixture.0.join("credentials").exists());
+        let released = Instant::now();
+        fs::write(fixture.0.join("release-park"), []).unwrap();
+        let alive = play.join().unwrap().unwrap().unwrap();
+        let slot = deliveries.lock().unwrap().expect("reserved");
+        assert!(slot >= released, "the slot is taken after the park, not at the click");
+        assert_eq!(fs::read_to_string(fixture.0.join("credentials")).unwrap(), "parked Play 123456");
+        fs::write(fixture.0.join("stop"), []).unwrap();
+        until(|| !alive.load(Ordering::Acquire));
+        fs::remove_file(fixture.0.join("stop")).unwrap();
+        for file in ["release-park", "parking", "credentials"] { let _ = fs::remove_file(fixture.0.join(file)); }
+        // Closed while still parking: no terminate; the worker aborts its own park and exits.
+        let worker = spawn_park_command(child_command("session_worker::tests::park_worker_fixture", &fixture.0), &config, &account(), &park_plan()).unwrap();
+        until(|| fixture.0.join("parking").exists());
+        assert!(!worker.parked());
+        crate::pol_less::park::close_workers(vec![worker]);
+        until(|| fixture.0.join("aborted").exists());
+        assert!(!fixture.0.join("killed").exists(), "the park never finished");
+    }
+
     #[test]
     fn background_social_session_survives_ui_reconnect_and_game_exit() {
         let fixture = Fixture::new();
@@ -1442,7 +2680,7 @@ mod tests {
         app.preview = false;
         app.config = config.clone();
         app.settings.install_selected = true;
-        app.settings.account_startup_signin.insert(backend::account_key(&account));
+        app.settings.account_no_otp.insert(backend::account_key(&account));
         app.patch.as_mut().unwrap().state = crate::patch::PatchState::Required;
         app.accounts.truncate(1);
         let row = &mut app.accounts[0];
@@ -1514,7 +2752,7 @@ mod tests {
         let worker = identity(std::process::id()).unwrap();
         let path = record_path(&config, &account);
         let mut record = Record { worker, state: Event::Progress("Fixture signing in".into()),
-            social_only: false, authenticated: false, native_batch: false, launch_tool: None };
+            social_only: false, authenticated: false, native_batch: false, otp_used: Some(false), launch_tool: None };
         save_record(&path, &record).unwrap();
         let session = find(&config, &account).unwrap();
         assert!(!session.can_prepare_update());
@@ -1648,7 +2886,7 @@ mod tests {
                 state: Event::Progress("old session".into()),
                 social_only: false,
                 authenticated: false,
-                native_batch: false, launch_tool: None,
+                native_batch: false, otp_used: Some(false), launch_tool: None,
             },
         )
         .unwrap();
@@ -1664,7 +2902,7 @@ mod tests {
         let path = record_path(&config, &account);
         fs::create_dir_all(&directory).unwrap();
         let worker = identity(std::process::id()).unwrap();
-        save_record(&path, &Record { worker, state: Event::Progress("signed in".into()), social_only: false, authenticated: false, native_batch: false, launch_tool: None }).unwrap();
+        save_record(&path, &Record { worker, state: Event::Progress("signed in".into()), social_only: false, authenticated: false, native_batch: false, otp_used: Some(false), launch_tool: None }).unwrap();
         let snapshot = crate::friends::Snapshot {
             entries: vec![crate::friends::Friend { name: "Alice".into(), alternate: false, slot: 199, uid:None, online: Some(true), location: Some("Vana'diel".into()), character: None }],
             fetched_at: 1, ..crate::friends::Snapshot::default()
@@ -1682,7 +2920,7 @@ mod tests {
         assert!(friends_snapshot(&config, &account).1.is_none());
         fs::write(directory.join("friends.json"), vec![b' '; 512 * 1024 + 1]).unwrap();
         assert!(friends_snapshot(&config, &account).1.is_none());
-        save_record(&path, &Record { worker, state: Event::Finished(None), social_only: false, authenticated: false, native_batch: false, launch_tool: None }).unwrap();
+        save_record(&path, &Record { worker, state: Event::Finished(None), social_only: false, authenticated: false, native_batch: false, otp_used: Some(false), launch_tool: None }).unwrap();
         assert!(!friends_snapshot(&config, &account).0);
     }
 
@@ -1691,7 +2929,7 @@ mod tests {
         let fixture = Fixture::new(); let config = config(&fixture.0); let account = account();
         let directory = config.account_directory(&account); fs::create_dir_all(&directory).unwrap();
         let worker = identity(std::process::id()).unwrap();
-        save_record(&record_path(&config, &account), &Record { worker, state: Event::Progress("signed in".into()), social_only: false, authenticated: false, native_batch: false, launch_tool: None }).unwrap();
+        save_record(&record_path(&config, &account), &Record { worker, state: Event::Progress("signed in".into()), social_only: false, authenticated: false, native_batch: false, otp_used: Some(false), launch_tool: None }).unwrap();
         let mut snapshot = crate::friends::Snapshot { game_running: Some(false), ..Default::default() };
         assert!(request_social(&config, &account, crate::social::Request::Inbox { folder:0, page:0 }).is_err());
         snapshot.social.ready = true; publish_friends(&directory, &snapshot).unwrap();

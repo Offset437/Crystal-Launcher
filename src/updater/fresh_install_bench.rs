@@ -63,7 +63,7 @@ async fn fresh_official_install_total_update_timing() {
             if ending { break; }
         }
     });
-    let result = run_combined(viewer.clone(), game.clone(), Mode::Update, op.clone()).await;
+    let result = run_combined(Some(viewer.clone()), Some(game.clone()), Mode::Update, op.clone()).await;
     let elapsed = started.elapsed();
     let completed_utc = chrono::Utc::now().to_rfc3339();
     stopped.store(true, Ordering::Release);
@@ -75,8 +75,13 @@ async fn fresh_official_install_total_update_timing() {
         "baseline_viewer_version": baseline_viewer_version,
         "timing_scope": "Production run_combined: manifests, file scans, downloads, staging, application, final verification and applied records. MSI extraction and later independent checks excluded.",
         "overall_complete": final_progress.overall.is_some_and(|o| o.complete)});
+    struct Both<'a> { viewer: &'a Report, game: &'a Report }
+    fn both(combined: &CombinedReport) -> Both<'_> {
+        Both { viewer: combined.viewer.as_ref().unwrap(), game: combined.game.as_ref().unwrap() }
+    }
     match &result {
-        Ok(report) => {
+        Ok(combined) => {
+            let report = both(combined);
             summary["success"] = serde_json::json!(report.viewer.verified && report.game.verified);
             summary["viewer"] = serde_json::json!({"version": report.viewer.version, "files": report.viewer.total,
                 "updated": report.viewer.repaired, "decoded_bytes_staged": report.viewer.bytes,
@@ -93,17 +98,19 @@ async fn fresh_official_install_total_update_timing() {
     let mut summary_file = fs::OpenOptions::new().write(true).create_new(true)
         .open(root.join("update-result.json")).unwrap();
     writeln!(summary_file, "{}", serde_json::to_string_pretty(&summary).unwrap()).unwrap();
-    let report = result.unwrap_or_else(|error| panic!("Fresh update failed: {}", error.message));
-    eprintln!("Fresh update completed in {:.2}s: {}", elapsed.as_secs_f64(), report.summary());
+    let combined = result.unwrap_or_else(|error| panic!("Fresh update failed: {}", error.message));
+    eprintln!("Fresh update completed in {:.2}s: {}", elapsed.as_secs_f64(), combined.summary());
+    let report = both(&combined);
     assert!(report.viewer.verified && report.game.verified);
     assert_eq!(report.game.modified, 0);
     assert!(final_progress.overall.is_some_and(|o| o.complete));
-    let checked = run_combined(viewer, game, Mode::Check, Operation::new()).await
+    let independent = run_combined(Some(viewer), Some(game), Mode::Check, Operation::new()).await
         .unwrap_or_else(|error| panic!("Independent check failed: {}", error.message));
+    let checked = both(&independent);
     assert!(checked.viewer.verified && checked.game.verified);
     fs::write(root.join("independent-check.json"), serde_json::to_vec_pretty(&serde_json::json!({
         "viewer_current": checked.viewer.current, "viewer_total": checked.viewer.total,
         "game_current": checked.game.current, "game_total": checked.game.total,
         "both_verified": checked.viewer.verified && checked.game.verified})).unwrap()).unwrap();
-    eprintln!("Independent post-update check: {}", checked.summary());
+    eprintln!("Independent post-update check: {}", independent.summary());
 }

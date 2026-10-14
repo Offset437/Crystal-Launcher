@@ -16,6 +16,8 @@ mod product_tests;
 mod viewer_live_test;
 #[cfg(test)]
 mod fresh_install_bench;
+#[cfg(test)]
+mod traffic_tests;
 
 use crate::i18n::{t, tf};
 use crate::operation::{Operation, UpdateWork};
@@ -32,15 +34,53 @@ use std::sync::{
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-const SERVER: &str = "pc001.pol.com:53001";
-const VIEWER_SERVER: &str = "pc001.pol.com:54000";
+// The patch hosts stock looks up (`dns::GAME_PATCH_HOST`, `dns::VIEWER_PATCH_HOST`).
+const SERVER: &str = "pc001W2U.pol.com:53001";
+const VIEWER_SERVER: &str = "pt008.pol.com:54000";
 const MAX_MANIFEST: usize = 64 * 1024 * 1024;
 const MAX_FILE: u64 = 512 * 1024 * 1024;
 const STATE_DIR: &str = ".xi-updater";
+/// User copies of modified files an update or repair replaced, by their relative path.
+/// Never cleaned up by Crystal.
+const KEPT_DIR: &str = ".xi-updater/kept";
+/// Present while the next update must check every file in full: an interrupted
+/// update was found, or a transaction failed after touching the install.
+const FULL_CHECK_MARKER: &str = ".xi-updater/full-check";
 const SIGNATURE_BUFFER_LEN: usize = 1 << 20;
 const MAX_CHECK_WORKERS: usize = 8;
 const ACTIVE_GAME_CHECK_WORKERS: usize = 4;
-const MAX_DOWNLOAD_WORKERS: usize = 8;
+// Patch-server traffic follows stock POL (captures 2026-10-13 00:21 and the complete
+// update stock-update-20261013-004932: stock POL updating FFXI 30260904_1 → 30261006_0
+// on pc001W2U.pol.com:53001 = 124.150.156.107, every SYN with the `stock_socket`
+// options): the W20 version request on its own connection, FIN ~100 ms
+// after its 103 B reply; a 24 B POLP command 1 on a new connection for the file list,
+// FIN ~114 ms after the reply; then ONE connection carries every download as POLP
+// command 3 requests (byte-identical to `polp::file_request`), strictly one in flight:
+// request → the whole reply (≤ one 64 KB chunk) → next request. A file is fetched as
+// consecutive 64 KB chunks from offset 0, each next chunk requested at once (median
+// 0.7 ms after the reply); the next file follows its predecessor's local processing
+// (median 18 ms, growing with size, 3-239 ms). 422 requests for 360 files (298 deltas,
+// 62 full files), 14 MB, FIN 100 ms after the last reply. No version check followed the
+// update. Crystal used 8 parallel plain sockets before. Each rule here is one setting.
+// Every wire-visible pause runs on a high-resolution timer (`precise_sleep`).
+/// Download connections open at once; each one is stop-and-wait (`Session::exchange`).
+const MAX_DOWNLOAD_WORKERS: usize = 1;
+/// Least time from the last reply of one file to the request for the next file, drawn per
+/// file by what the previous file was (`next_file_pause`); Crystal's own processing of the
+/// finished file counts toward it. Stock's gap there is processing time
+/// (stock-update-20261013-004932, 359 new-file requests): after a delta never under
+/// 11.5 ms (delta → delta min 13.4, median 19.4, n=245; delta → direct min 11.5, n=52),
+/// longer after big files; after a 24 B direct file median 8.4, min 3.3 (n=46).
+const PAUSE_AFTER_DELTA: (Duration, Duration) = (Duration::from_millis(12), Duration::from_millis(25));
+const PAUSE_AFTER_SMALL_DIRECT: (Duration, Duration) = (Duration::from_millis(3), Duration::from_millis(9));
+/// A direct file up to this transfer size is "small" for `next_file_pause`.
+const SMALL_DIRECT: u64 = 1024;
+/// From Crystal's FIN on a patch connection to the SYN of its next connection to the same
+/// server. Stock (captures 2026-10-13 00:21 and 00:49): W20 FIN → idle prompt SYN +109 and
+/// +110 ms, its FIN → file-list SYN +107 and +105 ms; never a SYN within 100 ms of a FIN.
+const NEXT_CONNECTION_GAP: (Duration, Duration) = (Duration::from_millis(103), Duration::from_millis(112));
+/// Resolve plus connect for one patch-server connection.
+const CONNECT_LIMIT: Duration = Duration::from_secs(30);
 const DOWNLOAD_BUDGET_MIB: usize = 1024;
 #[cfg(test)]
 const MAX_BENCHMARK_CHECK_WORKERS: usize = 12;
@@ -51,7 +91,7 @@ impl Product {
     fn label(self) -> &'static str {
         match self { Self::Ffxi => t("FINAL FANTASY XI"), Self::Viewer => t("PlayOnline") }
     }
-    fn server(self) -> &'static str {
+    pub(crate) fn server(self) -> &'static str {
         match self { Self::Ffxi => SERVER, Self::Viewer => VIEWER_SERVER }
     }
     fn title(self) -> &'static str {
@@ -72,6 +112,21 @@ impl Product {
             Self::Viewer => manifest.files.iter().flat_map(|h| h.versions.iter()).map(|v| v.stamp.as_str())
                 .max_by_key(|s| s.split_once('_').map(|(date, revision)|
                     (date.parse::<u64>().unwrap_or(0), u64::from_str_radix(revision, 16).unwrap_or(0)))),
+        }
+    }
+    /// A stamp's place in time (date, then revision), `None` when it is not this product's.
+    fn stamp_order(self, stamp: &str) -> Option<(u64, u64)> {
+        if !self.valid_stamp(stamp) { return None; }
+        let (date, revision) = stamp.split_once('_')?;
+        let radix = match self { Self::Ffxi => 10, Self::Viewer => 16 };
+        Some((date.parse().ok()?, u64::from_str_radix(revision, radix).ok()?))
+    }
+    /// Whether an update from `installed` changes `history`: its current version is newer
+    /// than the installed one. Without an installed version every file counts as changed.
+    fn changed_since(self, installed: Option<&str>, history: &FileHistory) -> bool {
+        match installed.and_then(|version| self.stamp_order(version)) {
+            Some(base) => self.stamp_order(&history.current().stamp).is_none_or(|stamp| stamp > base),
+            None => true,
         }
     }
     fn parse_manifest(self, text: &str) -> Result<Manifest, String> {
@@ -128,6 +183,13 @@ pub struct Report {
     pub bytes: u64,
     pub verified: bool,
     pub issues: Vec<String>,
+    /// Modified files replaced with official ones whose copies are in `.xi-updater/kept`.
+    pub kept: usize,
+    /// Modified files an update doesn't change, left in place.
+    pub left: usize,
+    /// The plan read every file in full (not only what the update changes), so a verified
+    /// commit vouches for every official file.
+    pub all_files_checked: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,6 +202,9 @@ struct Planned {
     index: usize,
     action: Action,
     original: Option<FileSig>,
+    /// The file is a user modification being replaced: its copy goes to
+    /// `.xi-updater/kept/<path>` before the version advances (owner, 2026-10-13).
+    keep: bool,
 }
 
 #[derive(Clone)]
@@ -181,7 +246,9 @@ pub async fn probe(install: PathBuf, operation: Operation) -> Result<String, Str
         return Err("Install must be a directory".into());
     }
     operation.progress("Probe", 0, 5, "Fetching canonical manifest into memory");
-    let mut session = Session::connect(&operation).await?;
+    // A diagnostic (`--patch-probe`), not an update: no stock flow fetches files without
+    // one, so it keeps a single connection. It still uses the stock socket shape.
+    let mut session = Session::connect_to(Product::Ffxi, SERVER, &operation).await?;
     // The stock shape: FFXI's installed version (empty only for a fresh install).
     let installed = crate::patch::installed_for_request(&root);
     let reply = session
@@ -279,7 +346,7 @@ pub async fn probe(install: PathBuf, operation: Operation) -> Result<String, Str
             return Err("Downloaded historical delta base failed signature verification".into());
         }
         let delta = pair[1].indirect.as_ref().unwrap();
-        let raw = session.fetch(&delta.path, delta.len, &operation).await?;
+        let raw = session.fetch_delta(&delta.path, delta.len, &operation).await?;
         operation.check_cancelled()?;
         let target = lz::apply_indirect_bounded(&raw, &base, pair[1].sig.len as usize)?;
         if FileSig::of(&target) != pair[1].sig {
@@ -306,6 +373,7 @@ pub async fn probe(install: PathBuf, operation: Operation) -> Result<String, Str
         "Read-only direct/delta verification complete",
     );
     lines.push("All downloads remained in memory. No installation files or applied-version metadata changed.".into());
+    session.close().await;
     Ok(lines.join("\n"))
 }
 
@@ -316,14 +384,19 @@ pub async fn run(install: PathBuf, mode: Mode, operation: Operation) -> Result<R
 
 pub(crate) async fn run_for(product: Product, install: PathBuf, mode: Mode, operation: Operation) -> Result<Report, String> {
     let prepared = prepare(product, install, mode, &operation).await?;
-    let mut reports = execute(vec![prepared], &operation).await?;
+    let mut reports = execute(vec![prepared], &operation, true, ensure_idle).await?;
     Ok(reports.remove(0))
 }
 
-pub(crate) struct CombinedReport { pub viewer: Report, pub game: Report }
+pub(crate) struct CombinedReport { pub viewer: Option<Report>, pub game: Option<Report> }
 impl CombinedReport {
     pub fn summary(&self) -> String {
-        tf("PlayOnline: {pol}\nFINAL FANTASY XI: {ffxi}", &[("pol", &self.viewer.summary), ("ffxi", &self.game.summary)])
+        match (&self.viewer, &self.game) {
+            (Some(viewer), Some(game)) => tf("PlayOnline: {pol}\nFINAL FANTASY XI: {ffxi}", &[("pol", &viewer.summary), ("ffxi", &game.summary)]),
+            (Some(viewer), None) => tf("PlayOnline: {pol}", &[("pol", &viewer.summary)]),
+            (None, Some(game)) => tf("FINAL FANTASY XI: {ffxi}", &[("ffxi", &game.summary)]),
+            (None, None) => String::new(),
+        }
     }
 }
 
@@ -332,27 +405,48 @@ impl From<String> for CombinedFailure {
     fn from(message: String) -> Self { Self { message, viewer_version: None } }
 }
 
-/// One engine and one operation. Plan both components before downloading so
-/// the total and ETA cover both; stage everything, then commit POL before FFXI.
-pub(crate) async fn run_combined(viewer: PathBuf, game: PathBuf, mode: Mode, operation: Operation) -> Result<CombinedReport, CombinedFailure> {
-    ensure_plain(&viewer)?; ensure_plain(&game)?;
-    let viewer = fs::canonicalize(viewer).map_err(|e| e.to_string())?;
-    let game = fs::canonicalize(game).map_err(|e| e.to_string())?;
-    if viewer == game || viewer.starts_with(&game) || game.starts_with(&viewer) {
-        return Err(t("Choose separate PlayOnline and FINAL FANTASY XI installation folders.").to_owned().into());
+/// One engine and one operation for PlayOnline, FINAL FANTASY XI or both. PlayOnline goes
+/// first and finishes (version, list, downloads, commit) before anything goes to FFXI's
+/// patch service: in stock the Viewer updates at Connect and restarts before any FFXI W20,
+/// so :53001 traffic never sits between the Viewer's list and its downloads. Each
+/// component's own traffic is in stock's order: version, list, then its downloads.
+pub(crate) async fn run_combined(viewer: Option<PathBuf>, game: Option<PathBuf>, mode: Mode, operation: Operation) -> Result<CombinedReport, CombinedFailure> {
+    run_combined_at(viewer, game, mode, operation, (Product::Viewer.server(), Product::Ffxi.server()), ensure_idle).await
+}
+
+/// `run_combined` with the patch servers (PlayOnline's, FFXI's) and the liveness guard as
+/// seams for local-server tests.
+async fn run_combined_at(viewer: Option<PathBuf>, game: Option<PathBuf>, mode: Mode, operation: Operation,
+    servers: (&str, &str), guard: Guard) -> Result<CombinedReport, CombinedFailure> {
+    let canonical = |path: Option<PathBuf>| -> Result<Option<PathBuf>, String> {
+        path.map(|path| { ensure_plain(&path)?; fs::canonicalize(path).map_err(|e| e.to_string()) }).transpose()
+    };
+    let (viewer, game) = (canonical(viewer)?, canonical(game)?);
+    if let (Some(viewer), Some(game)) = (&viewer, &game) {
+        if viewer == game || viewer.starts_with(game) || game.starts_with(viewer) {
+            return Err(t("Choose separate PlayOnline and FINAL FANTASY XI installation folders.").to_owned().into());
+        }
     }
     operation.check_cancelled()?;
     if mode != Mode::Check {
         operation.begin_update();
-        ensure_idle(&viewer)?; ensure_idle(&game)?;
+        for root in viewer.iter().chain(&game) { guard(root)?; }
     }
-    let pol = prepare(Product::Viewer, viewer, mode, &operation.component(t("PlayOnline"))).await?;
-    let viewer_version = pol.report.version.clone();
-    let failure = |message| CombinedFailure { message, viewer_version: Some(viewer_version.clone()) };
-    let ffxi = prepare(Product::Ffxi, game, mode, &operation.component(t("FINAL FANTASY XI"))).await.map_err(failure)?;
-    let mut reports = execute(vec![pol, ffxi], &operation).await.map_err(failure)?;
-    let game = reports.pop().unwrap();
-    Ok(CombinedReport { viewer: reports.pop().unwrap(), game })
+    let mut combined = CombinedReport { viewer: None, game: None };
+    let mut viewer_version = None;
+    if let Some(viewer) = viewer {
+        let pol = prepare_at(Product::Viewer, viewer, mode, &operation.component(t("PlayOnline")), servers.0, guard).await?;
+        viewer_version = Some(pol.report.version.clone());
+        let reports = execute(vec![pol], &operation, game.is_none(), guard).await
+            .map_err(|message| CombinedFailure { message, viewer_version: viewer_version.clone() })?;
+        combined.viewer = reports.into_iter().next();
+    }
+    if let Some(game) = game {
+        let failure = |message| CombinedFailure { message, viewer_version: viewer_version.clone() };
+        let ffxi = prepare_at(Product::Ffxi, game, mode, &operation.component(t("FINAL FANTASY XI")), servers.1, guard).await.map_err(failure)?;
+        combined.game = execute(vec![ffxi], &operation, true, guard).await.map_err(failure)?.into_iter().next();
+    }
+    Ok(combined)
 }
 
 struct PreparedUpdate {
@@ -365,9 +459,26 @@ struct PreparedUpdate {
     text: Vec<u8>,
     planned: Vec<Planned>,
     seed: Option<u64>,
+    /// The patch server ("host:port") its downloads come from.
+    server: Arc<str>,
+    /// Every file was read in full (not a version plan): success clears a pending full check.
+    full_scan: bool,
+}
+impl PreparedUpdate {
+    /// Repair (and the small PlayOnline component) verifies every file after applying;
+    /// an FFXI update verifies the files it wrote (Phase 3).
+    fn full_verify(&self) -> bool { self.mode == Mode::Repair || self.product == Product::Viewer }
 }
 
 async fn prepare(product: Product, install: PathBuf, mode: Mode, operation: &Operation) -> Result<PreparedUpdate, String> {
+    prepare_at(product, install, mode, operation, product.server(), ensure_idle).await
+}
+
+/// The liveness check a step that changes an install runs first (`ensure_idle`; fixture
+/// tests pass their own).
+type Guard = fn(&Path) -> Result<(), String>;
+
+async fn prepare_at(product: Product, install: PathBuf, mode: Mode, operation: &Operation, server: &str, guard: Guard) -> Result<PreparedUpdate, String> {
     operation.check_cancelled()?;
     if mode != Mode::Check { operation.begin_update(); }
     ensure_plain(&install)?;
@@ -376,7 +487,7 @@ async fn prepare(product: Product, install: PathBuf, mode: Mode, operation: &Ope
     if !root.is_dir() { return Err(t("Install must be a directory").into()); }
     validate_installation(product, &root)?;
     let lock = if mode != Mode::Check {
-        ensure_idle(&root)?;
+        guard(&root)?;
         let state = confined(&root, STATE_DIR)?;
         fs::create_dir_all(&state).map_err(|e| e.to_string())?;
         let mut options = fs::OpenOptions::new();
@@ -388,35 +499,67 @@ async fn prepare(product: Product, install: PathBuf, mode: Mode, operation: &Ope
         Some(options.open(confined(&root, &format!("{STATE_DIR}/lock"))?)
             .map_err(|e| tf("Another updater may be using this install: {error}", &[("error", &e)]))?)
     } else { None };
-    if mode != Mode::Check { ensure_idle(&root)?; recover(&root)?; }
-    operation.progress("Manifest", 0, 1, t("Downloading the official file manifest"));
-    let mut session = Session::connect_for(product, operation).await?;
+    if mode != Mode::Check {
+        guard(&root)?;
+        // An interrupted update leaves files nobody vouches for: check them all next.
+        if recover_with_guard(&root, guard)? { mark_full_check(&root); }
+    }
     let installed = crate::patch::installed_for_request_for(&root, product.title());
-    let version_frame = session.exchange(&polp::version(&product.tags(), installed.as_bytes()), 8, operation).await?;
-    let version = polp::parse_version_reply(&version_frame[16..])?;
-    if version.label == "unknown" || !product.valid_stamp(&version.version) {
-        return Err(t("Official version response is invalid").into());
-    }
-    let frame = session.exchange(&polp::hello(&product.tags()), 2, operation).await?;
-    let text = decode_payload(&frame[16..], MAX_MANIFEST)?;
-    let utf8 = std::str::from_utf8(&text).map_err(|_| t("Official manifest is not UTF-8"))?;
-    let manifest = product.parse_manifest(utf8)?;
-    validate_manifest_for(product, &manifest)?;
-    if product.latest_stamp(&manifest) != Some(version.version.as_str()) {
-        return Err(t("Official version changed while fetching the manifest; retry").into());
-    }
-    drop(session);
+    let (version, text, manifest) = if mode == Mode::Check {
+        // Check compares the files with the installed file list (the patch.cfg the last
+        // update wrote) and never contacts Square Enix: stock has no such request.
+        operation.progress("Manifest", 0, 1, t("Reading the installed file list"));
+        let Some(text) = read_installed_list(&root)? else {
+            let report = Report { summary: t("No installed file list (patch.cfg) to compare with yet, so nothing was checked. Press Update or use Repair files.").into(),
+                ..Default::default() };
+            return Ok(PreparedUpdate { product, root, _lock: lock, mode, report, manifest: Manifest::default(),
+                text: Vec::new(), planned: Vec::new(), seed: None, server: server.into(), full_scan: false });
+        };
+        let manifest = parse_list(product, &text)?;
+        let version = product.latest_stamp(&manifest).unwrap_or_default().to_owned();
+        (version, text, manifest)
+    } else {
+        operation.progress("Manifest", 0, 1, t("Downloading the official file manifest"));
+        let version = official_version(product, server, &installed, operation).await?;
+        // Phase 2 hook (Play is the update): stock opens one more connection here, ~110 ms
+        // after the W20's FIN, and holds it idle, no data, while its "update?" prompt shows
+        // (captures 2026-10-13: 5.5 s at 00:21, ~1 s at 00:49), then closes it and opens the
+        // file-list connection ~105-110 ms later. Crystal adds it with the Play-driven update,
+        // where that prompt's moment exists (and reuses the Play's W20 instead of sending a
+        // second one); until then the list connection keeps the same FIN → SYN spacing.
+        let text = official_list(product, server, operation).await?;
+        let manifest = parse_list(product, &text)?;
+        if product.latest_stamp(&manifest) != Some(version.as_str()) {
+            return Err(t("Official version changed while fetching the manifest; retry").into());
+        }
+        (version, text, manifest)
+    };
     let manifest = product.deployment(&root, manifest)?;
     operation.progress("Manifest", 1, 1, tf("{count} files, version {version}",
-        &[("count", &manifest.files.len()), ("version", &version.version)]));
+        &[("count", &manifest.files.len()), ("version", &version)]));
     let scan_root = root.clone(); let scan_manifest = manifest.clone(); let scan_operation = operation.clone();
     // POL's official update restores canonical components. Fresh installer
-    // DLLs are not necessarily in the retained patch history. Preserve FFXI
-    // modifications as before; POL originals still receive transaction backups.
+    // DLLs are not necessarily in the retained patch history. POL originals
+    // still receive transaction backups.
     let scan_mode = if product == Product::Viewer && mode == Mode::Update { Mode::Repair } else { mode };
-    let (mut report, planned) = tokio::task::spawn_blocking(move || scan_for(product, &scan_root, &scan_manifest, scan_mode, &scan_operation))
-        .await.map_err(|e| e.to_string())??;
-    report.version = version.version;
+    let installed = (!installed.is_empty()).then_some(installed);
+    // A routine FFXI update checks only what changed (Phase 3). Everything else is a full
+    // scan: Check, Repair, a fresh install, a list that is not the installed version's, a
+    // pending full check (interrupted or failed update), or any failure of the plan.
+    let applied = (scan_mode == Mode::Update && product == Product::Ffxi && !full_check_due(&root))
+        .then(|| applied_list(&root, product, installed.as_deref())).flatten();
+    let ((mut report, planned), full_scan) = tokio::task::spawn_blocking(move || {
+        if let Some(applied) = applied {
+            let workers = check_workers(&scan_root, scan_mode);
+            match plan_from_applied(product, &scan_root, &applied, &scan_manifest, scan_mode, &scan_operation, workers) {
+                Ok(plan) => return Ok((plan, false)),
+                Err(error) if scan_operation.cancelled() => return Err(error),
+                Err(_) => {}
+            }
+        }
+        scan_for(product, &scan_root, &scan_manifest, scan_mode, &scan_operation, installed.as_deref()).map(|plan| (plan, true))
+    }).await.map_err(|e| e.to_string())??;
+    report.version = version;
     let seed = if mode == Mode::Check { None } else {
         confined(&root, "patch.ver")?;
         Some(if mode == Mode::Repair { crate::patch::repair_seed_for(&root, product.title())? }
@@ -432,7 +575,70 @@ async fn prepare(product: Product, install: PathBuf, mode: Mode, operation: &Ope
             tf("Checked {total} files: {current} current, {outdated} outdated, {missing} missing, {modified} modified. No files changed.", &counts)
         };
     }
-    Ok(PreparedUpdate { product, root, _lock: lock, mode, report, manifest, text, planned, seed })
+    Ok(PreparedUpdate { product, root, _lock: lock, mode, report, manifest, text, planned, seed, server: server.into(), full_scan })
+}
+
+/// The installed list when it is the installed version's (its newest stamp is the one
+/// patch.ver records), the base a version plan compares with.
+fn applied_list(root: &Path, product: Product, installed: Option<&str>) -> Option<Manifest> {
+    let installed = installed?;
+    let text = read_installed_list(root).ok()??;
+    let manifest = parse_list(product, &text).ok()?;
+    (product.latest_stamp(&manifest) == Some(installed)).then_some(manifest)
+}
+
+fn full_check_due(root: &Path) -> bool {
+    confined(root, FULL_CHECK_MARKER).map_or(true, |marker| marker.exists())
+}
+
+/// Best effort: without the marker, an interrupted update's journal or the failure
+/// itself still forces the full scan once.
+fn mark_full_check(root: &Path) {
+    if let Ok(marker) = confined(root, FULL_CHECK_MARKER) { let _ = fs::write(marker, b""); }
+}
+
+/// The installed file list (`patch.cfg`, written by the last verified update), or `None`
+/// when there is none yet. Read from disk only.
+fn read_installed_list(root: &Path) -> Result<Option<Vec<u8>>, String> {
+    let path = confined(root, "patch.cfg")?;
+    let file = match fs::File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("{}: {error}", path.display())),
+    };
+    let mut text = Vec::new();
+    file.take(MAX_MANIFEST as u64 + 1).read_to_end(&mut text).map_err(|e| format!("{}: {e}", path.display()))?;
+    if text.len() > MAX_MANIFEST { return Err(t("Decoded payload exceeds expected size").into()); }
+    Ok(Some(text))
+}
+
+fn parse_list(product: Product, text: &[u8]) -> Result<Manifest, String> {
+    let utf8 = std::str::from_utf8(text).map_err(|_| t("Official manifest is not UTF-8"))?;
+    let manifest = product.parse_manifest(utf8)?;
+    validate_manifest_for(product, &manifest)?;
+    Ok(manifest)
+}
+
+/// The version request on its own stock connection, closed like stock after the reply
+/// (capture 2026-10-13 00:21: 88 B request, 103 B reply, FIN ~110 ms later).
+async fn official_version(product: Product, server: &str, installed: &str, operation: &Operation) -> Result<String, String> {
+    let mut session = Session::connect_to(product, server, operation).await?;
+    let frame = session.exchange(&polp::version(&product.tags(), installed.as_bytes()), 8, operation).await?;
+    session.close().await;
+    let version = polp::parse_version_reply(&frame[16..])?;
+    if version.label == "unknown" || !product.valid_stamp(&version.version) {
+        return Err(t("Official version response is invalid").into());
+    }
+    Ok(version.version)
+}
+
+/// The file list (POLP command 1, 24 B) on a new stock connection, closed like stock
+/// ~0.1 s after the reply. Returns the decoded list text.
+async fn official_list(product: Product, server: &str, operation: &Operation) -> Result<Vec<u8>, String> {
+    let mut session = Session::connect_to(product, server, operation).await?;
+    let frame = session.exchange(&polp::hello(&product.tags()), 2, operation).await?;
+    session.close().await;
+    decode_payload(&frame[16..], MAX_MANIFEST)
 }
 
 // A directory selection is not evidence of an installed product. Allow repair
@@ -455,7 +661,9 @@ fn validate_installation(product: Product, root: &Path) -> Result<(), String> {
         &[("product", &product.label())]))
 }
 
-async fn execute(updates: Vec<PreparedUpdate>, operation: &Operation) -> Result<Vec<Report>, String> {
+/// Stage, then commit, `updates` in order. `finish`: this completes the whole operation
+/// (`false` while another component follows). `guard`: the liveness check of each commit.
+async fn execute(updates: Vec<PreparedUpdate>, operation: &Operation, finish: bool, guard: Guard) -> Result<Vec<Report>, String> {
     if updates.iter().all(|update| update.mode == Mode::Check) {
         return Ok(updates.into_iter().map(|u| u.report).collect());
     }
@@ -464,7 +672,11 @@ async fn execute(updates: Vec<PreparedUpdate>, operation: &Operation) -> Result<
     operation.plan_update(sizes.iter().sum(),
         updates.iter().flat_map(|u| u.planned.iter().map(|p| staging_work(&u.manifest.files[p.index], p))).sum(),
         updates.iter().flat_map(|u| u.planned.iter().map(|p| applying_work(u.manifest.files[p.index].current().sig, p.original))).sum(),
-        updates.iter().flat_map(|u| u.manifest.files.iter().map(|h| io_work(h.current().sig))).sum());
+        updates.iter().map(|u| if u.full_verify() {
+            u.manifest.files.iter().map(|h| io_work(h.current().sig)).sum::<u64>()
+        } else {
+            u.planned.iter().map(|p| io_work(u.manifest.files[p.index].current().sig)).sum()
+        }).sum());
     let downloads = Downloads::new(operation.clone(), sizes);
     let mut staged_updates = Vec::new(); let mut first = 0;
     for mut update in updates {
@@ -472,7 +684,7 @@ async fn execute(updates: Vec<PreparedUpdate>, operation: &Operation) -> Result<
         let op = operation.component(update.product.label());
         let staged = confined(&update.root, &format!("{STATE_DIR}/staged"))?;
         fs::create_dir_all(&staged).map_err(|e| e.to_string())?;
-        let (ready, bytes) = stage_plan_shared(update.product, &update.root, &staged, &update.manifest,
+        let (ready, bytes) = stage_plan_shared(update.product, &update.server, &update.root, &staged, &update.manifest,
             &update.planned, &op, downloads.clone(), first).await?;
         first += stage_groups(update.product, &update.manifest, &update.planned).len(); update.report.bytes = bytes;
         staged_updates.push((update, ready));
@@ -480,52 +692,84 @@ async fn execute(updates: Vec<PreparedUpdate>, operation: &Operation) -> Result<
     let mut reports = Vec::new();
     for (update, ready) in staged_updates {
         let op = operation.component(update.product.label());
-        reports.push(tokio::task::spawn_blocking(move || commit(update, ready, &op)).await.map_err(|e| e.to_string())??);
+        reports.push(tokio::task::spawn_blocking(move || commit_with_guard(update, ready, &op, guard)).await.map_err(|e| e.to_string())??);
     }
-    operation.progress("Finish", 0, 0, t("Finalizing update…"));
-    operation.finish_update();
+    if finish {
+        operation.progress("Finish", 0, 0, t("Finalizing update…"));
+        operation.finish_update();
+    }
     Ok(reports)
 }
 
-fn commit(mut update: PreparedUpdate, ready: Vec<Ready>, operation: &Operation) -> Result<Report, String> {
-    operation.check_cancelled()?; ensure_idle(&update.root)?;
-    let preserved = update.report.modified > 0 && update.product == Product::Ffxi && update.mode == Mode::Update;
-    let planned: HashSet<_> = update.planned.iter().map(|item| item.index).collect();
-    let baseline = if preserved { Some(installer_baseline::load()?) } else { None };
-    let committed = apply(&update.root, &ready, operation, || {
-        let mut buffer = vec![0u8; SIGNATURE_BUFFER_LEN];
-        let mut retained_modifications = false;
-        for (i, history) in update.manifest.files.iter().enumerate() {
-            operation.check_cancelled()?;
-            operation.progress("Verify", i as u64, update.manifest.files.len() as u64, history.path.clone());
-            let path = confined(&update.root, &history.path)?;
-            let local = if path.is_file() { Some(local_file_with_buffer(&path, operation, &mut buffer)?) } else { None };
-            if local.map(|file| file.sig) != Some(history.current().sig) {
-                // A preserved modification does not excuse a failed download,
-                // an outdated stock file, or a missing file later in the list.
-                if preserved && !planned.contains(&i) && local.is_some_and(|file|
-                    !history.versions.iter().any(|version| version.sig == file.sig)
-                    && !baseline.is_some_and(|b| b.matches(&history.path, file.sig.len, file.md5))) {
-                    retained_modifications = true;
-                } else {
+#[cfg(test)]
+fn commit(update: PreparedUpdate, ready: Vec<Ready>, operation: &Operation) -> Result<Report, String> {
+    commit_with_guard(update, ready, operation, ensure_idle)
+}
+
+/// `commit` with the liveness guard as a seam for isolated fixture tests.
+fn commit_with_guard(mut update: PreparedUpdate, ready: Vec<Ready>, operation: &Operation,
+    guard: impl Fn(&Path) -> Result<(), String>) -> Result<Report, String> {
+    operation.check_cancelled()?; guard(&update.root)?;
+    let keep: HashSet<String> = update.planned.iter().filter(|item| item.keep)
+        .map(|item| update.manifest.files[item.index].path.clone()).collect();
+    let full_verify = update.full_verify();
+    // What the cleanup after the commit may treat as official bytes rather than a user's.
+    let baseline = if update.product == Product::Ffxi { installer_baseline::load().ok() } else { None };
+    let official = |path: &str, file: &LocalFile| update.manifest.files.iter()
+        .find(|history| history.path.eq_ignore_ascii_case(path))
+        .is_some_and(|history| history.versions.iter().any(|version| version.sig == file.sig))
+        || baseline.is_some_and(|baseline| baseline.matches(path, file.sig.len, file.md5));
+    let applied = apply_keeping(&update.root, &ready, &keep, &official, operation, || {
+        if full_verify {
+            // Repair proves every official file, on the same worker pool as a check.
+            let workers = file_check_workers(std::thread::available_parallelism().map_or(1, |n| n.get()), false);
+            let found = scan_signatures(&update.root, &update.manifest, operation, workers, "Verify")?;
+            for (history, local) in update.manifest.files.iter().zip(found) {
+                if local.map(|file| file.sig) != Some(history.current().sig) {
                     return Err(tf("{path}: final file verification failed", &[("path", &history.path)]));
                 }
             }
-            operation.complete_update_work(UpdateWork::Verify, io_work(history.current().sig), None);
+        } else {
+            // A routine update verifies what it wrote; the plan vouched for the rest.
+            let mut buffer = vec![0u8; SIGNATURE_BUFFER_LEN];
+            for (i, (path, _, sig, _)) in ready.iter().enumerate() {
+                operation.check_cancelled()?;
+                operation.progress("Verify", i as u64, ready.len() as u64, path.clone());
+                let file = confined(&update.root, path)?;
+                if !file.is_file() || signature_with_buffer(&file, operation, &mut buffer)? != *sig {
+                    return Err(tf("{path}: final file verification failed", &[("path", path)]));
+                }
+                operation.complete_update_work(UpdateWork::Verify, io_work(*sig), None);
+            }
         }
-        operation.progress("Verify", update.manifest.files.len() as u64, update.manifest.files.len() as u64, t("Verifying downloaded files"));
+        operation.progress("Verify", 1, 1, t("Verifying downloaded files"));
         operation.check_cancelled()?;
-        if retained_modifications { return Ok(None); }
         Ok(Some((update.text.clone(), crate::patch::encode_applied_record_for(&update.report.version, update.seed.unwrap(), update.product.title())?)))
-    })?;
-    update.report.repaired = update.planned.len(); update.report.verified = committed;
-    update.report.summary = if committed {
-        tf("{total} files verified; {repaired} files updated. Applied version {version}. Backups retained in .xi-updater/backups.",
-            &[("total", &update.report.total), ("repaired", &update.report.repaired), ("version", &update.report.version)])
-    } else {
-        tf("{repaired} known files updated; {modified} modified files preserved. Applied version was not advanced. Repair can replace modified files with backups.",
-            &[("repaired", &update.report.repaired), ("modified", &update.report.modified)])
+    }, &guard);
+    let committed = match applied {
+        Ok(committed) => committed,
+        Err(error) => {
+            // The install was touched: the next update checks every file.
+            mark_full_check(&update.root);
+            return Err(error);
+        }
     };
+    if committed && update.full_scan {
+        if let Ok(marker) = confined(&update.root, FULL_CHECK_MARKER) { let _ = fs::remove_file(marker); }
+    }
+    update.report.repaired = update.planned.len(); update.report.verified = committed;
+    update.report.all_files_checked = update.full_scan;
+    let mut summary = vec![tf("{repaired} files updated. Applied version {version}.",
+        &[("repaired", &update.report.repaired), ("version", &update.report.version)])];
+    if update.report.kept > 0 {
+        summary.push(tf("{kept} modified files were replaced with official ones; your copies are in .xi-updater\\kept.",
+            &[("kept", &update.report.kept)]));
+    }
+    let left = update.report.left;
+    if left > 0 {
+        summary.push(tf("{left} modified files this update doesn't change were left in place.", &[("left", &left)]));
+    }
+    update.report.summary = summary.join(" ");
     Ok(update.report)
 }
 
@@ -681,11 +925,13 @@ async fn stage_plan(
     let product = Product::Ffxi;
     let downloads = Downloads::new(op.clone(), stage_groups(product, m, planned).iter()
         .map(|g| download_size(&m.files[g.source.index], &g.source.action)).collect());
-    stage_plan_shared(product, root, staged, m, planned, op, downloads, 0).await
+    stage_plan_shared(product, product.server(), root, staged, m, planned, op, downloads, 0).await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn stage_plan_shared(
     product: Product,
+    server: &str,
     root: &Path,
     staged: &Path,
     m: &Manifest,
@@ -703,6 +949,7 @@ async fn stage_plan_shared(
     let memory = Arc::new(tokio::sync::Semaphore::new(DOWNLOAD_BUDGET_MIB));
     let mut tasks = tokio::task::JoinSet::new();
     for _ in 0..planned.len().min(MAX_DOWNLOAD_WORKERS) {
+        let server: Arc<str> = server.into();
         let root = root.to_path_buf();
         let staged = staged.to_path_buf();
         let op = op.clone();
@@ -739,7 +986,7 @@ async fn stage_plan_shared(
                     );
                 } else {
                     let _reservation = reserve_download_memory(memory.clone(), download_memory_mib(history, &item.action), &op).await?;
-                    if session.is_none() { session = Some(Session::connect_for(product, &op).await?); }
+                    if session.is_none() { session = Some(Session::connect_to(product, &server, &op).await?); }
                     let session = session.as_mut().unwrap();
                     let produced = produce(session, &root, history, &item.action, &op, Some(&transfer)).await;
                     let data = match produced {
@@ -772,6 +1019,7 @@ async fn stage_plan_shared(
                     mine.push((target.index, (history.path.clone(), cache.clone(), current.sig, target.original)));
                 }
             }
+            if let Some(session) = session { session.close().await; }
             Ok::<_, String>((mine, bytes))
         });
     }
@@ -844,20 +1092,64 @@ fn scan(
     mode: Mode,
     op: &Operation,
 ) -> Result<(Report, Vec<Planned>), String> {
-    scan_for(Product::Ffxi, root, m, mode, op)
+    scan_for(Product::Ffxi, root, m, mode, op, None)
 }
 
-fn scan_for(product: Product, root: &Path, m: &Manifest, mode: Mode, op: &Operation) -> Result<(Report, Vec<Planned>), String> {
+/// The full scan: every file read in full. `installed` (the applied version) tells
+/// which files this update changes, for the modified-file rule; `None` counts all.
+fn scan_for(product: Product, root: &Path, m: &Manifest, mode: Mode, op: &Operation, installed: Option<&str>) -> Result<(Report, Vec<Planned>), String> {
     op.check_cancelled()?;
+    scan_with_workers_for(product, root, m, mode, op, check_workers(root, mode), installed)
+}
+
+fn check_workers(root: &Path, mode: Mode) -> usize {
     let available = std::thread::available_parallelism().map_or(1, |count| count.get());
     // This snapshot is only a scheduling hint. Check remains read-only and is
     // allowed while playing; mutation guards still run independently of it.
     let game_may_be_running = mode == Mode::Check && ensure_idle(root).is_err();
-    scan_with_workers_for(product, root, m, mode, op, file_check_workers(available, game_may_be_running))
+    file_check_workers(available, game_may_be_running)
 }
 
 fn file_check_workers(available: usize, game_may_be_running: bool) -> usize {
     available.clamp(1, if game_may_be_running { ACTIVE_GAME_CHECK_WORKERS } else { MAX_CHECK_WORKERS })
+}
+
+/// Phase 3's routine update plan (owner, 2026-10-13: "check only changed files").
+/// A file whose entry (current version stamp and signature) is the same in the installed
+/// list and the new one only has its size checked; a matching size takes it as that
+/// version. Every other file is read in full, so each file the update changes, and each
+/// one a delta will patch, is classified from its real bytes. Classification and planning
+/// are `plan_from_signatures`', so the plan equals a full scan's whenever the size-checked
+/// files hold what the installed list says.
+fn plan_from_applied(product: Product, root: &Path, installed: &Manifest, m: &Manifest, mode: Mode, op: &Operation, workers: usize) -> Result<(Report, Vec<Planned>), String> {
+    op.check_cancelled()?;
+    let before: std::collections::HashMap<String, &FileHistory> = installed.files.iter()
+        .map(|history| (history.path.to_ascii_lowercase(), history)).collect();
+    let changed: Vec<bool> = m.files.iter().map(|history| before.get(&history.path.to_ascii_lowercase())
+        .is_none_or(|old| old.current().stamp != history.current().stamp || old.current().sig != history.current().sig)).collect();
+    op.progress("Check", 0, m.files.len() as u64, t("Checking game files"));
+    let mut signatures = vec![None; m.files.len()];
+    let mut read = Vec::new();
+    for (index, history) in m.files.iter().enumerate() {
+        op.check_cancelled()?;
+        if changed[index] { read.push(index); continue; }
+        let path = confined(root, &history.path)?;
+        match fs::metadata(&path) {
+            // Only the signature's identity matters for a file taken as current; the
+            // full MD5 is consulted for unmatched files, which are always read.
+            Ok(metadata) if metadata.is_file() && metadata.len() == history.current().sig.len =>
+                signatures[index] = Some(LocalFile { sig: history.current().sig, md5: [0; 16] }),
+            Ok(metadata) if metadata.is_file() => read.push(index),
+            Ok(_) => return Err(tf("{path} is not a regular file", &[("path", &path.display())])),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+            Err(e) => return Err(format!("{}: {e}", path.display())),
+        }
+    }
+    let subset = Manifest { files: read.iter().map(|&index| m.files[index].clone()).collect() };
+    for (local, &index) in scan_signatures(root, &subset, op, workers, "Check")?.into_iter().zip(&read) {
+        signatures[index] = local;
+    }
+    plan_from_signatures(product, m, mode, op, signatures, &|index| changed[index], true)
 }
 
 #[cfg(test)]
@@ -868,15 +1160,27 @@ fn scan_with_workers(
     op: &Operation,
     workers: usize,
 ) -> Result<(Report, Vec<Planned>), String> {
-    scan_with_workers_for(Product::Ffxi, root, m, mode, op, workers)
+    scan_with_workers_for(Product::Ffxi, root, m, mode, op, workers, None)
 }
 
-fn scan_with_workers_for(product: Product, root: &Path, m: &Manifest, mode: Mode, op: &Operation, workers: usize) -> Result<(Report, Vec<Planned>), String> {
-    let signatures = scan_signatures(root, m, op, workers)?;
-    plan_from_signatures(product, m, mode, op, signatures)
+fn scan_with_workers_for(product: Product, root: &Path, m: &Manifest, mode: Mode, op: &Operation, workers: usize, installed: Option<&str>) -> Result<(Report, Vec<Planned>), String> {
+    let signatures = scan_signatures(root, m, op, workers, "Check")?;
+    // A PlayOnline Viewer without an installed version is a fresh install: its installer's
+    // files are not in the retained patch history (and there is no installer baseline for
+    // them), so they read as modified though nobody changed them. They are replaced like
+    // any other, with transaction backups, but are not presented as the user's copies.
+    let keep = product == Product::Ffxi || installed.is_some();
+    plan_from_signatures(product, m, mode, op, signatures, &|index| product.changed_since(installed, &m.files[index]), keep)
 }
 
-fn plan_from_signatures(product: Product, m: &Manifest, mode: Mode, op: &Operation, signatures: Vec<Option<LocalFile>>) -> Result<(Report, Vec<Planned>), String> {
+/// Classify each file and plan the work. Missing and outdated (an older official or
+/// stock-installer version) files are always planned. A modified file (no official
+/// identity) is the user's: Repair replaces it, an Update replaces it only when the
+/// update `changes` that file, and either way its copy is kept (`Planned::keep`) when
+/// `keep_modified`. A modification the update doesn't change stays (`Report::left`) and
+/// no longer holds the version back.
+fn plan_from_signatures(product: Product, m: &Manifest, mode: Mode, op: &Operation, signatures: Vec<Option<LocalFile>>,
+    changes: &dyn Fn(usize) -> bool, keep_modified: bool) -> Result<(Report, Vec<Planned>), String> {
     let baseline = if product == Product::Ffxi { Some(installer_baseline::load()?) } else { None };
     let mut report = Report {
         total: m.files.len(),
@@ -916,7 +1220,10 @@ fn plan_from_signatures(product: Product, m: &Manifest, mode: Mode, op: &Operati
                 }
             ));
         }
-        if mode == Mode::Check || (mode == Mode::Update && local.is_some() && !outdated) {
+        let modified = local.is_some() && !outdated;
+        if mode == Mode::Check { continue; }
+        if mode == Mode::Update && modified && !changes(index) {
+            report.left += 1;
             continue;
         }
         let mut action = Action::Direct;
@@ -929,11 +1236,14 @@ fn plan_from_signatures(product: Product, m: &Manifest, mode: Mode, op: &Operati
                 action = Action::Deltas(i + 1);
             }
         }
+        let keep = modified && keep_modified;
         planned.push(Planned {
             index,
             action,
             original: local.map(|file| file.sig),
+            keep,
         });
+        report.kept += usize::from(keep);
     }
     op.progress(
         "Check",
@@ -949,14 +1259,17 @@ fn plan_from_signatures(product: Product, m: &Manifest, mode: Mode, op: &Operati
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LocalFile { sig: FileSig, md5: [u8; 16] }
 
+/// `stage` is "Check" for planning or "Verify" for Repair's final verification, which
+/// also credits each file's verify work to the whole-update estimate.
 fn scan_signatures(
     root: &Path,
     m: &Manifest,
     op: &Operation,
     workers: usize,
+    stage: &str,
 ) -> Result<Vec<Option<LocalFile>>, String> {
     op.check_cancelled()?;
-    op.progress("Check", 0, m.files.len() as u64, t("Checking game files"));
+    op.progress(stage, 0, m.files.len() as u64, if stage == "Verify" { t("Verifying downloaded files") } else { t("Checking game files") });
     if m.files.is_empty() { return Ok(Vec::new()); }
     // Opt-in timing tests can compare larger pools without increasing the
     // production limit selected by scan.
@@ -1015,8 +1328,11 @@ fn scan_signatures(
                 Ok(signature) => {
                     signatures[index] = Some(signature);
                     done += 1;
+                    if stage == "Verify" {
+                        op.complete_update_work(UpdateWork::Verify, io_work(m.files[index].current().sig), None);
+                    }
                     if last_progress.elapsed() >= Duration::from_millis(100) {
-                        op.progress("Check", done, m.files.len() as u64, m.files[index].path.clone());
+                        op.progress(stage, done, m.files.len() as u64, m.files[index].path.clone());
                         last_progress = Instant::now();
                     }
                 }
@@ -1084,17 +1400,82 @@ fn read_local_file(mut file: impl Read, op: &Operation, buffer: &mut [u8]) -> Re
     }, md5: d })
 }
 
+/// One patch-server connection on a stock-shaped socket (`stock_socket`: bound, 64 KB
+/// SO_RCVBUF/SO_SNDBUF before connect, Nagle and delayed ACK left alone). One request
+/// is in flight at a time: `exchange` writes a request and reads its whole reply.
 struct Session {
     stream: tokio::net::TcpStream,
     product: Product,
+    server: Arc<str>,
+    /// When the last reply on this connection ended: paces the next file
+    /// (`next_file_pause`) and times the close (`stock_socket::CLOSE_AFTER_REPLY`).
+    replied: Option<Instant>,
+    /// The last file fetched on this connection, for `next_file_pause`.
+    previous: Option<Transfer>,
 }
-impl Session {
-    async fn connect(op: &Operation) -> Result<Self, String> {
-        Self::connect_for(Product::Ffxi, op).await
+/// One file a fetch asks for: a direct (full) file of its transfer size, or a delta.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Transfer { Direct(u64), Delta }
+
+/// The pause before a new file, by the previous one (`PAUSE_AFTER_DELTA`).
+fn next_file_pause(previous: Option<Transfer>) -> (Duration, Duration) {
+    match previous {
+        Some(Transfer::Direct(len)) if len <= SMALL_DIRECT => PAUSE_AFTER_SMALL_DIRECT,
+        _ => PAUSE_AFTER_DELTA,
     }
-    async fn connect_for(product: Product, op: &Operation) -> Result<Self, String> {
-        let stream = cancel_io(tokio::net::TcpStream::connect(product.server()), op).await?;
-        Ok(Self { stream, product })
+}
+
+/// A wire-visible pause on a high-resolution timer. tokio's timer on Windows wakes only on
+/// the ~15.6 ms system tick (its GetQueuedCompletionStatusEx timeout: 7 ms waits ~15.6,
+/// 115 ms up to ~131) unless the process raised the timer resolution, which Crystal never
+/// does; std's sleep uses a high-resolution waitable timer.
+async fn precise_sleep(duration: Duration) {
+    if duration.is_zero() { return; }
+    let _ = tokio::task::spawn_blocking(move || std::thread::sleep(duration)).await;
+}
+
+/// When Crystal last closed a connection to each patch server (`NEXT_CONNECTION_GAP`).
+static LAST_CLOSE: Mutex<Vec<(String, Instant)>> = Mutex::new(Vec::new());
+
+fn note_closed(server: &str, at: Instant) {
+    let mut closes = LAST_CLOSE.lock().unwrap_or_else(|e| e.into_inner());
+    closes.retain(|(known, _)| known != server);
+    closes.push((server.to_owned(), at));
+}
+
+/// How long a new connection to `server` still waits for `NEXT_CONNECTION_GAP` after
+/// Crystal's last FIN to it.
+fn connect_gap(server: &str) -> Duration {
+    LAST_CLOSE.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(known, _)| known == server)
+        .map_or(Duration::ZERO, |(_, at)| crate::stock_socket::uniform(NEXT_CONNECTION_GAP).saturating_sub(at.elapsed()))
+}
+
+impl Session {
+    #[cfg(test)]
+    async fn connect(op: &Operation) -> Result<Self, String> {
+        Self::connect_to(Product::Ffxi, Product::Ffxi.server(), op).await
+    }
+    async fn connect_to(product: Product, server: &str, op: &Operation) -> Result<Self, String> {
+        let stream = cancel_io(stock_connect(server.to_owned()), op).await?;
+        Ok(Self { stream, product, server: server.into(), replied: None, previous: None })
+    }
+    /// Close like stock: FIN 100-115 ms after the last reply byte, never in its millisecond,
+    /// timed and sent on one blocking thread (`stock_socket::close_after_reply`). Returns
+    /// after the FIN, which a next connection to this server spaces itself from.
+    async fn close(self) {
+        let server = self.server.clone();
+        let replied = self.replied;
+        let closed = match self.stream.into_std() {
+            Ok(stream) => tokio::task::spawn_blocking(move || {
+                match replied {
+                    Some(replied) => crate::stock_socket::close_after_reply(stream, replied),
+                    None => drop(stream),
+                }
+                Instant::now()
+            }).await.unwrap_or_else(|_| Instant::now()),
+            Err(_) => Instant::now(),
+        };
+        note_closed(&server, closed);
     }
     async fn exchange(
         &mut self,
@@ -1121,6 +1502,7 @@ impl Session {
         } else {
             cancel_io(self.stream.read_exact(&mut data[4..]), op).await?;
         }
+        self.replied = Some(Instant::now());
         let p = polp::parse(&data)?;
         if p.kind != expected {
             return Err(tf(
@@ -1130,14 +1512,23 @@ impl Session {
         }
         Ok(data)
     }
+    /// A direct (full) file; `fetch_delta` for a delta.
     async fn fetch(&mut self, path: &str, len: u64, op: &Operation) -> Result<Vec<u8>, String> {
-        self.fetch_tracked(path, len, op, None).await
+        self.fetch_tracked(path, len, Transfer::Direct(len), op, None).await
     }
-    async fn fetch_tracked(&mut self, path: &str, len: u64, op: &Operation, progress: Option<&FileProgress>) -> Result<Vec<u8>, String> {
+    async fn fetch_delta(&mut self, path: &str, len: u64, op: &Operation) -> Result<Vec<u8>, String> {
+        self.fetch_tracked(path, len, Transfer::Delta, op, None).await
+    }
+    async fn fetch_tracked(&mut self, path: &str, len: u64, kind: Transfer, op: &Operation, progress: Option<&FileProgress>) -> Result<Vec<u8>, String> {
         if len > MAX_FILE {
             return Err(t("Download exceeds file limit").into());
         }
         let mut data = Vec::with_capacity(len as usize);
+        if let Some(replied) = self.replied {
+            // A new file: stock asks for it after processing the last one.
+            let pause = crate::stock_socket::uniform(next_file_pause(self.previous)).saturating_sub(replied.elapsed());
+            precise_sleep(pause).await;
+        }
         while (data.len() as u64) < len {
             op.check_cancelled()?;
             let offset = data.len() as u32;
@@ -1155,7 +1546,7 @@ impl Session {
                         last = e;
                         op.check_cancelled()?;
                         if attempt < 2 {
-                            *self = Self::connect_for(self.product, op).await?;
+                            *self = Self::connect_to(self.product, &self.server.clone(), op).await?;
                         }
                     }
                 }
@@ -1181,9 +1572,33 @@ impl Session {
                 op.progress_bytes("Download", data.len() as u64, len, path.to_owned());
             }
         }
+        self.previous = Some(kind);
         Ok(data)
     }
 }
+/// Resolve `server` through the system resolver (A records only, `dns::resolve_server`),
+/// then connect a `stock_socket` after `NEXT_CONNECTION_GAP` from Crystal's last FIN to that
+/// server (on the blocking pool, so on a high-resolution clock) and hand it to tokio.
+async fn stock_connect(server: String) -> std::io::Result<tokio::net::TcpStream> {
+    let stream = tokio::task::spawn_blocking(move || {
+        let addresses = crate::dns::resolve_server(&server)?;
+        std::thread::sleep(connect_gap(&server));
+        let started = Instant::now();
+        let mut last = std::io::Error::new(std::io::ErrorKind::NotFound, t("no address"));
+        for address in addresses {
+            let left = CONNECT_LIMIT.saturating_sub(started.elapsed());
+            if left.is_zero() { break; }
+            match crate::stock_socket::connect(&address, left) {
+                Ok(stream) => return Ok(stream),
+                Err(error) => last = error,
+            }
+        }
+        Err(last)
+    }).await.map_err(std::io::Error::other)??;
+    stream.set_nonblocking(true)?;
+    tokio::net::TcpStream::from_std(stream)
+}
+
 // A manifest can take longer than 30 seconds while bytes keep arriving. Limit
 // inactivity between reads, not the duration of the entire bounded frame.
 async fn read_manifest_body<R: tokio::io::AsyncRead + Unpin>(
@@ -1262,8 +1677,9 @@ async fn produce(
 ) -> Result<Vec<u8>, String> {
     match action {
         Action::Direct => {
+            let len = h.current().direct_len;
             let raw = session
-                .fetch_tracked(&h.current().direct, h.current().direct_len, op, progress)
+                .fetch_tracked(&h.current().direct, len, Transfer::Direct(len), op, progress)
                 .await?;
             decode_payload(&raw, h.current().sig.len as usize)
         }
@@ -1272,7 +1688,7 @@ async fn produce(
             for v in &h.versions[*from..] {
                 op.check_cancelled()?;
                 let d = v.indirect.as_ref().ok_or(t("Missing delta"))?;
-                let raw = session.fetch_tracked(&d.path, d.len, op, progress).await?;
+                let raw = session.fetch_tracked(&d.path, d.len, Transfer::Delta, op, progress).await?;
                 data = lz::apply_indirect_bounded(&raw, &data, v.sig.len as usize)?;
                 if FileSig::of(&data) != v.sig {
                     return Err(tf("{path}: delta signature mismatch", &[("path", &h.path)]));
@@ -1421,7 +1837,14 @@ struct Journal {
     id: String,
     committed: bool,
     entries: Vec<Entry>,
+    /// `RECORDS_FORMAT` when the user modifications this transaction replaced went to
+    /// `KEPT_DIR`; 0 (absent) in older builds' records, whose backups may hold the only
+    /// copy of a modification their Repair replaced.
+    #[serde(default)]
+    format: u32,
 }
+/// See `Journal::format`.
+const RECORDS_FORMAT: u32 = 1;
 #[derive(Serialize, Deserialize)]
 struct Entry {
     path: String,
@@ -1431,6 +1854,9 @@ struct Entry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     original: Option<Sig>,
     expected: Sig,
+    /// The replaced file was a user modification, copied to `KEPT_DIR` on commit.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    kept: bool,
 }
 #[derive(Serialize, Deserialize)]
 struct Sig {
@@ -1458,23 +1884,32 @@ fn write_journal(root: &Path, j: &Journal) -> Result<(), String> {
         &serde_json::to_vec(j).map_err(|e| e.to_string())?,
     )
 }
-fn apply<F>(
+/// Transaction mechanics share an internal liveness seam with isolated fixture
+/// tests. Every production call goes through `commit` and its real process guard.
+#[cfg(test)]
+fn apply_with_guard<F, G>(
     root: &Path,
     ready: &[(String, PathBuf, FileSig, Option<FileSig>)],
     op: &Operation,
     verify: F,
+    guard: G,
 ) -> Result<bool, String>
 where
     F: FnOnce() -> Result<Option<(Vec<u8>, Vec<u8>)>, String>,
+    G: Fn(&Path) -> Result<(), String>,
 {
-    apply_with_guard(root, ready, op, verify, ensure_idle)
+    apply_keeping(root, ready, &HashSet::new(), &|_, _| false, op, verify, guard)
 }
 
-/// Transaction mechanics share an internal liveness seam with isolated fixture
-/// tests. Every production call goes through `apply` and its real process guard.
-fn apply_with_guard<F, G>(
+/// `keep`: paths of user modifications being replaced. After every file verifies and
+/// before the version advances, their originals (the transaction's backups) are copied
+/// to `KEPT_DIR` (`keep_copy`). A successful commit then cleans up; `official` tells the
+/// cleanup which older backups hold official bytes rather than a user's.
+fn apply_keeping<F, G>(
     root: &Path,
     ready: &[(String, PathBuf, FileSig, Option<FileSig>)],
+    keep: &HashSet<String>,
+    official: &dyn Fn(&str, &LocalFile) -> bool,
     op: &Operation,
     verify: F,
     guard: G,
@@ -1497,6 +1932,7 @@ where
         id,
         committed: false,
         entries: Vec::new(),
+        format: RECORDS_FORMAT,
     };
     write_journal(root, &j)?;
     let result = (|| {
@@ -1519,10 +1955,23 @@ where
         }
         op.progress("Apply", ready.len() as u64, ready.len() as u64, t("Applying files"));
         let metadata = verify()?;
+        // The user's copies go to KEPT_DIR before anything can commit. A copy written
+        // before a later failure duplicates a file the rollback then restores; an older
+        // kept copy is never replaced, so a rollback cannot lose one.
+        for entry in j.entries.iter_mut().filter(|entry| keep.contains(&entry.path)) {
+            if let Some(backup) = &entry.backup {
+                op.check_cancelled()?;
+                keep_copy(root, &entry.path, backup, &j.id)?;
+                entry.kept = true;
+            }
+        }
         if let Some((cfg, ver)) = &metadata {
             for (name, data) in [("patch.cfg", cfg), ("patch.ver", ver)] {
                 op.check_cancelled()?;
                 guard(root)?;
+                // An unchanged record needs neither a backup nor a write.
+                let dest = confined(root, name)?;
+                if dest.is_file() && fs::read(&dest).is_ok_and(|now| now == *data) { continue; }
                 let tmp = confined(root, &format!("{STATE_DIR}/staged/{name}"))?;
                 save(&tmp, data)?;
                 replace(root, &mut j, name, &tmp, FileSig::of(data), op)?;
@@ -1537,12 +1986,13 @@ where
         write_journal(root, &j)?;
         fs::remove_file(confined(root, &format!("{STATE_DIR}/transaction.json"))?)
             .map_err(|e| e.to_string())?;
+        if metadata.is_some() { clean_up_after_commit(root, &j.id, official); }
         Ok(metadata.is_some())
     })();
     if let Err(e) = result {
         // Rollback ignores user cancellation but preserves the recorded backups.
         return match recover_with_guard(root, &guard) {
-            Ok(()) => Err(tf(
+            Ok(_) => Err(tf(
                 "{error}. Transaction recovered; verified downloads retained.",
                 &[("error", &e)],
             )),
@@ -1590,6 +2040,7 @@ fn replace(
         backup,
         original,
         expected: sig.into(),
+        kept: false,
     });
     write_journal(root, j)?;
     if let Some(parent) = dest.parent() {
@@ -1616,15 +2067,134 @@ fn replace(
     }
     Ok(())
 }
-fn recover(root: &Path) -> Result<(), String> {
+/// Copy a replaced modification's backup into `KEPT_DIR` (flushed, then published). It goes
+/// to `<path>` when that is free, else beside it as `<path>.<id>` (then `<path>.<id>-2`, …):
+/// an earlier kept copy is never replaced. Nothing is written when one of those already
+/// holds these bytes. `id` is the transaction that replaced the file.
+fn keep_copy(root: &Path, path: &str, backup: &str, id: &str) -> Result<(), String> {
+    let source = confined(root, backup)?;
+    let cannot = |error: &dyn std::fmt::Display| tf("{path}: cannot keep your copy: {error}", &[("path", &path), ("error", error)]);
+    let sig = FileSig::of_path(&source).map_err(|e| cannot(&e))?;
+    let mut free = None;
+    for attempt in 0..100u32 {
+        let name = match attempt {
+            0 => format!("{KEPT_DIR}/{path}"),
+            1 => format!("{KEPT_DIR}/{path}.{id}"),
+            n => format!("{KEPT_DIR}/{path}.{id}-{n}"),
+        };
+        let candidate = confined(root, &name)?;
+        match fs::symlink_metadata(&candidate) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => { free = Some(candidate); break; }
+            Ok(metadata) if metadata.is_file() && FileSig::of_path(&candidate).map_err(|e| cannot(&e))? == sig => return Ok(()),
+            Ok(_) => {}
+            Err(error) => return Err(cannot(&error)),
+        }
+    }
+    let dest = free.ok_or_else(|| cannot(&"no free name"))?;
+    if let Some(parent) = dest.parent() {
+        ensure_plain(parent)?;
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let mut name = dest.file_name().unwrap_or_default().to_os_string();
+    name.push(".xi-part");
+    let tmp = dest.with_file_name(name);
+    ensure_plain(&tmp)?;
+    fs::copy(&source, &tmp).map_err(|e| cannot(&e))?;
+    fs::OpenOptions::new().write(true).open(&tmp).and_then(|file| file.sync_all()).map_err(|e| e.to_string())?;
+    if FileSig::of_path(&tmp)? != sig {
+        let _ = fs::remove_file(&tmp);
+        return Err(cannot(&"the copy did not verify"));
+    }
+    publish(&tmp, &dest)
+}
+
+/// After a verified commit: drop the staged downloads (all of them; nothing staged is
+/// useful once every file is current) and older transactions' backups. Keeps `KEPT_DIR`
+/// and this transaction's backups and records until the next commit. An older build's
+/// transaction (`Journal::format` 0) may hold the only copy of a modification its Repair
+/// replaced: those copies move to `KEPT_DIR` first (`retire_backups`). Best effort: a
+/// leftover is removed by the next successful update.
+fn clean_up_after_commit(root: &Path, id: &str, official: &dyn Fn(&str, &LocalFile) -> bool) {
+    if let Ok(staged) = confined(root, &format!("{STATE_DIR}/staged")) {
+        for entry in fs::read_dir(staged).into_iter().flatten().flatten() {
+            if entry.file_type().is_ok_and(|kind| kind.is_file()) { let _ = fs::remove_file(entry.path()); }
+        }
+    }
+    if let Ok(backups) = confined(root, &format!("{STATE_DIR}/backups")) {
+        for entry in fs::read_dir(backups).into_iter().flatten().flatten() {
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else { continue };
+            let older = name != id && !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit() || b == b'-');
+            if older && entry.file_type().is_ok_and(|kind| kind.is_dir()) && ensure_plain(&entry.path()).is_ok()
+                && retire_backups(root, &name, official).is_ok() {
+                let _ = fs::remove_dir_all(entry.path());
+            }
+        }
+    }
+}
+
+/// `Ok` when the older transaction `name`'s backups may be deleted: it has no records (it
+/// rolled back: every backup was restored) or this build's records (its user modifications
+/// are in `KEPT_DIR`). An older build's records kept nothing there: each of its backups
+/// that is no official identity (`official`) and is not marked kept is copied to
+/// `KEPT_DIR` first. `Err` for records that cannot be read or a copy that fails: the
+/// folder stays for the next commit to try again.
+fn retire_backups(root: &Path, name: &str, official: &dyn Fn(&str, &LocalFile) -> bool) -> Result<(), String> {
+    let records = confined(root, &format!("{STATE_DIR}/backups/{name}/records.json"))?;
+    let bytes = match fs::read(&records) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+    };
+    let journal: Journal = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    if journal.format >= RECORDS_FORMAT { return Ok(()); }
+    let mut buffer = vec![0u8; SIGNATURE_BUFFER_LEN];
+    let operation = Operation::new();
+    for entry in &journal.entries {
+        // The version records are Crystal's own, never a user's file.
+        if entry.kept || ["patch.cfg", "patch.ver"].iter().any(|record| entry.path.eq_ignore_ascii_case(record)) { continue; }
+        let Some(backup) = &entry.backup else { continue };
+        if !backup.starts_with(&format!("{STATE_DIR}/backups/{name}/")) {
+            return Err(t("Invalid backup path in transaction").into());
+        }
+        let source = confined(root, backup)?;
+        if !source.is_file() { continue; }
+        let file = local_file_with_buffer(&source, &operation, &mut buffer)?;
+        if official(&entry.path, &file) { continue; }
+        keep_copy(root, &entry.path, backup, name)?;
+    }
+    Ok(())
+}
+
+/// Finish or undo an interrupted transaction. `true` when there was one.
+fn recover(root: &Path) -> Result<bool, String> {
     recover_with_guard(root, ensure_idle)
 }
 
-fn recover_with_guard(root: &Path, guard: impl Fn(&Path) -> Result<(), String>) -> Result<(), String> {
+/// Before a Play: finish or undo an interrupted update in `install` under the updater's
+/// lock, instead of refusing the start. `Ok(false)`: there was none.
+pub(crate) fn recover_interrupted(install: &Path) -> Result<bool, String> {
+    ensure_plain(install)?;
+    let root = fs::canonicalize(install).map_err(|e| tf("Install directory: {error}", &[("error", &e)]))?;
+    ensure_plain(&root)?;
+    if !confined(&root, &format!("{STATE_DIR}/transaction.json"))?.exists() { return Ok(false); }
+    let mut options = fs::OpenOptions::new();
+    options.create(true).truncate(false).read(true).write(true);
+    #[cfg(windows)] {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.share_mode(0);
+    }
+    let _lock = options.open(confined(&root, &format!("{STATE_DIR}/lock"))?)
+        .map_err(|e| tf("Another updater may be using this install: {error}", &[("error", &e)]))?;
+    let recovered = recover(&root)?;
+    if recovered { mark_full_check(&root); }
+    Ok(recovered)
+}
+
+fn recover_with_guard(root: &Path, guard: impl Fn(&Path) -> Result<(), String>) -> Result<bool, String> {
     let path = confined(root, &format!("{STATE_DIR}/transaction.json"))?;
     let file = match fs::File::open(&path) {
         Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(e.to_string()),
     };
     let mut bytes = Vec::new();
@@ -1694,7 +2264,8 @@ fn recover_with_guard(root: &Path, guard: impl Fn(&Path) -> Result<(), String>) 
             }
         }
     }
-    fs::remove_file(path).map_err(|e| e.to_string())
+    fs::remove_file(path).map_err(|e| e.to_string())?;
+    Ok(true)
 }
 
 #[cfg(windows)]
@@ -1897,7 +2468,7 @@ mod tests {
             let cache = staged.join(format!("{}-{}.bin", hex_md5(path.as_bytes()), hex_md5(format!("{sig:?}").as_bytes())));
             fs::write(&cache, &data).unwrap();
             manifest.files.push(history);
-            planned.push(Planned { index, action: Action::Direct, original: None });
+            planned.push(Planned { index, action: Action::Direct, original: None, keep: false });
         }
         let expected_total = planned.iter().map(|p| download_size(&manifest.files[p.index], &p.action)).sum();
         let op = Operation::new();
@@ -2263,7 +2834,7 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
-    fn explicit_update_preserves_unknown_modification_but_repair_plans_it() {
+    fn an_update_replaces_only_the_modifications_it_changes_and_repair_replaces_all() {
         let root = fixture("modified");
         fs::write(root.join("f.dat"), b"custom").unwrap();
         let m = Manifest {
@@ -2279,16 +2850,20 @@ mod tests {
                 }],
             }],
         };
-        let (report, plan) = scan(&root, &m, Mode::Update, &Operation::new()).unwrap();
-        assert_eq!(report.modified, 1);
+        let op = Operation::new();
+        // Installed 30260904_1 already: this update does not change f.dat, so the mod stays.
+        let (report, plan) = scan_for(Product::Ffxi, &root, &m, Mode::Update, &op, Some("30260904_1")).unwrap();
+        assert_eq!((report.modified, report.kept), (1, 0));
         assert!(plan.is_empty());
-        assert_eq!(
-            scan(&root, &m, Mode::Repair, &Operation::new())
-                .unwrap()
-                .1
-                .len(),
-            1
-        );
+        // From 30260903_0 the update changes f.dat: official file in, the user's copy kept.
+        let (report, plan) = scan_for(Product::Ffxi, &root, &m, Mode::Update, &op, Some("30260903_0")).unwrap();
+        assert_eq!((report.modified, report.kept), (1, 1));
+        assert_eq!(plan, vec![Planned { index: 0, action: Action::Direct, original: Some(FileSig::of(b"custom")), keep: true }]);
+        // No installed version (fresh or unreadable record): every file counts as changed.
+        assert_eq!(scan(&root, &m, Mode::Update, &op).unwrap().1.len(), 1);
+        let (_, plan) = scan_for(Product::Ffxi, &root, &m, Mode::Repair, &op, Some("30260904_1")).unwrap();
+        assert!(plan.len() == 1 && plan[0].keep);
+        assert!(scan(&root, &m, Mode::Check, &op).unwrap().1.is_empty());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2429,22 +3004,27 @@ mod tests {
             }
             m.files.push(FileHistory { path, optional: false, versions: vec![old, current] });
         }
+        // Installed 30260904_1: the modifications are of files this update doesn't change.
+        let installed = Some("30260904_1");
         for mode in [Mode::Check, Mode::Update, Mode::Repair] {
-            let expected = scan_with_workers(&root, &m, mode, &Operation::new(), 1).unwrap();
+            let expected = scan_with_workers_for(Product::Ffxi, &root, &m, mode, &Operation::new(), 1, installed).unwrap();
             assert_eq!((expected.0.current, expected.0.outdated, expected.0.missing, expected.0.modified), (68, 68, 68, 68));
             assert_eq!(expected.0.issues.len(), 200);
             match mode {
                 Mode::Check => assert!(expected.1.is_empty()),
                 Mode::Update => {
                     assert_eq!(expected.1.len(), 136);
-                    assert!(expected.1.iter().all(|p| p.index % 4 != 3));
+                    assert!(expected.1.iter().all(|p| p.index % 4 != 3 && !p.keep));
                     assert!(expected.1.iter().filter(|p| p.index % 4 == 1).all(|p| p.action == Action::Deltas(1)));
                 }
-                Mode::Repair => assert_eq!(expected.1.len(), 204),
+                Mode::Repair => {
+                    assert_eq!(expected.1.len(), 204);
+                    assert!(expected.1.iter().all(|p| p.keep == (p.index % 4 == 3)));
+                }
             }
             for workers in [2, 4, 6, 8, 12] {
                 let op = Operation::new();
-                assert_eq!(scan_with_workers(&root, &m, mode, &op, workers).unwrap(), expected);
+                assert_eq!(scan_with_workers_for(Product::Ffxi, &root, &m, mode, &op, workers, installed).unwrap(), expected);
                 assert_eq!((op.snapshot().done, op.snapshot().total), (272, 272));
             }
         }
@@ -2485,40 +3065,221 @@ mod tests {
                 direct: "30260904_1/Direct/FFXiMain.dll.slc".into(), direct_len: 100,
                 indirect: Some(manifest::Delta { path: "30260904_1/Indirect/FFXiMain.dll.olc".into(), len: 1 }) }] }] };
         for mode in [Mode::Check, Mode::Update, Mode::Repair] {
-            let (report, planned) = plan_from_signatures(Product::Ffxi, &manifest, mode, &Operation::new(), vec![Some(stock)]).unwrap();
+            let (report, planned) = plan_from_signatures(Product::Ffxi, &manifest, mode, &Operation::new(), vec![Some(stock)], &|_| false, true).unwrap();
             assert_eq!((report.outdated, report.modified), (1, 0));
             if mode == Mode::Check { assert!(planned.is_empty()); }
-            else { assert_eq!(planned, vec![Planned { index: 0, action: Action::Direct, original: Some(stock.sig) }]); }
+            else { assert_eq!(planned, vec![Planned { index: 0, action: Action::Direct, original: Some(stock.sig), keep: false }]); }
         }
         let mut modified = stock;
         modified.md5[15] ^= 1; // Same length and stock protocol MD5 prefix is insufficient.
-        let (report, planned) = plan_from_signatures(Product::Ffxi, &manifest, Mode::Update, &Operation::new(), vec![Some(modified)]).unwrap();
+        let (report, planned) = plan_from_signatures(Product::Ffxi, &manifest, Mode::Update, &Operation::new(), vec![Some(modified)], &|_| false, true).unwrap();
         assert_eq!((report.outdated, report.modified), (0, 1));
         assert!(planned.is_empty());
-        let (report, _) = plan_from_signatures(Product::Viewer, &manifest, Mode::Check, &Operation::new(), vec![Some(stock)]).unwrap();
+        let (report, _) = plan_from_signatures(Product::Viewer, &manifest, Mode::Check, &Operation::new(), vec![Some(stock)], &|_| true, true).unwrap();
         assert_eq!(report.modified, 1, "FFXI's installer identities never classify PlayOnline files");
     }
 
+    /// Stage `planned` as verified downloads of each file's current bytes (`official`).
+    fn stage_fixture(root: &Path, m: &Manifest, planned: &[Planned], official: &dyn Fn(&str) -> Vec<u8>) -> Vec<Ready> {
+        let staged = root.join(".xi-updater/staged");
+        planned.iter().map(|item| {
+            let history = &m.files[item.index];
+            let cache = staged.join(format!("{}.bin", hex_md5(history.path.as_bytes())));
+            fs::write(&cache, official(&history.path)).unwrap();
+            (history.path.clone(), cache, history.current().sig, item.original)
+        }).collect()
+    }
+
     #[test]
-    fn preserving_a_modification_still_checks_later_files_and_does_not_mask_a_missing_file() {
-        let root = fixture("preserved-final-verification");
-        fs::write(root.join("a.DAT"), b"user texture").unwrap();
-        fs::write(root.join("b.DAT"), b"official").unwrap();
-        let manifest = Manifest { files: ["a.DAT", "b.DAT"].into_iter().map(|path|
-            FileHistory { path: path.into(), optional: false, versions: vec![manifest::Version {
-                stamp: "30260904_1".into(), sig: FileSig::of(b"official"),
-                direct: format!("30260904_1/Direct/{path}.slc"), direct_len: 20, indirect: None }] }).collect() };
-        let (mut report, planned) = scan(&root, &manifest, Mode::Update, &Operation::new()).unwrap();
-        report.version = "30260904_1".into();
-        assert_eq!((report.current, report.modified), (1, 1));
+    fn modifications_no_longer_hold_the_version_back_and_replaced_ones_are_kept_then_cleaned_up() {
+        let root = fixture("modified-policy");
+        let official = |path: &str| format!("official {path}").into_bytes();
+        let history = |path: &str, stamp: &str| FileHistory { path: path.into(), optional: false, versions: vec![
+            manifest::Version { stamp: "30260904_1".into(), sig: FileSig::of(b"old"),
+                direct: format!("30260904_1/Direct/{path}.slc"), direct_len: 4, indirect: None },
+            manifest::Version { stamp: stamp.into(), sig: FileSig::of(&official(path)),
+                direct: format!("{stamp}/Direct/{path}.slc"), direct_len: 30, indirect: None }] };
+        // untouched.DAT last changed before the installed version; texture.DAT changes now.
+        let m = Manifest { files: vec![history("untouched.DAT", "30260904_1"), history("ROM/1/texture.DAT", "30261006_0"),
+            history("old.DAT", "30261006_0")] };
+        let m = Manifest { files: m.files.into_iter().map(|mut h| { if h.path == "untouched.DAT" { h.versions.remove(1); h.versions[0].sig = FileSig::of(&official("untouched.DAT")); } h }).collect() };
+        fs::create_dir_all(root.join("ROM/1")).unwrap();
+        fs::write(root.join("untouched.DAT"), b"my untouched mod").unwrap();
+        fs::write(root.join("ROM/1/texture.DAT"), b"my texture mod").unwrap();
+        fs::write(root.join("old.DAT"), b"old").unwrap();
+        // Leftovers of earlier runs: a stale download, a rolled-back transaction's backups (no
+        // records), and an older build's Repair whose backups hold the only copy of a mod.
+        fs::write(root.join(".xi-updater/staged/stale.bin"), b"stale").unwrap();
+        fs::create_dir_all(root.join(".xi-updater/backups/1-1")).unwrap();
+        fs::write(root.join(".xi-updater/backups/1-1/0.bin"), b"older backup").unwrap();
+        legacy_repair(&root, "2-2", &[("ROM/1/texture.DAT", b"my first texture mod"), ("old.DAT", b"old"), ("patch.ver", b"old record")]);
+        fs::write(root.join(FULL_CHECK_MARKER), b"").unwrap();
+        let op = Operation::new();
+        let (mut report, planned) = scan_for(Product::Ffxi, &root, &m, Mode::Update, &op, Some("30260904_1")).unwrap();
+        assert_eq!((report.modified, report.kept, report.outdated, planned.len()), (2, 1, 1, 2));
+        report.version = "30261006_0".into();
+        let ready = stage_fixture(&root, &m, &planned, &official);
+        let seed = crate::patch::applied_seed_for(&root, "0001").unwrap();
+        let prepared = PreparedUpdate { product: Product::Ffxi, root: root.clone(), _lock: None, mode: Mode::Update,
+            report, manifest: m.clone(), text: b"list 30261006_0".to_vec(), planned, seed: Some(seed),
+            server: SERVER.into(), full_scan: true };
+        let report = commit_with_guard(prepared, ready, &op, |_| Ok(())).unwrap();
+        assert!(report.verified && report.all_files_checked, "{}", report.summary);
+        assert_eq!((report.kept, report.left), (1, 1));
+        assert_eq!(crate::patch::installed_for_request(&root), "30261006_0");
+        assert!(report.summary.contains("your copies are in") && report.summary.contains("left in place"), "{}", report.summary);
+        assert_eq!(fs::read(root.join("untouched.DAT")).unwrap(), b"my untouched mod");
+        assert_eq!(fs::read(root.join("ROM/1/texture.DAT")).unwrap(), official("ROM/1/texture.DAT"));
+        assert_eq!(fs::read(root.join(".xi-updater/kept/ROM/1/texture.DAT")).unwrap(), b"my texture mod");
+        // The older build's backup of an earlier mod moved to kept beside it, not over it;
+        // its official original and the version record did not.
+        assert_eq!(fs::read(root.join(".xi-updater/kept/ROM/1/texture.DAT.2-2")).unwrap(), b"my first texture mod");
+        assert!(!root.join(".xi-updater/kept/old.DAT").exists() && !root.join(".xi-updater/kept/patch.ver").exists());
+        assert_eq!(fs::read(root.join("old.DAT")).unwrap(), official("old.DAT"));
+        assert!(!root.join(FULL_CHECK_MARKER).exists(), "a verified full scan clears the pending full check");
+        // Cleanup: no staged downloads, only this transaction's backups.
+        assert_eq!(fs::read_dir(root.join(".xi-updater/staged")).unwrap().count(), 0);
+        let backups: Vec<PathBuf> = fs::read_dir(root.join(".xi-updater/backups")).unwrap().map(|e| e.unwrap().path()).collect();
+        assert_eq!(backups.len(), 1);
+        let records: Journal = serde_json::from_slice(&fs::read(backups[0].join("records.json")).unwrap()).unwrap();
+        assert!(records.entries.iter().any(|e| e.path == "ROM/1/texture.DAT" && e.kept));
+        assert!(records.entries.iter().any(|e| e.path == "patch.ver") && records.entries.iter().any(|e| e.path == "patch.cfg"));
+
+        // The same version again: nothing to write, and unchanged records get no backup.
+        let (mut report, planned) = scan_for(Product::Ffxi, &root, &m, Mode::Update, &op, Some("30261006_0")).unwrap();
         assert!(planned.is_empty());
-        fs::remove_file(root.join("b.DAT")).unwrap(); // Removed after the check.
-        let prepared = PreparedUpdate { product: Product::Ffxi, root: root.clone(), _lock: None,
-            mode: Mode::Update, report, manifest, text: vec![], planned, seed: Some(1) };
-        let error = commit(prepared, vec![], &Operation::new()).unwrap_err();
-        assert!(error.contains("b.DAT: final file verification failed"), "{error}");
+        report.version = "30261006_0".into();
+        let seed = crate::patch::applied_seed_for(&root, "0001").unwrap();
+        let again = PreparedUpdate { product: Product::Ffxi, root: root.clone(), _lock: None, mode: Mode::Update,
+            report, manifest: m, text: b"list 30261006_0".to_vec(), planned, seed: Some(seed),
+            server: SERVER.into(), full_scan: false };
+        let again = commit_with_guard(again, Vec::new(), &op, |_| Ok(())).unwrap();
+        assert!(again.verified && !again.all_files_checked, "a version plan vouches for the version only");
+        let backups: Vec<PathBuf> = fs::read_dir(root.join(".xi-updater/backups")).unwrap().map(|e| e.unwrap().path()).collect();
+        assert_eq!(backups.len(), 1, "the earlier transaction's backups are gone");
+        let records: Journal = serde_json::from_slice(&fs::read(backups[0].join("records.json")).unwrap()).unwrap();
+        assert!(records.entries.is_empty(), "unchanged patch.cfg/patch.ver are not backed up");
+        assert_eq!(fs::read(root.join(".xi-updater/kept/ROM/1/texture.DAT")).unwrap(), b"my texture mod");
+        assert_eq!(fs::read_dir(root.join(".xi-updater/kept/ROM/1")).unwrap().count(), 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// An older build's committed Repair (records without a format): `files` are (path,
+    /// backed-up bytes), recorded as `backups/<id>/<n>.bin`.
+    fn legacy_repair(root: &Path, id: &str, files: &[(&str, &[u8])]) {
+        let dir = root.join(format!(".xi-updater/backups/{id}"));
+        fs::create_dir_all(&dir).unwrap();
+        let entries: Vec<serde_json::Value> = files.iter().enumerate().map(|(n, (path, bytes))| {
+            fs::write(dir.join(format!("{n}.bin")), bytes).unwrap();
+            let sig = FileSig::of(bytes);
+            serde_json::json!({ "path": path, "backup": format!(".xi-updater/backups/{id}/{n}.bin"),
+                "expected": { "len": sig.len, "sum": sig.byte_sum, "word": sig.md5_word } })
+        }).collect();
+        fs::write(dir.join("records.json"), serde_json::to_vec(&serde_json::json!({ "id": id, "committed": true, "entries": entries })).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn cleanup_keeps_what_older_builds_backed_up_of_user_files_and_never_replaces_a_kept_copy() {
+        let root = fixture("legacy-cleanup");
+        let official_bytes = b"official bytes";
+        let official = |_: &str, file: &LocalFile| file.sig == FileSig::of(official_bytes);
+        fs::create_dir_all(root.join(".xi-updater/kept/a")).unwrap();
+        fs::write(root.join(".xi-updater/kept/a/mod.DAT"), b"kept earlier").unwrap();
+        // An older Repair replaced a mod (kept beside the earlier copy), an official file
+        // and a mod whose identical copy is already kept (nothing new).
+        legacy_repair(&root, "10-1", &[("a/mod.DAT", b"replaced by an older repair"), ("b.DAT", official_bytes), ("c.DAT", b"kept earlier")]);
+        fs::create_dir_all(root.join(".xi-updater/kept")).unwrap();
+        fs::write(root.join(".xi-updater/kept/c.DAT"), b"kept earlier").unwrap();
+        // Unreadable records stay for the next commit; this build's records go as they are.
+        fs::create_dir_all(root.join(".xi-updater/backups/11-1")).unwrap();
+        fs::write(root.join(".xi-updater/backups/11-1/records.json"), b"damaged").unwrap();
+        fs::write(root.join(".xi-updater/backups/11-1/0.bin"), b"unknown").unwrap();
+        legacy_repair(&root, "12-1", &[("d.DAT", b"not kept: this build's policy")]);
+        let records = root.join(".xi-updater/backups/12-1/records.json");
+        let mut current: serde_json::Value = serde_json::from_slice(&fs::read(&records).unwrap()).unwrap();
+        current["format"] = RECORDS_FORMAT.into();
+        fs::write(&records, serde_json::to_vec(&current).unwrap()).unwrap();
+        fs::create_dir_all(root.join(".xi-updater/backups/13-1")).unwrap();
+        clean_up_after_commit(&root, "13-1", &official);
+        let mut left: Vec<String> = fs::read_dir(root.join(".xi-updater/backups")).unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        left.sort();
+        assert_eq!(left, ["11-1", "13-1"]);
+        let kept = |path: &str| fs::read(root.join(".xi-updater/kept").join(path)).ok();
+        assert_eq!(kept("a/mod.DAT").as_deref(), Some(&b"kept earlier"[..]));
+        assert_eq!(kept("a/mod.DAT.10-1").as_deref(), Some(&b"replaced by an older repair"[..]));
+        assert_eq!((kept("b.DAT"), kept("c.DAT.10-1"), kept("d.DAT")), (None, None, None));
+
+        // keep_copy itself: a different file never replaces a kept copy; the same bytes add nothing.
+        fs::create_dir_all(root.join(".xi-updater/backups/14-1")).unwrap();
+        for (n, bytes) in [b"version 2".as_slice(), b"version 3", b"kept earlier", b"version 2"].into_iter().enumerate() {
+            fs::write(root.join(format!(".xi-updater/backups/14-1/{n}.bin")), bytes).unwrap();
+            keep_copy(&root, "a/mod.DAT", &format!(".xi-updater/backups/14-1/{n}.bin"), "14-1").unwrap();
+        }
+        assert_eq!(kept("a/mod.DAT").as_deref(), Some(&b"kept earlier"[..]));
+        assert_eq!(kept("a/mod.DAT.14-1").as_deref(), Some(&b"version 2"[..]));
+        assert_eq!(kept("a/mod.DAT.14-1-2").as_deref(), Some(&b"version 3"[..]));
+        assert_eq!(fs::read_dir(root.join(".xi-updater/kept/a")).unwrap().count(), 4);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_rolled_back_update_never_loses_an_earlier_kept_copy() {
+        let root = fixture("kept-rollback");
+        fs::create_dir_all(root.join("ROM/1")).unwrap();
+        fs::create_dir_all(root.join(".xi-updater/kept/ROM/1")).unwrap();
+        fs::write(root.join(".xi-updater/kept/ROM/1/texture.DAT"), b"mod v1").unwrap();
+        // The file is now damaged (a failed mod tool): Repair replaces it and keeps a copy.
+        fs::write(root.join("ROM/1/texture.DAT"), b"half-written").unwrap();
+        let cache = root.join(".xi-updater/staged/new.bin");
+        fs::write(&cache, b"official").unwrap();
+        let ready = vec![("ROM/1/texture.DAT".to_owned(), cache, FileSig::of(b"official"), Some(FileSig::of(b"half-written")))];
+        let keep: HashSet<String> = ["ROM/1/texture.DAT".to_owned()].into();
+        let calls = std::cell::Cell::new(0);
+        // The second liveness check (before patch.cfg is written) finds a game: roll back.
+        let guard = |_: &Path| { calls.set(calls.get() + 1); if calls.get() == 2 { Err("fixture game started".to_owned()) } else { Ok(()) } };
+        let error = apply_keeping(&root, &ready, &keep, &|_, _| false, &Operation::new(),
+            || Ok(Some((b"list".to_vec(), b"record".to_vec()))), guard).unwrap_err();
+        assert!(error.contains("fixture game started") && error.contains("Transaction recovered"), "{error}");
+        assert_eq!(fs::read(root.join("ROM/1/texture.DAT")).unwrap(), b"half-written");
         assert!(!root.join("patch.ver").exists());
-        assert_eq!(fs::read(root.join("a.DAT")).unwrap(), b"user texture");
+        assert_eq!(fs::read(root.join(".xi-updater/kept/ROM/1/texture.DAT")).unwrap(), b"mod v1", "the earlier copy survives");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_fresh_playonline_install_does_not_call_its_installer_files_your_copies() {
+        let root = fixture("fresh-viewer");
+        fs::create_dir_all(root.join("viewer/com")).unwrap();
+        fs::write(root.join("viewer/com/app.dll"), b"installer build").unwrap();
+        let m = Manifest { files: vec![FileHistory { path: "viewer/com/app.dll".into(), optional: false, versions: vec![manifest::Version {
+            stamp: "20261001_0".into(), sig: FileSig::of(b"official build"), direct: "20261001_0/Direct/app.dll.slc".into(),
+            direct_len: 20, indirect: None }] }] };
+        let op = Operation::new();
+        let (report, plan) = scan_with_workers_for(Product::Viewer, &root, &m, Mode::Repair, &op, 1, None).unwrap();
+        assert_eq!((report.modified, report.kept, plan.len(), plan[0].keep), (1, 0, 1, false));
+        // An installed Viewer's unrecognized file is a modification: its copy is kept.
+        let (report, plan) = scan_with_workers_for(Product::Viewer, &root, &m, Mode::Repair, &op, 1, Some("20260901_0")).unwrap();
+        assert_eq!((report.modified, report.kept, plan[0].keep), (1, 1, true));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_failed_commit_leaves_a_full_check_for_the_next_update() {
+        let root = fixture("failed-commit");
+        let m = Manifest { files: vec![FileHistory { path: "a.DAT".into(), optional: false, versions: vec![manifest::Version {
+            stamp: "30261006_0".into(), sig: FileSig::of(b"official"), direct: "30261006_0/Direct/a.DAT.slc".into(),
+            direct_len: 9, indirect: None }] }] };
+        let planned = vec![Planned { index: 0, action: Action::Direct, original: None, keep: false }];
+        // The staged bytes are not the official ones: the transaction must roll back.
+        let ready = stage_fixture(&root, &m, &planned, &|_| b"damaged".to_vec());
+        let mut report = Report { version: "30261006_0".into(), ..Default::default() };
+        report.total = 1;
+        let prepared = PreparedUpdate { product: Product::Ffxi, root: root.clone(), _lock: None, mode: Mode::Update,
+            report, manifest: m, text: Vec::new(), planned, seed: Some(1), server: SERVER.into(), full_scan: false };
+        assert!(commit_with_guard(prepared, ready, &Operation::new(), |_| Ok(())).is_err());
+        assert!(full_check_due(&root));
+        assert!(!root.join("a.DAT").exists() && !root.join("patch.ver").exists());
         fs::remove_dir_all(root).unwrap();
     }
 

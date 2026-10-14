@@ -17,7 +17,7 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU64, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
         mpsc, OnceLock,
     },
     thread::JoinHandle,
@@ -129,14 +129,54 @@ const SOCIAL_REQUEST: u8 = 7;
 /// Status command flag: the dialog's "apply to groups" (app 10031b2b).
 const GROUPS: u8 = 0x10;
 static CONTROL: AtomicU8 = AtomicU8::new(GAME);
+/// A Play that arrived while a user command (social request, status change)
+/// ran: answered 0 and taken as START_GAME when that command returns, the way
+/// the Viewer's Play follows a dialog the user already applied (07c §6 S1 b).
+static PLAY_LATCH: AtomicBool = AtomicBool::new(false);
+
+/// Play was requested (START_GAME accepted or latched). From then on no new
+/// attempt starts (no auto-Away, no status/mail retry, no new mail transfer)
+/// and in-flight tickets finish without a cancel (07a presign-no-cancel-freeze 1).
+#[cfg(not(test))]
+pub(crate) fn play_requested() -> bool { play_requested_in(&CONTROL, &PLAY_LATCH) }
+/// START_GAME is set alone (never with GROUPS); a latched Play waits behind a
+/// running user command and counts already.
+fn play_requested_in(control: &AtomicU8, latch: &AtomicBool) -> bool {
+    control.load(Ordering::Acquire) == START_GAME || latch.load(Ordering::Acquire)
+}
+// Tests drive the owner on their own thread and leave the globals alone,
+// unless a test serialised on CONTROL opts in to the shipped predicate.
+#[cfg(test)]
+thread_local! {
+    static TEST_PLAY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static REAL_CONTROL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+#[cfg(test)]
+pub(crate) fn play_requested() -> bool {
+    TEST_PLAY.with(|p| p.get()) || REAL_CONTROL.with(|r| r.get()) && play_requested_in(&CONTROL, &PLAY_LATCH)
+}
+#[cfg(test)]
+pub(crate) struct TestPlay;
+#[cfg(test)]
+impl TestPlay {
+    pub(crate) fn requested() -> Self { TEST_PLAY.with(|p| p.set(true)); Self }
+    /// This thread reads the real CONTROL/PLAY_LATCH (hold CONTROL_TEST).
+    pub(crate) fn real_control() -> Self { REAL_CONTROL.with(|r| r.set(true)); Self }
+}
+#[cfg(test)]
+impl Drop for TestPlay {
+    fn drop(&mut self) { TEST_PLAY.with(|p| p.set(false)); REAL_CONTROL.with(|r| r.set(false)); }
+}
 
 /// FINAL FANTASY XI's content id (InstallFolder\0001), the app id the Viewer
 /// stores with 1175 before handing off (app 101a0611, [esi+0x27c]).
 const FFXI_APP: usize = 1;
 /// The Viewer application id it publishes on return (app 101cf603).
 const VIEWER_APP: i32 = 1000;
-/// app 1001b13f: the auto-away check runs when the gated counter exceeds 3600.
-const AUTO_AWAY_FRAMES: u32 = 3600;
+/// app 1001b13f: the auto-away check runs when the gated counter exceeds 3600
+/// stock frames, 112.5 s at the cold 31.25 ms frame: 5625 frames of 20 ms
+/// (pol-spec 08 §4 item 7, 07d §6 S1 D).
+const AUTO_AWAY_FRAMES: u32 = native_jobs::stock_frames(3600);
 /// 101983fb polls 817 at least 100 ms apart (696 clock) and never pumps.
 const CLOSE_POLL: Duration = Duration::from_millis(100);
 /// The Viewer polls without a limit; Crystal logs and stops after this.
@@ -145,13 +185,61 @@ const CLOSE_LIMIT: Duration = Duration::from_secs(10);
 /// Viewer's own abort (807) after this, or when the launcher goes away.
 const SIGN_IN_LIMIT: Duration = Duration::from_secs(120);
 const ABORT_LIMIT: Duration = Duration::from_secs(30);
+#[cfg(test)]
 const SLOTS_FULL: i32 = -256;
 /// The four sign-in/return lists in the Viewer's start order (app 10040650,
 /// 10040822): friends, handles, characters, groups.
-const LISTS: [(&str, usize, usize); 4] =
+const LISTS: [(&'static str, usize, usize); 4] =
     [("friends", 163, 164), ("handles", 171, 172), ("characters", 175, 176), ("groups", 383, 384)];
 
-pub fn request_start_game() { request_control(START_GAME, "start_game"); }
+/// Longest wait for the launcher's W2U answer. It must cover the launcher's
+/// worst case, patch.rs VIEWER_CHECK_BUDGET = 32.115 s: the network-not-ready
+/// retry (NETWORK_WAIT 12 s), its fresh lookup (≤ CHECK_TIMEOUT 10 s), then one
+/// full CHECK_TIMEOUT exchange from the answer and the stock close (≤ 0.115 s);
+/// pol-spec 07d §3. On expiry the sign-in fails before Open(1); no :51240 ever
+/// goes out without a W2U.
+pub(crate) const VIEWER_CHECK_LIMIT: Duration = Duration::from_secs(35);
+/// Stock :54000 close → :51240 SYN is 39-62 ms (r1 46.856 → 46.895, r2
+/// 18.917 → 18.979): Open(1) starts no earlier than this after the answer.
+pub(crate) const VIEWER_CHECK_FLOOR: Duration = Duration::from_millis(40);
+/// The launcher's answer to this sign-in's `native_viewer_check` and when it
+/// arrived (the W2U close; the floor counts from here), taken by the owner
+/// thread while it pumps frames (07c §1).
+static VIEWER_CHECK: std::sync::Mutex<Option<(proto::ViewerCheckResult, Instant)>> = std::sync::Mutex::new(None);
+/// Reply-reader thread: store the answer; only the owner acts on it.
+pub fn viewer_check_result(result: proto::ViewerCheckResult) {
+    *VIEWER_CHECK.lock().unwrap_or_else(|e| e.into_inner()) = Some((result, Instant::now()));
+}
+fn take_viewer_check() -> Option<(proto::ViewerCheckResult, Instant)> {
+    #[cfg(test)]
+    if let Some(answer) = tests::viewer_check_answer() { return answer; }
+    VIEWER_CHECK.lock().unwrap_or_else(|e| e.into_inner()).take()
+}
+const VIEWER_CHECK_SILENT: &str = "PlayOnline Viewer version check did not answer.";
+
+/// `native_play_pending`: a Play is queued behind this pre-sign-in (pol-spec
+/// 07d §4.3). Not a START_GAME: it only ends the not-yet-elapsed Viewer gaps,
+/// since the cold path has none (08 §4 item 5).
+static PLAY_PENDING: AtomicBool = AtomicBool::new(false);
+/// Reply-reader thread.
+pub fn note_play_pending() {
+    #[cfg(test)]
+    TEST_PLAY_PENDING.with(|p| p.set(true));
+    if !PLAY_PENDING.swap(true, Ordering::AcqRel) { log!("native POL: a Play is queued; remaining Viewer gaps are skipped"); }
+}
+/// `viewer_gap` returns at its next frame once this (or `play_requested`) is true.
+#[cfg(not(test))]
+pub(crate) fn play_pending() -> bool { PLAY_PENDING.load(Ordering::Acquire) }
+// Tests note a pending Play on their own owner thread only.
+#[cfg(test)]
+thread_local! { static TEST_PLAY_PENDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+#[cfg(test)]
+pub(crate) fn play_pending() -> bool { TEST_PLAY_PENDING.with(|p| p.get()) }
+
+pub fn request_start_game() {
+    let code = accept_play(&CONTROL, &PLAY_LATCH);
+    events::send(format!("{{\"type\":\"native_control_result\",\"action\":\"start_game\",\"code\":{code}}}\n"));
+}
 static START_GATE: std::sync::Mutex<Option<crate::start_gate::Participant>> = std::sync::Mutex::new(None);
 pub fn request_batch_game(token: &str) {
     let mut gate = START_GATE.lock().unwrap_or_else(|e| e.into_inner());
@@ -159,7 +247,7 @@ pub fn request_batch_game(token: &str) {
         Ok(participant) if gate.is_none() => {
             // Publish the gate before the owner can observe START_GAME.
             *gate = Some(participant);
-            let code = accept_control(&CONTROL, START_GAME);
+            let code = accept_play(&CONTROL, &PLAY_LATCH);
             if code != 0 { *gate = None; }
             code
         }
@@ -183,11 +271,32 @@ pub fn request_status(mode: i32, groups: bool) {
     }
 }
 fn request_control(command: u8, name: &str) {
-    let code = accept_control(&CONTROL, command);
+    let code = accept_control(&CONTROL, &PLAY_LATCH, command);
     events::send(format!("{{\"type\":\"native_control_result\",\"action\":\"{name}\",\"code\":{code}}}\n"));
 }
-fn accept_control(control: &AtomicU8, command: u8) -> i32 {
+/// Every non-Play command starts only from the idle Viewer with no Play queued.
+fn accept_control(control: &AtomicU8, latch: &AtomicBool, command: u8) -> i32 {
+    if latch.load(Ordering::Acquire) { return -256; }
     if control.compare_exchange(SOCIAL, command, Ordering::AcqRel, Ordering::Acquire).is_ok() { 0 } else { -256 }
+}
+/// Play from the idle Viewer, or latched behind a running user command. Never
+/// during a game, a sign-out or a second Play.
+fn accept_play(control: &AtomicU8, latch: &AtomicBool) -> i32 {
+    if latch.load(Ordering::Acquire) { return -256; }
+    if control.compare_exchange(SOCIAL, START_GAME, Ordering::AcqRel, Ordering::Acquire).is_ok() { return 0; }
+    let user_command = matches!(control.load(Ordering::Acquire) & !GROUPS, SOCIAL_REQUEST | VISIBLE | AWAY | INVISIBLE);
+    if user_command && latch.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok() { 0 } else { -256 }
+}
+/// The owner finished a user command: a latched Play starts now.
+fn release_command(control: &AtomicU8, latch: &AtomicBool) {
+    control.store(if latch.swap(false, Ordering::AcqRel) { START_GAME } else { SOCIAL }, Ordering::Release);
+}
+/// A Play latched just as the command was released (the requester saw the
+/// command, the owner had already released it): take it from the idle Viewer.
+fn take_latched_play(control: &AtomicU8, latch: &AtomicBool) {
+    if latch.load(Ordering::Acquire) && control.compare_exchange(SOCIAL, START_GAME, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+        latch.store(false, Ordering::Release);
+    }
 }
 
 /// The Viewer has no manual friend refresh: Get Friend List (163) runs only at
@@ -213,7 +322,7 @@ fn idle_time() -> Duration {
 
 pub fn request_social(request: proto::NativeSocialRequest) {
     let mut pending = crate::native_social::REQUEST.lock().unwrap_or_else(|e| e.into_inner());
-    if pending.is_some() || accept_control(&CONTROL, SOCIAL_REQUEST) != 0 {
+    if pending.is_some() || accept_control(&CONTROL, &PLAY_LATCH, SOCIAL_REQUEST) != 0 {
         events::send(format!("{{\"type\":\"native_social_result\",\"id\":\"{}\",\"action\":\"{}\",\"code\":-256}}\n", request.id(), request.action()));
     } else { *pending = Some(request); }
 }
@@ -306,8 +415,8 @@ impl Api {
 }
 
 /// Runs a status-job request (376/377) under the Viewer's Normal policy.
-fn status_request(api: &Api, tuple: [i32; 6], frame: &mut dyn FnMut() -> bool) -> i32 {
-    native_jobs::run(api, Request { start: &mut || api.begin_status(tuple), poll: 377, policy: Policy::Normal }, frame)
+fn status_request(api: &Api, name: &'static str, tuple: [i32; 6], frame: &mut dyn FnMut() -> bool) -> i32 {
+    native_jobs::run(api, Request { name, start: &mut || api.begin_status(tuple), poll: 377, policy: Policy::Normal }, frame)
 }
 
 // --- Viewer host callbacks (pol-spec 01 §2.1 #13/#15/#17) -------------------
@@ -355,6 +464,60 @@ impl AutoAway {
     }
 }
 
+/// Manual and automatic presence share the Viewer's b4c status job. A newer
+/// change replaces it, cancelling only an actually pending status ticket.
+#[derive(Default)]
+struct ViewerStatus {
+    pending: Option<PendingStatus>,
+}
+struct PendingStatus {
+    mode: i32,
+    automatic: bool,
+    job: native_jobs::Job,
+}
+impl ViewerStatus {
+    fn queue(&mut self, api: &Api, mode: i32, automatic: bool) {
+        self.cancel(api);
+        self.pending = Some(PendingStatus { mode, automatic, job: native_jobs::Job::new() });
+    }
+    fn step(&mut self, api: &Api) {
+        let Some(pending) = &mut self.pending else { return; };
+        let mode = pending.mode;
+        let mut start = || api.begin_status([-2, -2, 1, mode, 0, -2]);
+        let request = &mut Request { name: "status-change", start: &mut start, poll: 377, policy: Policy::Normal };
+        let Some(code) = pending.job.advance(api, request) else { return; };
+        let action = match mode { 0 => "visible", 1 => "away", _ => "invisible" };
+        log!("native POL {action} status mode={mode} automatic={} result={code}", pending.automatic);
+        // After Play a failure is only logged: the worker would hold it as a
+        // session error until attach_game's state line clears it, and a batch
+        // release reads that window as a dead session.
+        if code >= 0 || code == -261 || !play_requested() {
+            events::send(format!("{{\"type\":\"native_control_result\",\"action\":\"{action}\",\"code\":{code}}}\n"));
+        }
+        self.pending = None;
+    }
+    fn in_flight(&self) -> bool { self.pending.as_ref().is_some_and(|p| p.job.in_flight()) }
+    /// Once Play is requested: poll an in-flight ticket to its end (or its 60 s
+    /// policy cancel); a change not in flight (queued or waiting to retry) is
+    /// dropped unsent, since no new attempt may start. Logged, not reported (see `step`).
+    fn settle_step(&mut self, api: &Api) {
+        if self.in_flight() { return self.step(api); }
+        if let Some(pending) = self.pending.take() {
+            log!("native POL status mode={} automatic={} not resent: Play requested", pending.mode, pending.automatic);
+        }
+    }
+    fn cancel(&mut self, api: &Api) {
+        if let Some(mut pending) = self.pending.take() { pending.job.cancel(api); }
+    }
+    /// The handoff takes the job without a cancel: the settle loop has already
+    /// polled any ticket to its end, so none is left that 337 would abort.
+    fn retire(&mut self) {
+        if let Some(pending) = self.pending.take() {
+            if pending.job.in_flight() { log!("error: native POL status ticket still in flight at the handoff; not cancelled"); }
+        }
+    }
+}
+
 /// Lives inside the same scope as the COM core: the Viewer's host state and
 /// its signed-in member session. Drop before releasing the core; it runs the
 /// Viewer's sign-out and close teardown (03 §5).
@@ -365,7 +528,9 @@ pub struct NativeSession {
     /// The game language 421 falls back to (app 102787d6 → 1528).
     language: u32,
     auto_away: AutoAway,
+    viewer_status: ViewerStatus,
     social: crate::native_social::Service,
+    pushes: crate::native_social::PushDelivery,
     /// Profile list header returned by 825.
     profiles: usize,
     /// 932/914 started the file worker and option.bin mutex.
@@ -376,8 +541,17 @@ pub struct NativeSession {
     registered: bool,
     /// Member session reached 30 with 838 == 3 and has not been lost.
     signed_in: bool,
+    /// Open(0) succeeded; member-login failure still requires native close.
+    network_opened: bool,
     /// GameStart returned; the Viewer's restart is still due.
     returned: bool,
+    /// Session `viewer_gaps`: a sign-in-only session restores the Viewer's
+    /// ~1.05 s (op7 → 374) and ~1.6 s (mail → publish) UI gaps, as owner
+    /// frames. Never on a cold Play (07b decision 2, 07c §5.4).
+    viewer_gaps: bool,
+    /// This sign-in has asked for its W2U; one per sign-in, and Crystal runs
+    /// one session per host process (07c §1.1).
+    viewer_checked: bool,
 }
 
 impl NativeSession {
@@ -388,15 +562,23 @@ impl NativeSession {
             area,
             language: u32::from(area != 0),
             auto_away: AutoAway::new(auto_away_minutes),
+            viewer_status: Default::default(),
             social: Default::default(),
+            pushes: Default::default(),
             profiles: 0,
             files: false,
             home: false,
             registered: false,
             signed_in: false,
+            network_opened: false,
             returned: false,
+            viewer_gaps: false,
+            viewer_checked: false,
         }
     }
+
+    /// From the session line's `viewer_gaps`; set before `sign_in`.
+    pub fn set_viewer_gaps(&mut self, gaps: bool) { self.viewer_gaps = gaps; }
 
     /// pol.exe → app.dll startup on a fresh core, before any 815/814 (A1/A2/A8).
     /// The caller keeps the verified core alive through this object's lifetime;
@@ -504,6 +686,7 @@ impl NativeSession {
         // Local storage must work before spending a login/OTP.
         let home = claim_home(&self.viewer, &credentials.profile_key)?;
         note_activity();
+        native_jobs::restart_request_clock();
         let result = self.sign_in_core(home, &credentials);
         drop(credentials);
         result
@@ -518,8 +701,11 @@ impl NativeSession {
         // the core's own state-40 status request that Open(3) would add; the
         // live captures contain none. 1502 is set before member login.
         self.open(0, 2)?;
+        self.network_opened = true;
+        self.connect_viewer_check()?;
         self.api.se(Some(c));
         self.open(1, 3)?;
+        let member_login = owner_frames();
         self.signed_in = true;
         log!("native POL member session signed in");
         // The live stock probe shows delivery switched on right after sign-in,
@@ -527,12 +713,14 @@ impl NativeSession {
         // status load alone, and its success handler (10040650) queues the
         // four lists. No status request of our own at sign-in (A6).
         self.api.call(1032, &[1]);
-        self.register_callbacks();
         let api = self.api.clone();
+        // Stock op7 end → 374 SYN: 1.049 s (r2), 1.07 s (r1); 07a stock-faithful-pacing.
+        self.viewer_gap(&api, "member login → status", member_login, OP7_TO_STATUS_FRAMES)?;
+        self.register_callbacks();
         let status_started = Instant::now();
         let status = {
             let mut cadence = StartupCadence::new("status");
-            native_jobs::run(&api, Request { start: &mut || api.zero(374), poll: 375, policy: Policy::Login }, &mut || cadence.frame(&api))
+            native_jobs::run(&api, Request { name: "status", start: &mut || api.zero(374), poll: 375, policy: Policy::Login }, &mut || cadence.frame(&api, &mut self.pushes))
         };
         log!("native POL status load result {status} in {:.2}s", status_started.elapsed().as_secs_f64());
         if !(status > 0 || status == -261) {
@@ -540,8 +728,8 @@ impl NativeSession {
         }
         let results = {
             let mut cadence = StartupCadence::new("lists");
-            cadence.frame(&api); // the queued lists start on the next pump tick
-            run_concurrent(&api, &LISTS, &mut || cadence.frame(&api))
+            cadence.frame(&api, &mut self.pushes); // the queued lists start on the next pump tick
+            run_concurrent(&api, &LISTS, &mut || cadence.frame(&api, &mut self.pushes))
         };
         if let Some((name, result)) = LISTS.iter().zip(&results).map(|((n, ..), r)| (n, *r)).find(|(_, r)| !(*r > 0 || *r == -261)) {
             return Err(format!("Native PlayOnline {name} loading failed ({result})."));
@@ -553,17 +741,108 @@ impl NativeSession {
         let mail_started = Instant::now();
         // The list's timeouts use wall time, so it can advance at startup
         // cadence. Downloads and acknowledgements still count Viewer frames.
-        self.social.social_entry_with_list_frame(&api,
-            &mut || owner_frame_at(&api, STARTUP_FRAME),
-            &mut || owner_frame(&api));
+        let listed = self.social.social_entry_with_list_frame(&api, STARTUP_FRAME,
+            &mut |interval| owner_frame_at(&api, &mut self.pushes, interval));
         log!("native POL startup mail completed in {:.2}s", mail_started.elapsed().as_secs_f64());
+        // Stock mail response → publish SYN: 1.606 s (r2), ~1.63 s (r1) at sign-in,
+        // counted from the list response so new-mail transfers fall inside it (07c §5.4).
+        self.viewer_gap(&api, "mail → presence", listed, MAIL_TO_PUBLISH_FRAMES)?;
         let presence_started = Instant::now();
-        {
+        let published = {
             let mut cadence = StartupCadence::new("presence");
-            self.publish_viewer(&mut || cadence.frame(&api));
-        }
+            Self::publish_viewer(&api, &mut || cadence.frame(&api, &mut self.pushes))
+        };
         log!("native POL startup presence completed in {:.2}s", presence_started.elapsed().as_secs_f64());
+        events::send(proto::main_menu_line(published, false));
         Ok(())
+    }
+
+    /// One of the Viewer's frame-counted screen transitions, only for a
+    /// sign-in-only session: idle owner frames (818, pushes; never a bare
+    /// sleep) until `gap` frames have run since owner frame `since` (pol-spec
+    /// 08 §4 item 5: the Viewer counts frames, not time). Once a Play is
+    /// queued or requested the rest is skipped at the next frame: a cold Play
+    /// has no gaps (07d §4.3). A stopping owner fails the sign-in here, before
+    /// the next request starts: a Viewer closed during the transition opens
+    /// neither 374 nor 376, so none is started to be cancelled (337) just
+    /// ahead of the sign-out.
+    fn viewer_gap(&mut self, api: &Api, stage: &str, since: u64, gap: u32) -> Result<(), String> {
+        if !self.viewer_gaps { return Ok(()); }
+        let started = Instant::now();
+        let mut frames = 0;
+        while owner_frames().saturating_sub(since) < u64::from(gap) {
+            if play_requested() || play_pending() {
+                log!("native POL Viewer gap {stage} skipped after {frames} frame(s): a Play is queued");
+                return Ok(());
+            }
+            if !owner_frame(api, &mut self.pushes) {
+                log!("native POL Viewer gap {stage} stopped after {frames} frame(s)");
+                if events::pipe_closed() { return Err("The launcher closed the session during PlayOnline sign-in.".into()); }
+                return Err(format!("Native PlayOnline connection failed during sign-in (POL result {}).", api.zero(1103)));
+            }
+            frames += 1;
+        }
+        log!("native POL Viewer gap {stage}: {frames} frame(s), {:.2}s", started.elapsed().as_secs_f64());
+        Ok(())
+    }
+
+    /// The Viewer's own version check inside Connect (app 1029c725 → 102a63fa):
+    /// stock sends W2U :54000 after Open(0) and closes it 39-62 ms before the
+    /// :51240 member SYN (pol-spec 07a w2u-at-connect F3; 07c §1). The launcher
+    /// runs it and answers after its close. Owner frames (window messages,
+    /// one 818, pushes; no 815, no request) keep the core alive meanwhile.
+    /// An outdated Viewer or a check that could not be sent fails the sign-in
+    /// before 1502/Open(1) (the existing post-Open(0) teardown). An unanswered
+    /// server does not: the sign-in goes on, like the FFXI check (owner,
+    /// 2026-10-12).
+    fn connect_viewer_check(&mut self) -> Result<(), String> {
+        if std::mem::replace(&mut self.viewer_checked, true) {
+            return Err("The PlayOnline Viewer version check already ran for this sign-in.".into());
+        }
+        if events::pipe_closed() { return Err(VIEWER_CHECK_SILENT.into()); }
+        let api = self.api.clone();
+        *VIEWER_CHECK.lock().unwrap_or_else(|e| e.into_inner()) = None; // only this request's answer counts
+        events::send(proto::viewer_check_line());
+        let asked = Instant::now();
+        let mut frames = 0;
+        let (answer, arrived) = loop {
+            if let Some(answer) = take_viewer_check() { break answer; }
+            if waited(asked, frames, VIEWER_CHECK_LIMIT) {
+                log!("error: native POL Viewer check: no answer after {:.1}s", asked.elapsed().as_secs_f64());
+                return Err(VIEWER_CHECK_SILENT.into());
+            }
+            if !owner_frame(&api, &mut self.pushes) { return Err(self.stopped_owner(&api)); }
+            frames += 1;
+        };
+        log!("native POL Viewer check answered after {:.2}s: {answer:?}", asked.elapsed().as_secs_f64());
+        let error = match answer {
+            proto::ViewerCheckResult::Current => None,
+            proto::ViewerCheckResult::Outdated(e) => Some((e, "PlayOnline Viewer needs an update before signing in.")),
+            proto::ViewerCheckResult::Failed(e) => Some((e, "PlayOnline Viewer version check failed.")),
+            // The launcher's capped retry found no network (07d §2.3): Open(1) would end in -19.
+            proto::ViewerCheckResult::NetworkNotReady(e) => Some((e, "The network is not ready, so PlayOnline did not sign in.")),
+            proto::ViewerCheckResult::Unreachable(_) => {
+                log!("note: native POL Viewer check got no answer from the server; signing in anyway");
+                None
+            }
+        };
+        if let Some((text, fallback)) = error {
+            return Err(if text.is_empty() { fallback.into() } else { text });
+        }
+        // Stock W2U FIN → :51240 SYN 39-62 ms: frames until the floor has passed.
+        let mut frames = 0;
+        while !waited(arrived, frames, VIEWER_CHECK_FLOOR) {
+            if !owner_frame(&api, &mut self.pushes) { return Err(self.stopped_owner(&api)); }
+            frames += 1;
+        }
+        Ok(())
+    }
+
+    /// An owner frame stopped a sign-in wait: the launcher is gone or the core
+    /// latched a pump error.
+    fn stopped_owner(&self, api: &Api) -> String {
+        if events::pipe_closed() { return VIEWER_CHECK_SILENT.into(); }
+        format!("Native PlayOnline connection failed before member login (POL result {}).", api.zero(1103))
     }
 
     /// Member select (app 101a425f): 870 → 851 → 852 → 886(encoded "") → 853 → 891.
@@ -595,14 +874,19 @@ impl NativeSession {
     /// (2 network, 3 member). 31..38 are transitional; failure is a negative
     /// state, reported with 823 (D18).
     fn open(&mut self, mode: usize, linked: i32) -> Result<(), String> {
-        let mut cadence = StartupCadence::new(if mode == 0 { "open-network" } else { "open-member" });
+        let name = if mode == 0 { "open-network" } else { "open-member" };
+        let mut cadence = StartupCadence::new(name);
         let api = &self.api;
         let connection = api.word(835, &[]);
+        // 07d §4.7: start/end, one attempt, one poll per 815.
+        let mut request = native_jobs::RequestLog::start(name);
+        request.attempts = 1;
         #[cfg(feature = "native-login-diagnostics")]
         let open_started = crate::startup_timing::Stamp::capture();
         let code = api.call(814, &[mode, connection]);
         #[cfg(feature = "native-login-diagnostics")]
         let open_finished = crate::startup_timing::Stamp::capture();
+        request.result = code;
         if code < 0 {
             #[cfg(feature = "native-login-diagnostics")]
             crate::startup_timing::report(if mode == 0 { "open-network-call-failed" } else { "open-member-call-failed" }, open_started, open_finished);
@@ -618,6 +902,7 @@ impl NativeSession {
             pump_idle_messages();
             api.zero(818);
             let state = api.zero(815);
+            (request.polls, request.result) = (request.polls + 1, state);
             #[cfg(feature = "native-login-diagnostics")]
             let polled = (first_poll || state == 17 && !state17_seen).then(crate::startup_timing::Stamp::capture);
             if state != previous {
@@ -642,7 +927,7 @@ impl NativeSession {
                 Some(Ok(())) => return Ok(()),
                 Some(Err(())) => {
                     let error = api.zero(823); // non-consuming native error getter
-                    return Err(format!("Native PlayOnline login failed (state {state}, POL result {error})."));
+                    return Err(open_failure(mode, state, error, aborted.is_some()));
                 }
                 None => {}
             }
@@ -662,21 +947,21 @@ impl NativeSession {
         }
     }
 
-    fn social_entry(&mut self) {
-        let api = self.api.clone();
-        self.social.social_entry(&self.api, &mut || owner_frame(&api));
-    }
-
     /// Before GameStart, mirror the Viewer's launch and exit (B3, 03 §3.1).
-    /// Requests run synchronously on this thread, so none is pending here.
+    /// Retire the owned status job before the game takes its place, without a
+    /// cancel: 337/328/199 would stamp the core's 10 s request freeze over the
+    /// game's first status (07a presign-no-cancel-freeze). Its ticket, if any,
+    /// was polled to its end by `settle_for_play`.
     pub fn attach_game(&mut self) {
         CONTROL.store(GAME, Ordering::Release);
         let api = self.api.clone();
+        self.viewer_status.retire();
         // Answer messages pushed during the last idle frames before the game
         // owns the core; later pushes go to FFXI's 288 receiver.
-        crate::native_social::set_listening(false);
         if self.signed_in {
-            self.social.idle_frame(&api, &mut || owner_frame(&api));
+            // No retry-capable mail cycle and no pump between this flush and
+            // 872 removing the callback. A push cannot land in a disabled sink.
+            self.pushes.flush_pushed(&api, true);
         }
         // Play (app 1019fe84 / 1019fec7): clear the arrival flag, hold delivery
         // off only around the version check, then back on. The live probe
@@ -691,6 +976,7 @@ impl NativeSession {
         // Viewer exit: 101aa2ac (463), then 1019869a (828/824/819/872/1149).
         api.zero(463);
         self.unregister_host();
+        crate::native_social::set_listening(false);
         events::send("{\"type\":\"native_session_state\",\"game\":true}\n".into());
     }
 
@@ -707,9 +993,11 @@ impl NativeSession {
     /// 374, the app-1000 publish, then the social entry.
     fn return_from_game(&mut self) -> Result<(), String> {
         note_activity(); // 101abaf8 / 1019fde5 refresh the last-input stamp
+        native_jobs::restart_request_clock();
         self.region_settings(); // 1001a175
         if self.api.zero(838) != 3 {
             self.signed_in = false;
+            self.network_opened = false;
             events::send("{\"type\":\"native_pol_status\",\"code\":-1025}\n".into());
             return Err("PlayOnline is no longer signed in after the game. Sign in again to reconnect.".into());
         }
@@ -717,32 +1005,35 @@ impl NativeSession {
         self.api.call(1032, &[1]); // 101aaebe
         self.register_callbacks(); // 101aa269 → 10050fd9
         let api = self.api.clone();
-        let mut frame = || owner_frame(&api);
+        let mut frame = || owner_frame(&api, &mut self.pushes);
         let results = run_concurrent(&api, &LISTS, &mut frame);
         for ((name, ..), result) in LISTS.iter().zip(&results) {
             log!("native POL {name} reload result {result}");
         }
         // As at sign-in: the mail list first, then the Viewer presence.
-        self.social_entry();
-        self.publish_viewer(&mut frame);
+        // (Return-path gaps, 0.9-1.06 s, are not restored: 07c §8.4.)
+        self.social.social_entry(&api, &mut frame);
+        let published = Self::publish_viewer(&api, &mut frame);
+        events::send(proto::main_menu_line(published, true));
         Ok(())
     }
 
     /// app 101cf603 → 10041342(1000) with no Viewer-own handle (10019224):
     /// a selected character is cleared with the publish; otherwise publish
-    /// only if the application is not already the Viewer.
-    fn publish_viewer(&self, frame: &mut dyn FnMut() -> bool) {
-        let api = &self.api;
+    /// only if the application is not already the Viewer. Returns the 376/377
+    /// result, or 0 when nothing needed publishing (07c §2).
+    fn publish_viewer(api: &Api, frame: &mut dyn FnMut() -> bool) -> i32 {
         let tuple = if api.zero(190) >= 0 {
             [-2, -1, 1, -2, 0, VIEWER_APP]
         } else if api.zero(207) as u16 as i32 != VIEWER_APP {
             [-2, -2, 1, -2, 0, VIEWER_APP]
         } else {
             log!("native POL Viewer presence already published");
-            return;
+            return 0;
         };
-        let code = status_request(api, tuple, frame);
+        let code = status_request(api, "presence", tuple, frame);
         log!("native POL Viewer presence result {code}");
+        code
     }
 
     /// The idle Viewer between games (03 §1): commands, auto-Away, the social
@@ -755,29 +1046,34 @@ impl NativeSession {
         if std::mem::take(&mut self.returned) {
             self.return_from_game()?;
         }
+        PLAY_LATCH.store(false, Ordering::Release);
         CONTROL.store(SOCIAL, Ordering::Release);
         events::send("{\"type\":\"native_session_state\",\"game\":false}\n".into());
         events::send("{\"type\":\"native_social_ready\"}\n".into());
         let observer = self.observe_friends()?;
         let api = self.api.clone();
-        let mut frame = || owner_frame(&api);
         let result = loop {
             if crate::native_social::take_mail_changed() {
                 events::send("{\"type\":\"native_mail_changed\"}\n".into());
             }
             let control = CONTROL.load(Ordering::Acquire);
             match control & !GROUPS {
+                SOCIAL => take_latched_play(&CONTROL, &PLAY_LATCH),
                 SOCIAL_REQUEST => {
                     let request = crate::native_social::REQUEST.lock().unwrap_or_else(|e| e.into_inner()).take();
-                    if let Some(request) = request { self.social.execute_with(&self.api, request, &mut frame); }
-                    CONTROL.store(SOCIAL, Ordering::Release);
+                    if let Some(request) = request {
+                        self.social.execute_with(&self.api, request,
+                            &mut || idle_owner_frame(&api, &mut self.pushes, &mut self.auto_away, &mut self.viewer_status, idle_time()));
+                    }
+                    release_command(&CONTROL, &PLAY_LATCH);
                 }
-                START_GAME => break Ok(true),
+                START_GAME => break self.settle_for_play(),
                 SIGN_OUT => break Ok(false),
                 action @ (VISIBLE | AWAY | INVISIBLE) => {
                     let mode = match action { VISIBLE => 0, AWAY => 1, _ => 4 };
-                    self.user_status(mode, control & GROUPS != 0, &mut frame);
-                    CONTROL.store(SOCIAL, Ordering::Release);
+                    Self::user_status(&api, mode, control & GROUPS != 0, &mut self.viewer_status,
+                        &mut |status| idle_owner_frame(&api, &mut self.pushes, &mut self.auto_away, status, idle_time()));
+                    release_command(&CONTROL, &PLAY_LATCH);
                 }
                 _ => {},
             }
@@ -786,40 +1082,72 @@ impl NativeSession {
             if error < 0 {
                 break Err(self.connection_lost(error));
             }
-            self.auto_away_tick(idle_time(), &mut frame);
-            self.social.idle_frame(&self.api, &mut frame);
+            let mut frame = || idle_owner_frame(&api, &mut self.pushes, &mut self.auto_away, &mut self.viewer_status, idle_time());
+            self.social.idle_frame(&self.api, &mut frame); // no mail retry once Play is requested
             frame();
         };
         CONTROL.store(GAME, Ordering::Release);
+        PLAY_LATCH.store(false, Ordering::Release);
         drop(observer);
+        // Play hands off with no cancel; sign-out and a stopping owner keep the
+        // Viewer's own cancel point (Drop repeats it harmlessly).
+        if !matches!(result, Ok(true)) { self.viewer_status.cancel(&api); }
         result
+    }
+
+    /// Play from the idle Viewer: launch states 3/6/7 (app 101a0269, 03 §3.1)
+    /// wait for the status and commit jobs to go idle, then hand off with no
+    /// status call and no cancel. Here that is the owned status job (auto-Away
+    /// or a user change); social requests, commits and mail cycles run inside
+    /// their own nested owner loops and have finished before START_GAME is read.
+    /// Idle frames keep running (818, pushes); nothing new starts. The 60 s
+    /// Normal-policy cancel still fires for a stuck ticket. Ok(false): the
+    /// launcher went away while waiting.
+    fn settle_for_play(&mut self) -> Result<bool, String> {
+        let api = self.api.clone();
+        let started = Instant::now();
+        let mut frames = 0u32;
+        while self.viewer_status.in_flight() {
+            let status = &mut self.viewer_status;
+            let running = owner_frame_with(&api, &mut self.pushes, FRAME, &mut || status.settle_step(&api));
+            frames += 1;
+            if !running {
+                if events::pipe_closed() { return Ok(false); }
+                let error = api.zero(1103);
+                return Err(self.connection_lost(error));
+            }
+        }
+        if frames > 0 {
+            log!("native POL Play waited {frames} frame(s) ({:.2}s) for the in-flight status job", started.elapsed().as_secs_f64());
+        }
+        Ok(true)
     }
 
     /// One idle frame of the Viewer's OnUpdate auto-Away (app 1001b0f3): gated
     /// on Visible (206() == 0); when due and idle long enough, 10040d4f(1)
     /// sends (-2,-2,1,1,0,-2). No group push and no automatic return (03 §1.3).
-    fn auto_away_tick(&mut self, idle: Duration, frame: &mut dyn FnMut() -> bool) -> Option<i32> {
-        if !self.auto_away.frame(self.api.zero(206) == 0, idle) {
-            return None;
-        }
-        let code = status_request(&self.api, [-2, -2, 1, 1, 0, -2], frame);
-        log!("native POL auto-away after {}s idle: result {code}", idle.as_secs());
-        Some(code)
+    fn auto_away_tick(api: &Api, auto_away: &mut AutoAway, status: &mut ViewerStatus, idle: Duration) {
+        if auto_away.frame(api.zero(206) == 0, idle) { status.queue(api, 1, true); }
     }
 
-    /// Status dialog apply (app 10031b2b → 10040d4f, 10040f39): ChangeMyStatus,
-    /// then, when asked to apply to groups and a group is active, ChgAllGrpStatus
-    /// (404 maps 0/1/4 to 1/2/5 itself, core 10029ff0).
-    fn user_status(&mut self, mode: i32, groups: bool, frame: &mut dyn FnMut() -> bool) {
-        let name = match mode { 0 => "visible", 1 => "away", _ => "invisible" };
-        let api = &self.api;
-        let code = status_request(api, [-2, -2, 1, mode, 0, -2], frame);
-        events::send(format!("{{\"type\":\"native_control_result\",\"action\":\"{name}\",\"code\":{code}}}\n"));
-        // 10040f39 starts ChgAllGrpStatus alongside ChangeMyStatus, whatever its result.
-        if groups && api.zero(385) > 0 {
-            let pushed = native_jobs::run(api, Request { start: &mut || api.call(404, &[mode as usize]), poll: 405, policy: Policy::Normal }, frame);
-            log!("native POL group status mode={mode} result={pushed}");
-            events::send(format!("{{\"type\":\"native_control_result\",\"action\":\"groups\",\"code\":{pushed}}}\n"));
+    /// Status dialog apply queues ChangeMyStatus and, when requested and a
+    /// group is active, ChgAllGrpStatus in the same frame (app 10031ba9..bc1).
+    /// Both retain independent Normal-policy completion, timeout and retries.
+    fn user_status(api: &Api, mode: i32, groups: bool, status: &mut ViewerStatus, frame: &mut dyn FnMut(&mut ViewerStatus) -> bool) {
+        let with_groups = groups && api.zero(385) > 0;
+        status.queue(api, mode, false);
+        status.step(api);
+        if with_groups {
+            let mut running = true;
+            let code = native_jobs::run(api, Request {
+                name: "groups-status", start: &mut || api.call(404, &[mode as usize]), poll: 405, policy: Policy::Normal,
+            }, &mut || { running = frame(status); running });
+            log!("native POL groups status mode={mode} result={code}");
+            events::send(format!("{{\"type\":\"native_control_result\",\"action\":\"groups\",\"code\":{code}}}\n"));
+            if !running { status.cancel(api); return; }
+        }
+        while status.pending.is_some() {
+            if !frame(status) { status.cancel(api); break; }
         }
     }
 
@@ -830,13 +1158,44 @@ impl NativeSession {
         log!("native POL connection lost (POL result {error})");
         events::send("{\"type\":\"native_pol_status\",\"code\":-1025}\n".into());
         self.signed_in = false;
+        self.network_opened = false;
+        self.viewer_status.cancel(&self.api);
         crate::native_social::set_listening(false);
         // Keep what already arrived; the lost session can't take receipts.
-        self.social.flush_pushed(&self.api, false);
+        self.pushes.flush_pushed(&self.api, false);
         crate::native_social::discard_pushed();
         self.api.zero(463);
         self.api.zero(434);
         format!("PlayOnline session ended (POL result {error}). Sign in again to reconnect.")
+    }
+
+    /// Closing a command is separate from accepting it. Only 817 reaching 7
+    /// proves native sign-out completed; an error or timeout retains its result.
+    fn close_member(&mut self) -> Option<i32> {
+        if !self.signed_in && !self.network_opened { return None; }
+        self.signed_in = false;
+        self.network_opened = false;
+        self.api.call(816, &[1]);
+        let started = Instant::now();
+        let result = loop {
+            let state = self.api.zero(817);
+            if state == 7 {
+                log!("native POL sign-out completed (state 7)");
+                break 0;
+            }
+            if state < 0 {
+                log!("error: native POL sign-out failed (state {state})");
+                break state;
+            }
+            if started.elapsed() >= CLOSE_LIMIT {
+                log!("error: native POL sign-out still at state {state} after {}s; closing anyway", CLOSE_LIMIT.as_secs());
+                break native_jobs::TIMED_OUT;
+            }
+            std::thread::sleep(CLOSE_POLL);
+        };
+        self.api.zero(463);
+        self.api.zero(434);
+        Some(result)
     }
 
     /// Observe native snapshots through locked getters only (167/169/206/207/
@@ -859,25 +1218,63 @@ impl NativeSession {
 /// One Viewer frame for request drivers: window messages, one 818, one frame
 /// of sleep. False when the owner must stop: launcher gone or a latched pump
 /// error (1103, peeked like the Viewer's frame tail 101984da).
-fn owner_frame(api: &Api) -> bool {
-    owner_frame_at(api, FRAME)
+pub(crate) fn owner_frame(api: &Api, pushes: &mut crate::native_social::PushDelivery) -> bool {
+    owner_frame_at(api, pushes, FRAME)
 }
 
-fn owner_frame_at(api: &Api, interval: Duration) -> bool {
+fn idle_owner_frame(api: &Api, pushes: &mut crate::native_social::PushDelivery, auto_away: &mut AutoAway, status: &mut ViewerStatus, idle: Duration) -> bool {
+    owner_frame_with(api, pushes, FRAME, &mut || {
+        // Play is pending: finish in-flight work only; no auto-Away, no retry.
+        if play_requested() { return status.settle_step(api); }
+        NativeSession::auto_away_tick(api, auto_away, status, idle);
+        status.step(api);
+    })
+}
+
+fn owner_frame_at(api: &Api, pushes: &mut crate::native_social::PushDelivery, interval: Duration) -> bool {
+    owner_frame_with(api, pushes, interval, &mut || {})
+}
+
+// Owner frames run so far on this (the owner) thread; the Viewer's
+// frame-counted pauses measure from here.
+thread_local! { static OWNER_FRAMES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
+pub(crate) fn owner_frames() -> u64 { OWNER_FRAMES.with(|f| f.get()) }
+#[cfg(test)]
+pub(crate) fn count_owner_frame_for_test() { OWNER_FRAMES.with(|f| f.set(f.get() + 1)); }
+
+fn owner_frame_with(api: &Api, pushes: &mut crate::native_social::PushDelivery, interval: Duration, work: &mut dyn FnMut()) -> bool {
+    OWNER_FRAMES.with(|f| f.set(f.get() + 1));
     pump_idle_messages();
     api.zero(818);
+    work();
+    pushes.flush_pushed(api, api.zero(838) == 3);
     pause_owner(interval);
     !events::pipe_closed() && api.zero(1103) >= 0
 }
 
 // Initial open/status/list/presence polls, including the wall-clock mail list,
-// use this cadence. FRAME remains 20 ms for mail downloads/acknowledgements,
-// their frame-counted backoffs, idle and game return.
+// use this cadence. The default build steps them one 818 per Viewer frame
+// (07b decision 2; 07a stock-faithful-pacing: 1 ms turnarounds are below any
+// stock timing). The opt-in comparison feature keeps the old 1 ms pilot.
 const STARTUP_FRAME: Duration = if cfg!(feature = "native-fast-login-poll") {
     Duration::from_millis(1)
 } else {
     FRAME
 };
+/// The Viewer's screen transitions on a sign-in-only session (07a
+/// stock-faithful-pacing), counted in frames like the Viewer counts them
+/// (08 §4 item 5): op7 end → 374 (stock 1.05 s ≈ 34 frames of 31.25 ms) and
+/// mail response → publish (1.6 s ≈ 51 frames). At FRAME that is ≈0.69 s and
+/// ≈1.03 s, both timings a stock Viewer produces (07d §6 S1 D).
+const OP7_TO_STATUS_FRAMES: u32 = 34;
+const MAIL_TO_PUBLISH_FRAMES: u32 = 51;
+
+/// `limit` has passed since `since`, measured on the wall clock or as `frames`
+/// owner frames of FRAME. A real frame never takes less than FRAME, so live
+/// this is the wall clock; tests that capture the sleeps count frames.
+fn waited(since: Instant, frames: u32, limit: Duration) -> bool {
+    since.elapsed() >= limit || FRAME * frames >= limit
+}
 
 fn pause_owner(interval: Duration) {
     #[cfg(test)]
@@ -905,9 +1302,9 @@ impl StartupCadence {
         }
         self.pumps += 1;
     }
-    fn frame(&mut self, api: &Api) -> bool {
+    fn frame(&mut self, api: &Api, pushes: &mut crate::native_social::PushDelivery) -> bool {
         self.tick();
-        owner_frame_at(api, STARTUP_FRAME)
+        owner_frame_at(api, pushes, STARTUP_FRAME)
     }
 }
 impl Drop for StartupCadence {
@@ -920,63 +1317,30 @@ impl Drop for StartupCadence {
 
 /// Concurrent requests under the Login policy, as the Viewer's job runner
 /// starts several queued jobs in one tick (1003feb5): all start in list order,
-/// then each frame polls them in order. -256 restarts on the next frame; no
+/// then each frame polls them in order. A full table restarts the allocation
+/// on the next frame; no
 /// timeout or retry; only a stopping owner cancels its own pending tickets.
-fn run_concurrent(api: &Api, jobs: &[(&str, usize, usize)], frame: &mut dyn FnMut() -> bool) -> Vec<i32> {
-    #[derive(Clone, Copy)]
-    enum Job { Start, Poll(i32), Done(i32) }
-    let mut state = vec![Job::Start; jobs.len()];
+/// Each job writes its own request lines (07d §4.7; attempts include the
+/// full-table reissues).
+fn run_concurrent(api: &Api, jobs: &[(&'static str, usize, usize)], frame: &mut dyn FnMut() -> bool) -> Vec<i32> {
     let started = Instant::now();
-    let mut reissues = vec![0u32; jobs.len()];
-    let mut first_start = vec![true; jobs.len()];
+    let mut starts: Vec<_> = jobs.iter().map(|&(_, start, _)| move || api.zero(start)).collect();
+    let mut requests: Vec<_> = starts.iter_mut().zip(jobs).map(|(start, &(name, _, poll))|
+        Request { name, start, poll, policy: Policy::Login }).collect();
     let mut max_frame = Duration::ZERO;
-    loop {
-        for (((job, retries), first), &(name, start, poll)) in state.iter_mut().zip(&mut reissues).zip(&mut first_start).zip(jobs) {
-            let was_done = matches!(job, Job::Done(_));
-            *job = match *job {
-                Job::Start if api.zero(838) != 3 => Job::Done(native_jobs::ABORTED),
-                Job::Start => match api.zero(start) {
-                    ticket if ticket >= 0 => {
-                        if std::mem::take(first) {
-                            log!("native POL {name} load started at +{:.2}s", started.elapsed().as_secs_f64());
-                        }
-                        Job::Poll(ticket)
-                    },
-                    SLOTS_FULL => { *retries += 1; Job::Start },
-                    error => Job::Done(error),
-                },
-                Job::Poll(ticket) => match api.one(poll, ticket as usize) {
-                    0 => Job::Poll(ticket),
-                    SLOTS_FULL if api.one(1107, SLOTS_FULL as usize) != 0 => { *retries += 1; Job::Start },
-                    result => Job::Done(result),
-                },
-                done => done,
-            };
-            if !was_done {
-                if let Job::Done(result) = *job {
-                    log!("native POL {name} load result {result} in {:.2}s (full-table reissues {retries})", started.elapsed().as_secs_f64());
-                }
-            }
-        }
-        if state.iter().all(|j| matches!(j, Job::Done(_))) {
-            break;
-        }
+    let results = native_jobs::run_all(api, &mut requests, &mut || {
         let frame_started = Instant::now();
         let running = frame();
         max_frame = max_frame.max(frame_started.elapsed());
-        if !running {
-            for job in &mut state {
-                match *job {
-                    Job::Poll(ticket) => { api.one(native_jobs::CANCEL, ticket as usize); *job = Job::Done(native_jobs::ABORTED); }
-                    Job::Start => *job = Job::Done(native_jobs::ABORTED),
-                    Job::Done(_) => {}
-                }
-            }
-            break;
-        }
+        running
+    }, &mut |_, _| {});
+    let took = started.elapsed();
+    log!("native POL concurrent loads completed in {:.2}s (longest owner frame {:.0}ms)", took.as_secs_f64(), max_frame.as_secs_f64() * 1000.0);
+    // The four lists, start → last end (07d §4.5).
+    if jobs.len() == LISTS.len() {
+        if let Some(note) = native_jobs::possible_loss("lists", took, native_jobs::CLEAN_LISTS) { log!("{note}"); }
     }
-    log!("native POL concurrent loads completed in {:.2}s (longest owner frame {:.0}ms)", started.elapsed().as_secs_f64(), max_frame.as_secs_f64() * 1000.0);
-    state.into_iter().map(|j| if let Job::Done(code) = j { code } else { native_jobs::ABORTED }).collect()
+    results
 }
 
 /// Keep this STA responsive to COM and injected-tool window messages between
@@ -1074,36 +1438,15 @@ impl Drop for NativeSession {
     /// 101aa2d4 (1502 clear), 1019869a (host unregistration) and 10019464
     /// (920 file worker stop, 915 option.bin mutex). No 852 (B9).
     fn drop(&mut self) {
+        self.viewer_status.cancel(&self.api);
         crate::native_social::set_listening(false);
         if self.home {
             // Store (and while still signed in, answer) the last pushes first.
             let receipts = self.signed_in && self.api.zero(838) == 3;
-            self.social.flush_pushed(&self.api, receipts);
+            self.pushes.flush_pushed(&self.api, receipts);
         }
         crate::native_social::discard_pushed();
-        if self.signed_in {
-            self.signed_in = false;
-            self.api.call(816, &[1]);
-            let started = Instant::now();
-            loop {
-                let state = self.api.zero(817);
-                if state == 7 {
-                    log!("native POL sign-out completed (state 7)");
-                    break;
-                }
-                if state < 0 {
-                    log!("error: native POL sign-out failed (state {state})");
-                    break;
-                }
-                if started.elapsed() >= CLOSE_LIMIT {
-                    log!("error: native POL sign-out still at state {state} after {}s; closing anyway", CLOSE_LIMIT.as_secs());
-                    break;
-                }
-                std::thread::sleep(CLOSE_POLL);
-            }
-            self.api.zero(463);
-            self.api.zero(434);
-        }
+        let sign_out = self.close_member();
         if self.home {
             self.api.se(None);
         }
@@ -1111,6 +1454,9 @@ impl Drop for NativeSession {
         if self.files {
             self.api.zero(920);
             self.api.zero(915);
+        }
+        if let Some(code) = sign_out {
+            events::send(format!("{{\"type\":\"native_sign_out_complete\",\"code\":{code}}}\n"));
         }
     }
 }
@@ -1125,6 +1471,23 @@ impl Drop for FriendObserver {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+    }
+}
+
+/// The words for an Open the core failed, naming the stage, because the launcher
+/// learns from them (src/launch_log.rs `sign_in_refused`): only the member login
+/// (mode 1, after the code is set with 1502) can be a verdict on the account,
+/// such as a password or a one-time code it wanted. The network-level Open
+/// (mode 0) runs before any credential is sent, and a login cancelled here (too
+/// slow, or the launcher went away) never reached a verdict. "POL result {n})"
+/// stays in every form: -19 there is the launcher's network failure.
+fn open_failure(mode: usize, state: i32, error: i32, cancelled: bool) -> String {
+    if cancelled {
+        format!("Native PlayOnline login was cancelled at state {state} (POL result {error}).")
+    } else if mode == 0 {
+        format!("Native PlayOnline network connection failed (state {state}, POL result {error}).")
+    } else {
+        format!("Native PlayOnline member login failed (state {state}, POL result {error}).")
     }
 }
 

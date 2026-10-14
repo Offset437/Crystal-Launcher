@@ -12,10 +12,19 @@ pub(crate) struct BatchAccount {
     pub key: String, pub config: Config, pub account: Account, pub otp: String, pub via: Plan,
     #[serde(default)]
     existing_worker: Option<Identity>,
+    /// The existing pre-sign-in took the account's one-time code: its failure is never
+    /// followed by a cold sign-in here, which would go without a code (07d §5.4).
+    #[serde(default)]
+    otp_spent: bool,
 }
 impl BatchAccount {
     pub(crate) fn new(key: String, config: Config, account: Account, otp: String, via: Plan) -> Self {
-        Self { key, config, account, otp, via, existing_worker: None }
+        Self { key, config, account, otp, via, existing_worker: None, otp_spent: false }
+    }
+
+    pub(crate) fn with_otp_spent(mut self, spent: bool) -> Self {
+        self.otp_spent = spent;
+        self
     }
 
     pub(crate) fn existing(key: String, config: Config, account: Account, otp: String, via: Plan, session: &BackgroundSession) -> Self {
@@ -72,7 +81,8 @@ fn launch_batch_command(
     mut command: Command, mut jobs: Vec<BatchAccount>, clicked: Instant,
     progress: &mut dyn FnMut(&str, &str), complete: &mut dyn FnMut(&str, Result<LaunchResult, String>),
 ) -> Result<(), String> {
-    prepare_dispatch(&mut jobs, || crate::viewer::gate(&crate::viewer::status(false)))?;
+    // Local readiness only; each new sign-in's worker runs its own W2U at Connect (07c §3).
+    prepare_dispatch(&mut jobs, || crate::viewer::gate(&crate::viewer::local_status()))?;
     let paths: std::collections::HashMap<_, _> = jobs.iter().map(|j| (j.key.clone(), record_path(&j.config, &j.account))).collect();
     let request = BatchRequest { jobs, elapsed_ms: clicked.elapsed().as_millis().min(u64::MAX as u128) as u64,
         clicked_clock: crate::launch_timing::MonotonicStamp::capture(clicked) };
@@ -146,7 +156,10 @@ fn run_batch_with(prepare: fn(BatchAccount, Instant) -> Result<Prepared, String>
     if result.is_ok() { 0 } else { 1 }
 }
 
-struct Prepared { job: BatchAccount, session: BackgroundSession, launch: LaunchResult, check: Result<(), String>, start_game: bool }
+/// The account's W20; its phases go to the account's launch log (the `&Path`).
+type VersionCheck = fn(&Config, &Path) -> Result<String, String>;
+/// `version`: the account's W20, still to run (`verify`) once every account is prepared.
+struct Prepared { job: BatchAccount, session: BackgroundSession, launch: LaunchResult, check: Result<(), String>, start_game: bool, version: Option<VersionCheck> }
 pub(crate) fn batch_pending(config: &Config, account: &Account) -> bool {
     read_bounded(&config.account_directory(account).join("batch-owner.json"), 1024)
         .and_then(|b| serde_json::from_slice::<Identity>(&b).ok())
@@ -178,8 +191,18 @@ impl Drop for Ownership { fn drop(&mut self) { for path in &self.paths { let _ =
 fn prepare(job: BatchAccount, clicked: Instant) -> Result<Prepared, String> {
     prepare_with(job, clicked, check_version)
 }
-fn check_version(config: &Config) -> Result<String, String> {
-    check_version_with(config, crate::patch::check_before_launch)
+fn check_version(config: &Config, log: &Path) -> Result<String, String> {
+    let mut timing = None;
+    let result = check_version_with(config, |install| {
+        let (check, phases) = crate::patch::check_before_launch_timed(install);
+        timing = Some(phases);
+        check
+    });
+    // W20 phases on every path (08 §4 item 6).
+    if let Some(timing) = timing {
+        crate::launch_log::append_launcher_lines(log, &crate::launch_timing::check_lines("FFXI check (W20)", &timing));
+    }
+    result
 }
 fn check_version_with(config: &Config, check: impl FnOnce(&Path) -> crate::patch::LaunchCheck) -> Result<String, String> {
     let install = crate::pol_less::install_directory(config)?;
@@ -201,85 +224,97 @@ fn report_version(key: &str, log: &Path, result: &Result<String, String>, mut em
     } else { note.clone() };
     emit(&BatchEvent::Progress(key.into(), progress));
 }
-fn prepare_with(mut job: BatchAccount, clicked: Instant, check_version: fn(&Config) -> Result<String, String>) -> Result<Prepared, String> {
+fn prepare_with(mut job: BatchAccount, clicked: Instant, check_version: VersionCheck) -> Result<Prepared, String> {
     let deadline = Instant::now() + PREPARE_LIMIT;
-    let mut plan = job.via.clone(); plan.social_only = true;
+    // A batch's own sign-in is a cold Play: no restored Viewer pauses (07c §4).
+    let mut plan = job.via.clone(); plan.social_only = true; plan.viewer_gaps = false;
     let mut otp = Zeroizing::new(std::mem::take(&mut job.otp));
     let existing = job.existing_session()?;
     if let Some(session) = existing.as_ref().filter(|session| session.game_running() == Some(true)) {
         let launch = session.clone().reconnect(|line| emit_batch(&BatchEvent::Progress(job.key.clone(), line.into())))?;
-        return Ok(Prepared { session: session.clone(), job, launch, check: Ok(()), start_game: false });
+        return Ok(Prepared { session: session.clone(), job, launch, check: Ok(()), start_game: false, version: None });
     }
-    let canceled = AtomicBool::new(false);
-    let (session, launch, check) = std::thread::scope(|scope| {
-        // launch/reconnect waits for full native idle. Its exact worker publishes authentication
-        // earlier, so this one fresh request can overlap mail and presence initialization.
-        let version = std::thread::Builder::new().name("batch-version-check".into()).spawn_scoped(scope, || {
-            let session = loop {
-                if canceled.load(Ordering::Acquire) { return Err("The batch sign-in was canceled.".to_owned()); }
-                if let Some(session) = find(&job.config, &job.account) {
-                    if job.existing_worker.is_some_and(|worker| worker != session.worker) {
-                        return Err("The batch account's original worker changed.".into());
-                    }
-                    break session;
+    let progress = |line: &str| emit_batch(&BatchEvent::Progress(job.key.clone(), line.into()));
+    let mut reissued = false;
+    let launch = match existing {
+        Some(session) => {
+            // A Play during this pre-sign-in: the loader skips the pauses still to come.
+            let _ = note_play_pending(&job.config, &job.account);
+            match session.reconnect(progress) {
+                Ok(launch) => {
+                    let lines = crate::pol_less::launch_clock_lines(&crate::launch_timing::Timeline::begin_at(clicked), job.via.trigger);
+                    crate::launch_log::append_launcher_lines(&launch.log, &lines);
+                    launch
                 }
-                if job.existing_worker.is_some() { return Err("The batch account's original worker ended.".into()); }
-                if Instant::now() >= deadline { return Err("Timed out waiting for the account to sign in.".into()); }
-                std::thread::sleep(Duration::from_millis(20));
-            };
-
-            loop {
-                if canceled.load(Ordering::Acquire) { return Err("The batch sign-in was canceled.".to_owned()); }
-                if identity(session.worker.pid) != Some(session.worker)
-                    || !read_record(&session.path).is_some_and(|record| record.worker == session.worker
-                        && matches!(record.state, Event::Progress(_) | Event::Started(_))) {
-                    return Err("The batch account's worker ended.".into());
+                // 07d §5.4: the pre-sign-in failed before giving a verdict on the account (no
+                // network, or its host went away before authentication): this Play signs in
+                // once, cold. A refused password, OTP or update never costs a second login,
+                // and neither does a spent one-time code.
+                Err(error) if reissue_allowed(&error) && !job.otp_spent
+                    && !(crate::launch_log::transient_failure(launch_log_message(&error)) && reached_authentication(&job.config, &job.account)) => {
+                    if crate::launch_log::network_failure(launch_log_message(&error)) && !wait_for_network(deadline) { return Err(error); }
+                    reissued = true;
+                    plan.trigger = crate::launch_timing::LaunchTrigger::ReissuedPlay;
+                    launch_preflighted(&job.config, job.account.clone(), std::mem::take(&mut *otp), Some(plan), clicked, progress)?
                 }
-                if session.authenticated() { break; }
-                if Instant::now() >= deadline { return Err("Timed out waiting for the account to sign in.".into()); }
-                std::thread::sleep(Duration::from_millis(20));
+                Err(error) => return Err(error),
             }
-            emit_batch(&BatchEvent::Progress(job.key.clone(), "Checking the game version...".into()));
-            Ok((session.worker, check_version(&job.config)))
-        }).map_err(|_| "Could not start the batch game version check.")?;
-        let progress = |line: &str| emit_batch(&BatchEvent::Progress(job.key.clone(), line.into()));
-        let launched = match existing {
-            Some(session) => session.reconnect(progress),
-            None => launch_preflighted(&job.config, job.account.clone(), std::mem::take(&mut *otp), Some(plan), clicked, progress),
-        };
-        let launch = match launched {
-            Ok(launch) => launch,
-            Err(error) => { canceled.store(true, Ordering::Release); return Err(error); }
-        };
-        let session = match find(&job.config, &job.account) {
-            Some(session) => session,
-            None => { canceled.store(true, Ordering::Release); return Err("The prepared session ended.".into()); }
-        };
-        let idle = (|| {
+        }
+        None => launch_preflighted(&job.config, job.account.clone(), std::mem::take(&mut *otp), Some(plan), clicked, progress)?,
+    };
+    let session = find(&job.config, &job.account).ok_or("The prepared session ended.")?;
+    if !reissued && job.existing_worker.is_some_and(|worker| worker != session.worker) {
+        return Err("The batch account's original worker changed.".into());
+    }
+    // pol-spec 07c §5.2: W20 only once this account's Viewer main menu is up and idle,
+    // never on authentication (an early :53001 beside mail and presence is an order stock
+    // cannot produce, 07a presign-fast-path (1)). Also for a Play during a pre-sign-in.
+    // The W20 itself waits for the other accounts (`verify`).
+    let idle = main_menu(&job, &session, &launch, deadline);
+    if let Err(error) = &idle { report_version(&job.key, &launch.log, &Err(error.clone()), emit_batch); }
+    Ok(Prepared { job, session, launch, version: idle.is_ok().then_some(check_version), check: idle, start_game: true })
+}
 
-            loop {
-                if !launch.alive.load(Ordering::Acquire) || identity(session.worker.pid) != Some(session.worker) { return Err("The batch account's worker ended.".into()); }
-                if let Some(snapshot) = read_friend_cache(&job.config.account_directory(&job.account), session.worker) {
-                    if snapshot.game_running == Some(true) { return Err("This account already has a game running.".into()); }
-                    if let Some(error) = snapshot.session_error { return Err(error); }
-                    if snapshot.game_running == Some(false) && snapshot.social.ready && !snapshot.social.busy { break; }
-                }
-                if Instant::now() >= deadline { return Err("Timed out waiting for the account to finish signing in.".into()); }
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            Ok(())
-        })();
-        if idle.is_err() { canceled.store(true, Ordering::Release); }
-        let checked = version.join().unwrap_or_else(|_| Err("The batch game version check failed.".into()));
-        let check = idle.and_then(|()| {
-            let (worker, result) = checked?;
-            if worker != session.worker { return Err("The batch account's worker changed during its version check.".into()); }
-            result
-        });
-        report_version(&job.key, &launch.log, &check, emit_batch);
-        Ok::<_, String>((session, launch, check.map(|_| ())))
-    })?;
-    Ok(Prepared { job, session, launch, check, start_game: true })
+fn launch_log_message(error: &str) -> &str { crate::launch_log::split_log(error).0 }
+
+/// A failed pre-sign-in may be followed by one cold sign-in for the queued Play only when it
+/// never reached a verdict on the account (07d §5.4): no network, or a host that went away.
+pub(crate) fn reissue_allowed(error: &str) -> bool {
+    let message = launch_log_message(error);
+    crate::patch::parse_update_required(message).is_none()
+        && (crate::launch_log::network_failure(message) || crate::launch_log::transient_failure(message))
+}
+
+fn main_menu(job: &BatchAccount, session: &BackgroundSession, launch: &LaunchResult, deadline: Instant) -> Result<(), String> {
+    let directory = job.config.account_directory(&job.account);
+    loop {
+        if !launch.alive.load(Ordering::Acquire) || identity(session.worker.pid) != Some(session.worker) { return Err("The batch account's worker ended.".into()); }
+        if let Some(snapshot) = read_friend_cache(&directory, session.worker) {
+            if snapshot.game_running == Some(true) { return Err("This account already has a game running.".into()); }
+            if let Some(error) = snapshot.session_error { return Err(error); }
+        }
+        if main_menu_idle(&directory, session.worker) { return Ok(()); }
+        if Instant::now() >= deadline { return Err("Timed out waiting for the account to finish signing in.".into()); }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The account's W20 (:53001), once every account of the batch reached its idle main menu:
+/// a sign-in that fails meanwhile leaves no account with a passed check and no :54001 after
+/// it (stock always follows a passing W20 into the launch). Re-confirms the account's own
+/// idle main menu first; immediate while it stays there.
+fn verify(item: &mut Prepared) {
+    let Some(check_version) = item.version.take() else { return };
+    let check = main_menu(&item.job, &item.session, &item.launch, Instant::now() + PREPARE_LIMIT).and_then(|()| {
+        emit_batch(&BatchEvent::Progress(item.job.key.clone(), "Checking the game version...".into()));
+        let result = check_version(&item.job.config, &item.launch.log);
+        if find(&item.job.config, &item.job.account).is_none_or(|now| now.worker != item.session.worker) {
+            return Err("The batch account's worker changed during its version check.".into());
+        }
+        result
+    });
+    report_version(&item.job.key, &item.launch.log, &check, emit_batch);
+    item.check = check.map(|_| ());
 }
 
 fn coordinate(
@@ -302,18 +337,26 @@ fn coordinate(
     }
     drop(sender);
     let deadline = Instant::now() + PREPARE_LIMIT;
-    let mut prepared = Vec::new(); let mut error = None;
+    // The batch's first failure, and the account it is about when it is one account's.
+    let mut prepared = Vec::new(); let mut error: Option<(Option<String>, String)> = None;
     for _ in &keys {
         match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-            Ok((_, Ok(item))) => { if let Err(reason) = &item.check { error.get_or_insert(reason.clone()); } prepared.push(item); }
-            Ok((_, Err(reason))) => { error.get_or_insert(reason); }
-            Err(_) => { error.get_or_insert("A batch account did not become ready in time.".into()); break; }
+            Ok((key, Ok(item))) => { if let Err(reason) = &item.check { error.get_or_insert((Some(key), reason.clone())); } prepared.push(item); }
+            Ok((key, Err(reason))) => { error.get_or_insert((Some(key), reason)); }
+            Err(_) => { error.get_or_insert((None, "A batch account did not become ready in time.".into())); break; }
+        }
+    }
+    if error.is_none() {
+        // Every account is at its idle main menu: the W20s now, together.
+        std::thread::scope(|scope| { for item in prepared.iter_mut() { scope.spawn(move || verify(item)); } });
+        if let Some(item) = prepared.iter().find(|item| item.check.is_err()) {
+            error = item.check.clone().err().map(|reason| (Some(item.job.key.clone()), reason));
         }
     }
     if error.is_none() {
         let starts: Vec<_> = prepared.iter().filter(|item| item.start_game).collect();
         if !starts.is_empty() {
-            if let Err(reason) = release_prepared(&starts) { error = Some(reason); }
+            if let Err(reason) = release_prepared(&starts) { error = Some((None, reason)); }
         }
     }
     drop(ownership);
@@ -326,14 +369,28 @@ fn coordinate(
             log: item.launch.log.clone(), timing: item.launch.timing.clone(),
         }));
     }
-    if let Some(error) = error {
+    if let Some((source, error)) = error {
+        let others = others_failure(&error);
         for key in keys {
             if !prepared.iter().any(|item| item.job.key == key && !item.start_game) {
-                emit(&BatchEvent::Failed(key, error.clone()));
+                let message = if source.as_ref() == Some(&key) { error.clone() } else { others.clone() };
+                emit(&BatchEvent::Failed(key, message));
             }
         }
     }
     emit(&BatchEvent::Done);
+}
+
+/// What the other accounts of a batch are told when one account's failure stops it. The same
+/// words, so that an update its W20 asked for, for example, starts every Play again; except a
+/// refused member login, which is a verdict on that one account only: the window learns from it
+/// that the account may need a one-time code, and must not learn that of the others.
+fn others_failure(error: &str) -> String {
+    if crate::launch_log::sign_in_refused(launch_log_message(error)) {
+        t("Another selected account's PlayOnline sign-in was refused, so FFXI was not started.").to_owned()
+    } else {
+        error.to_owned()
+    }
 }
 
 fn release_prepared(prepared: &[&Prepared]) -> Result<(), String> {
@@ -381,7 +438,7 @@ mod tests {
         BatchAccount::new(key.into(),
             Config { experiment: root.into(), repository: root.into(), game_install: None, dat_overlays: Vec::new() },
             Account { label: key.into(), mode: backend::AccountMode::Retail, server: String::new(), pol_id: key.into(), pol_password: "fixture-secret".into(), se_id: String::new(), se_password: String::new(), region: 0, launch_with: None, ashita_boot_ini: None, windower_profile: None },
-            "123456".into(), Plan { tool: crate::pol_less::Tool::Windower, settings: Default::default(), social_only: false, invisible_login: false, auto_away_minutes: 10, auto_login: crate::pol_less::AutoLogin::default() })
+            "123456".into(), Plan { tool: crate::pol_less::Tool::Windower, settings: Default::default(), social_only: false, invisible_login: false, auto_away_minutes: 10, auto_login: crate::pol_less::AutoLogin::default(), viewer_gaps: false, trigger: Default::default() })
     }
     fn watch_fixture_start(job: &BatchAccount) {
         let directory = job.config.account_directory(&job.account);
@@ -411,7 +468,7 @@ mod tests {
         let alive = Arc::new(AtomicBool::new(job.key != "dead"));
         let check = if job.key == "fail" { Err("Missing game version.".into()) } else { Ok(()) };
         Ok(Prepared { session: BackgroundSession { path: record_path(&job.config, &job.account), worker },
-            launch: LaunchResult { pid: worker.pid, detail: "Fixture idle session".into(), alive, game_running: Arc::new(AtomicBool::new(false)), outcome: Arc::new(Mutex::new(None)), log: root_log(&job), timing: String::new() }, job, check, start_game: true })
+            launch: LaunchResult { pid: worker.pid, detail: "Fixture idle session".into(), alive, game_running: Arc::new(AtomicBool::new(false)), outcome: Arc::new(Mutex::new(None)), log: root_log(&job), timing: String::new() }, job, check, start_game: true, version: None })
     }
     fn root_log(job: &BatchAccount) -> PathBuf { job.config.experiment.join("fixture.log") }
     fn until(mut test: impl FnMut() -> bool) {
@@ -432,7 +489,7 @@ mod tests {
     fn one_running_account_does_not_enter_or_block_the_other_five_start_gates() {
         static CHECKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         fn prepare_six(job: BatchAccount, clicked: Instant) -> Result<Prepared, String> {
-            let prepared = prepare_with(job, clicked, |_| {
+            let prepared = prepare_with(job, clicked, |_, _| {
                 CHECKS.fetch_add(1, Ordering::SeqCst);
                 Ok("Fixture version is current.".into())
             })?;
@@ -452,7 +509,7 @@ mod tests {
             let log = root.join(format!("{key}.log")); fs::write(&log, []).unwrap();
             save_record(&path, &Record { worker, state: Event::Started(Started {
                 pid: worker.pid, detail: "Existing session".into(), log, timing: String::new(),
-            }), social_only: true, authenticated: true, native_batch: true,
+            }), social_only: true, authenticated: true, native_batch: true, otp_used: Some(false),
                 launch_tool: Some(crate::pol_less::Tool::Windower) }).unwrap();
             let mut snapshot = crate::friends::Snapshot { game_running: Some(key == "running"), ..Default::default() };
             snapshot.social.ready = true;
@@ -483,8 +540,38 @@ mod tests {
         let path = record_path(&job.config, &job.account);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         save_record(&path, &Record { worker, state: Event::Progress("Fixture signing in".into()),
-            social_only: true, authenticated: false, native_batch: true, launch_tool: None }).unwrap();
+            social_only: true, authenticated: false, native_batch: true, otp_used: Some(false), launch_tool: None }).unwrap();
         worker
+    }
+
+    /// Finding: a pre-sign-in that spent the account's one-time code, or lost its host after
+    /// authentication, is never followed by the batch's own cold sign-in: that login would go
+    /// without a code, or be a second one.
+    #[test]
+    fn a_failed_presign_that_spent_its_code_or_authenticated_is_not_signed_in_again() {
+        for case in ["one-time code", "authenticated"] {
+            let root = root();
+            let mut request = job(&root, "ABCD1234");
+            request.otp = String::new();
+            let worker = signing_in_record(&request);
+            request.existing_worker = Some(worker);
+            let request = request.with_otp_spent(case == "one-time code");
+            let path = record_path(&request.config, &request.account);
+            let failing = path.clone();
+            // The pre-sign-in's host goes away while the batch waits on it.
+            let fail = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(300));
+                update_record(&failing, worker, |record| {
+                    record.authenticated = case == "authenticated";
+                    record.state = Event::Failed("The background session worker ended before starting the game.".into());
+                }).unwrap();
+            });
+            let error = prepare_with(request, Instant::now(), |_, _| panic!("no version check")).err().unwrap();
+            fail.join().unwrap();
+            assert!(error.starts_with("The background session worker ended"), "{case}: {error}");
+            assert!(!path.with_extension("lock").exists(), "{case}: no cold sign-in was started");
+            let _ = fs::remove_dir_all(root);
+        }
     }
 
     #[test]
@@ -495,7 +582,7 @@ mod tests {
         let path = record_path(&request.config, &request.account);
         update_record(&path, worker, |record| record.launch_tool = Some(crate::pol_less::Tool::Windower)).unwrap();
         request.via.tool = crate::pol_less::Tool::Vanilla;
-        let error = prepare_with(request, Instant::now(), |_| panic!("must stop before checking the version")).err().unwrap();
+        let error = prepare_with(request, Instant::now(), |_, _| panic!("must stop before checking the version")).err().unwrap();
         assert!(error.contains("before switching launch methods"), "{error}");
         assert!(!path.parent().unwrap().join("native-batch.json").exists());
         update_record(&path, worker, |record| record.launch_tool = Some(crate::pol_less::Tool::Vanilla)).unwrap();
@@ -552,7 +639,7 @@ mod tests {
             if replaced {
                 save_record(&path, &Record { worker: replacement.as_ref().unwrap().worker,
                     state: Event::Progress("Replacement worker".into()), social_only: true,
-                    authenticated: false, native_batch: true, launch_tool: None }).unwrap();
+                    authenticated: false, native_batch: true, otp_used: Some(false), launch_tool: None }).unwrap();
                 assert_ne!(find(&jobs[0].config, &jobs[0].account).unwrap().worker, worker);
             } else { fs::remove_file(&path).unwrap(); }
             let error = prepare_dispatch(&mut jobs, || panic!("a selected worker must not become cold"))
@@ -574,10 +661,10 @@ mod tests {
             if replaced {
                 save_record(&path, &Record { worker: replacement.as_ref().unwrap().worker,
                     state: Event::Progress("Replacement worker".into()), social_only: true,
-                    authenticated: false, native_batch: true, launch_tool: None }).unwrap();
+                    authenticated: false, native_batch: true, otp_used: Some(false), launch_tool: None }).unwrap();
                 assert_ne!(find(&jobs[0].config, &jobs[0].account).unwrap().worker, worker);
             } else { fs::remove_file(&path).unwrap(); }
-            let error = prepare_with(jobs.remove(0), Instant::now(), |_| panic!("must stop before the version check"))
+            let error = prepare_with(jobs.remove(0), Instant::now(), |_, _| panic!("must stop before the version check"))
                 .err().expect("the dispatched worker must still exist");
             assert!(error.contains("original worker ended or changed"), "{error}");
             assert!(!path.with_extension("lock").exists(), "no replacement session worker was started");
@@ -586,7 +673,7 @@ mod tests {
     }
     #[test]
     fn batch_allows_explicitly_unverified_versions_but_known_updates_block_every_game() {
-        fn unverified_check(config: &Config) -> Result<String, String> {
+        fn unverified_check(config: &Config, _: &Path) -> Result<String, String> {
             check_version_with(config, |install| {
                 let mut report = crate::patch::local_report(install);
                 assert_eq!(report.local_version, "30260904_1");
@@ -594,7 +681,7 @@ mod tests {
                 crate::patch::LaunchCheck::Unverified(report)
             })
         }
-        fn update_check(config: &Config) -> Result<String, String> {
+        fn update_check(config: &Config, _: &Path) -> Result<String, String> {
             check_version_with(config, |_| crate::patch::LaunchCheck::Update(crate::patch::PatchReport {
                 state: crate::patch::PatchState::Required,
                 local_version: "30260904_1".into(), remote_version: "30260905_0".into(),
@@ -618,7 +705,7 @@ mod tests {
             fs::write(root.join("patch.ver"), record).unwrap();
             let mut config = job(&root, "warm").config.clone();
             config.game_install = Some(root.clone());
-            let single_note = unverified_check(&config).unwrap();
+            let single_note = unverified_check(&config, Path::new("unused.log")).unwrap();
             assert!(single_note.contains("could not be compared") && !single_note.contains("matches"));
             let keys = ["warm", if update { "update" } else { "unknown" }];
             let worker = identity(std::process::id()).unwrap();
@@ -630,7 +717,7 @@ mod tests {
                 let log = root.join(format!("{key}.crystal.log")); fs::write(&log, []).unwrap();
                 save_record(&path, &Record { worker, state: Event::Started(Started {
                     pid: worker.pid, detail: "Existing native idle fixture".into(), log, timing: String::new(),
-                }), social_only: true, authenticated: true, native_batch: true, launch_tool: None }).unwrap();
+                }), social_only: true, authenticated: true, native_batch: true, otp_used: Some(false), launch_tool: None }).unwrap();
                 let mut snapshot = crate::friends::Snapshot { game_running: Some(false), ..Default::default() };
                 snapshot.social.ready = true;
                 publish_friends(path.parent().unwrap(), &snapshot).unwrap();
@@ -680,6 +767,69 @@ mod tests {
         }
     }
     #[test]
+    fn an_account_that_fails_to_sign_in_leaves_no_other_account_with_a_passed_version_check() {
+        static CHECKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        fn prepare_one_fails(job: BatchAccount, clicked: Instant) -> Result<Prepared, String> {
+            if job.key == "wrong-otp" {
+                // Fails long after the other account reached its idle main menu.
+                std::thread::sleep(Duration::from_millis(80));
+                return Err("Fixture one-time password refused.".into());
+            }
+            let mut prepared = fixture_prepare(job, clicked)?;
+            prepared.version = Some(|_, _| { CHECKS.fetch_add(1, Ordering::SeqCst); Ok("Fixture version matches.".into()) });
+            Ok(prepared)
+        }
+        CHECKS.store(0, Ordering::SeqCst);
+        let root = root(); let (mut ready, mut errors) = (0, 0);
+        coordinate(vec![job(&root, "warm"), job(&root, "wrong-otp")], Instant::now(), prepare_one_fails, |e| match e {
+            BatchEvent::Ready(..) => ready += 1, BatchEvent::Failed(..) => errors += 1, _ => {},
+        });
+        fs::write(root.join("stop-fixture"), []).unwrap();
+        assert_eq!(CHECKS.load(Ordering::SeqCst), 0, "no :53001 for an account that will not be started");
+        assert_eq!((ready, errors), (1, 2));
+        assert!(!root.join("warm-started").exists());
+    }
+
+    /// Review finding (2026-10-13): one account's refused member login stops the batch, and only
+    /// that account is told its sign-in was refused. The others (one that got its session, one
+    /// still signing in) are told in words that never read as their own refusal: the window marks
+    /// a refused account as one that may need a one-time code. Other failures still reach every
+    /// account as they are (an update the W20 asked for starts every Play again).
+    #[test]
+    fn a_refused_sign_in_is_reported_as_refused_to_its_own_account_only() {
+        const REFUSED: &str = "Game loader error during startup: Native PlayOnline member login failed (state 39, POL result -1036). (Windower via crystal-loader).";
+        fn prepare_refused(job: BatchAccount, clicked: Instant) -> Result<Prepared, String> {
+            match job.key.as_str() {
+                "refused" => { std::thread::sleep(Duration::from_millis(40)); Err(REFUSED.into()) }
+                "slow" => { std::thread::sleep(Duration::from_millis(120)); Err("Timed out waiting for the account to finish signing in.".into()) }
+                _ => fixture_prepare(job, clicked),
+            }
+        }
+        crate::i18n::set(crate::i18n::Lang::En);
+        let root = root(); let mut ready = Vec::new(); let mut failed = std::collections::BTreeMap::new();
+        coordinate(vec![job(&root, "warm"), job(&root, "refused"), job(&root, "slow")], Instant::now(), prepare_refused, |e| match e {
+            BatchEvent::Ready(key, ..) => ready.push(key.clone()),
+            BatchEvent::Failed(key, error) => { failed.insert(key.clone(), error.clone()); }
+            _ => {}
+        });
+        fs::write(root.join("stop-fixture"), []).unwrap();
+        assert_eq!(ready, ["warm"]);
+        assert_eq!(failed.len(), 3);
+        assert_eq!(failed["refused"], REFUSED);
+        for key in ["warm", "slow"] {
+            assert_eq!(failed[key], "Another selected account's PlayOnline sign-in was refused, so FFXI was not started.");
+            assert!(!crate::launch_log::sign_in_refused(&failed[key]));
+        }
+        assert!(!root.join("warm-started").exists());
+        // Not a refusal: every account hears it as it is.
+        let update = format!("{} installed 30260904_1, official server 30260905_0. Open Downloads.", crate::patch::UPDATE_REQUIRED);
+        assert_eq!(others_failure(&update), update);
+        assert_eq!(others_failure("Missing game version."), "Missing game version.");
+        let older = "Game loader error during startup: Native PlayOnline login failed (state 39, POL result -1036).";
+        assert_eq!(others_failure(older), older);
+    }
+
+    #[test]
     fn ownership_blocks_overlap_and_controls_but_stale_owner_does_not() {
         let root = root(); let jobs = vec![job(&root, "warm"), job(&root, "cold")];
         let ownership = Ownership::acquire(&jobs).unwrap();
@@ -702,10 +852,10 @@ mod tests {
         }
         let path = record_path(&jobs[0].config, &jobs[0].account);
         save_record(&path, &Record { worker: Identity { created: 0, ..worker }, state: Event::Progress("old worker".into()),
-            social_only: true, authenticated: false, native_batch: false, launch_tool: None }).unwrap();
+            social_only: true, authenticated: false, native_batch: false, otp_used: Some(false), launch_tool: None }).unwrap();
         drop(Ownership::acquire(&jobs).expect("a dead worker's files cannot execute in the replacement session"));
         save_record(&path, &Record { worker, state: Event::Progress("live worker".into()),
-            social_only: true, authenticated: false, native_batch: false, launch_tool: None }).unwrap();
+            social_only: true, authenticated: false, native_batch: false, otp_used: Some(false), launch_tool: None }).unwrap();
         assert!(Ownership::acquire(&jobs).is_err(), "the live worker still owns its queued action");
         assert!(!batch_pending(&jobs[0].config, &jobs[0].account));
     }
@@ -717,7 +867,7 @@ mod tests {
             let path = record_path(&job.config, &job.account);
             let started = Event::Started(Started { pid: worker.pid, detail: "Existing worker".into(), log: root.join("fixture.log"), timing: String::new() });
             fs::create_dir_all(path.parent().unwrap()).unwrap();
-            save_record(&path, &Record { worker, state: if signing_in { Event::Progress("Still signing in".into()) } else { started.clone() }, social_only: true, authenticated: false, native_batch: false, launch_tool: None }).unwrap();
+            save_record(&path, &Record { worker, state: if signing_in { Event::Progress("Still signing in".into()) } else { started.clone() }, social_only: true, authenticated: false, native_batch: false, otp_used: Some(false), launch_tool: None }).unwrap();
             let mut snapshot = crate::friends::Snapshot { game_running: Some(false), ..Default::default() };
             snapshot.social.ready = true;
             publish_friends(path.parent().unwrap(), &snapshot).unwrap();
@@ -727,14 +877,16 @@ mod tests {
             }
             // A second process would reject the test executable's --session-worker;
             // reaching this injected version check proves exact-worker reconnect.
-            let prepared = prepare_with(job, Instant::now(), |_| Ok("Fixture version matches.".into())).unwrap();
-            assert_eq!(prepared.launch.pid, worker.pid); assert!(prepared.check.is_ok());
+            let mut prepared = prepare_with(job, Instant::now(), |_, _| Ok("Fixture version matches.".into())).unwrap();
+            assert!(prepared.version.is_some(), "the W20 waits for the batch");
+            verify(&mut prepared);
+            assert_eq!(prepared.launch.pid, worker.pid); assert!(prepared.check.is_ok() && prepared.version.is_none());
             assert!(!prepared.job.config.account_directory(&prepared.job.account).join("native-control.json").exists());
             update_record(&path, worker, |record| record.state = Event::Finished(None)).unwrap();
         }
     }
     #[test]
-    fn one_account_play_checks_on_typed_authentication_but_waits_for_all_native_services() {
+    fn one_account_play_checks_the_version_only_at_the_idle_main_menu() {
         type Signals = (mpsc::Sender<()>, mpsc::Receiver<Result<String, String>>, mpsc::Sender<()>);
         static SIGNALS: Mutex<Option<Signals>> = Mutex::new(None);
         static CHECKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -745,7 +897,7 @@ mod tests {
             let path = record_path(&job.config, &job.account);
             let directory = path.parent().unwrap().to_path_buf();
             fs::create_dir_all(&directory).unwrap();
-            save_record(&path, &Record { worker, state: Event::Progress("fixture locale-independent sign-in".into()), social_only: true, authenticated: false, native_batch: true, launch_tool: None }).unwrap();
+            save_record(&path, &Record { worker, state: Event::Progress("fixture locale-independent sign-in".into()), social_only: true, authenticated: false, native_batch: true, otp_used: Some(false), launch_tool: None }).unwrap();
             let (entered_tx, entered_rx) = mpsc::channel();
             let (verdict_tx, verdict_rx) = mpsc::channel();
             let (finished_tx, finished_rx) = mpsc::channel();
@@ -755,7 +907,7 @@ mod tests {
             let preparing = std::thread::spawn(move || {
                 let mut events = Vec::new();
                 coordinate(jobs, Instant::now(), |job, clicked| {
-                    let prepared = prepare_with(job, clicked, |_| {
+                    let prepared = prepare_with(job, clicked, |_, _| {
                         CHECKS.fetch_add(1, Ordering::SeqCst);
                         let (entered, verdict, finished) = SIGNALS.lock().unwrap().take().expect("one version request");
                         entered.send(()).unwrap();
@@ -768,29 +920,27 @@ mod tests {
                 }, |event| events.push(serde_json::to_string(event).unwrap()));
                 events
             });
-            assert!(matches!(entered_rx.recv_timeout(Duration::from_millis(30)), Err(mpsc::RecvTimeoutError::Timeout)),
-                "the version check must wait for typed authentication");
+            // pol-spec 07c §5.2: no W20 on authentication, at the bare idle report, or while a
+            // social request runs; only at the idle main menu (social.ready follows the publish).
+            let no_check = |why: &str| assert!(matches!(entered_rx.recv_timeout(Duration::from_millis(60)), Err(mpsc::RecvTimeoutError::Timeout)), "{why}");
+            no_check("the version check must wait for the main menu, not sign-in");
             publish_authenticated(&directory).unwrap();
-            entered_rx.recv_timeout(Duration::from_secs(10)).expect("check starts while native services remain pending");
-            assert!(matches!(read_record(&path).unwrap().state, Event::Progress(_)));
-            assert!(!directory.join("friends.json").exists());
-            verdict_tx.send(if refused { Err("fixture version refusal".into()) } else { Ok("Fixture version matches.".into()) }).unwrap();
-            finished_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-            assert!(!preparing.is_finished(), "the version result cannot replace full native idle");
-            assert!(!directory.join("native-batch.json").exists());
+            no_check("typed authentication starts no version check");
             let mut snapshot = crate::friends::Snapshot { game_running: Some(false), ..Default::default() };
             publish_friends(&directory, &snapshot).unwrap();
             update_record(&path, worker, |record| record.state = Event::Started(Started {
                 pid: worker.pid, detail: "Native startup services complete".into(), log: root.join("fixture.log"), timing: String::new(),
             })).unwrap();
-            std::thread::sleep(Duration::from_millis(30));
-            assert!(!preparing.is_finished(), "idle alone does not publish social readiness");
+            no_check("idle without social readiness is not the main menu");
             snapshot.social.ready = true; snapshot.social.busy = true;
             publish_friends(&directory, &snapshot).unwrap();
-            std::thread::sleep(Duration::from_millis(30));
-            assert!(!directory.join("native-batch.json").exists(), "a busy native owner cannot start");
+            no_check("a busy native owner is not idle");
             snapshot.social.busy = false;
             publish_friends(&directory, &snapshot).unwrap();
+            entered_rx.recv_timeout(Duration::from_secs(10)).expect("the check starts at the idle main menu");
+            assert!(!directory.join("native-batch.json").exists(), "no start before the check's verdict");
+            verdict_tx.send(if refused { Err("fixture version refusal".into()) } else { Ok("Fixture version matches.".into()) }).unwrap();
+            finished_rx.recv_timeout(Duration::from_secs(10)).unwrap();
             let events = preparing.join().unwrap();
             assert_eq!(events.iter().any(|event| event.contains("Failed")), refused);
             assert_eq!(events.iter().filter(|event| event.contains("Ready")).count(), 1);

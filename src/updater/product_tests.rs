@@ -90,7 +90,7 @@ fn prepared(product: Product, root: PathBuf, manifest: Manifest, data: &[u8]) ->
     }
     let seed = crate::patch::applied_seed_for(&root, product.title()).unwrap();
     PreparedUpdate { product, root, _lock: None, mode: Mode::Repair, report, manifest,
-        text: b"fixture manifest".to_vec(), planned, seed: Some(seed) }
+        text: b"fixture manifest".to_vec(), planned, seed: Some(seed), server: product.server().into(), full_scan: true }
 }
 
 #[tokio::test]
@@ -106,7 +106,7 @@ async fn one_operation_synchronizes_both_dll_targets_then_updates_the_game() {
     assert_eq!(stage_groups(Product::Viewer, &viewer.manifest, &viewer.planned).len(), 1);
     let game = prepared(Product::Ffxi, ffxi.clone(), Manifest { files: vec![history(Product::Ffxi, "game.dat", new)] }, new);
     let op = Operation::new(); op.begin_update();
-    let reports = execute(vec![viewer, game], &op).await.unwrap();
+    let reports = execute(vec![viewer, game], &op, true, ensure_idle).await.unwrap();
     assert_eq!(reports.len(), 2); assert!(reports.iter().all(|r| r.verified));
     assert_eq!(fs::read(pol.join(&stage.path)).unwrap(), fs::read(pol.join(&live.path)).unwrap());
     assert_eq!(fs::read(ffxi.join("game.dat")).unwrap(), new);
@@ -142,7 +142,7 @@ async fn second_component_failure_retains_verified_pol_and_does_not_finish_the_o
     let mut game = prepared(Product::Ffxi, ffxi.clone(), Manifest { files: vec![history(Product::Ffxi, "game.dat", new)] }, new);
     game.manifest.files.push(history(Product::Ffxi, "missing-final-file", new));
     let op = Operation::new(); op.begin_update();
-    assert!(execute(vec![viewer, game], &op).await.is_err());
+    assert!(execute(vec![viewer, game], &op, true, ensure_idle).await.is_err());
     assert_eq!(crate::patch::installed_for_request_for(&pol, "1000"), "20110829_E");
     assert_eq!(fs::read(pol.join("pol.exe")).unwrap(), new);
     assert!(!ffxi.join("patch.ver").exists()); assert!(!ffxi.join("game.dat").exists());

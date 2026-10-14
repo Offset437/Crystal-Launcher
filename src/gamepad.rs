@@ -6,9 +6,9 @@
 //! * `ffxi`: FFXI's `padmode000` / `padsin000` values, read from and written
 //!   to the Windows registry.
 //!
-//! Edits are pending until Apply; the first write backs up the originals.
+//! Edits save automatically; running clients reload through their scoped host.
 //! The design preview (`--preview-settings-controller`) fakes a controller
-//! from `XI_PREVIEW_PAD=xbox|dualsense|ds4|switch|generic|none` and never
+//! from `XI_PREVIEW_PAD=xbox|dualsense|ds4|ally|ally-x|switch|generic|none` and never
 //! writes anything.
 mod art;
 pub(crate) mod detect;
@@ -45,6 +45,15 @@ struct Notice {
     text: String,
 }
 
+#[derive(Default)]
+struct Saving {
+    revision: u64,
+    in_flight: Option<u64>,
+    live: Option<(u64, std::collections::BTreeMap<String, String>)>,
+    applying: Option<u64>,
+    persisted: bool,
+}
+
 pub(crate) struct State {
     preview: bool,
     pads: Vec<Pad>,
@@ -53,6 +62,7 @@ pub(crate) struct State {
     retail: Target,
     capture: Option<Row>,
     notice: Option<Notice>,
+    saving: Saving,
 }
 
 impl Default for State {
@@ -68,6 +78,7 @@ impl Default for State {
             retail: Target::from(ffxi::load_retail()),
             capture: None,
             notice: None,
+            saving: Saving::default(),
         }
     }
 }
@@ -94,6 +105,9 @@ impl State {
             pid: Some(pid),
             wireless: Some(wireless),
             battery: wireless.then_some(80),
+            battery_source: wireless.then_some(detect::BatterySource::Controller),
+            battery_state: detect::BatteryState::Discharging,
+            battery_level: None,
             rumble: true,
             input,
         };
@@ -103,6 +117,14 @@ impl State {
             "ds4" | "ps4" => vec![pad("Wireless Controller", 0x054C, 0x09CC, true)],
             "switch" => vec![pad("Pro Controller", 0x057E, 0x2009, true)],
             "generic" => vec![pad("USB Gamepad", 0x0079, 0x0006, false)],
+            "ally" | "rog-xbox-ally" | "ally-x" | "rog-xbox-ally-x" => {
+                let mut handheld = pad("ROG Xbox Ally", 0x045E, 0x028E, false);
+                handheld.family = if kind.to_ascii_lowercase().ends_with("-x") { Family::RogXboxAllyX } else { Family::RogXboxAlly };
+                handheld.name = handheld.family.label().into();
+                handheld.battery = Some(64);
+                handheld.battery_source = Some(detect::BatterySource::Handheld);
+                vec![handheld]
+            }
             _ => vec![pad("Xbox Wireless Controller", 0x045E, 0x0B13, true)],
         };
         let target = |source: &str| {
@@ -130,8 +152,17 @@ impl State {
             retail: target(r"HKLM\SOFTWARE\WOW6432Node\PlayOnlineUS\SquareEnix\FinalFantasyXI"),
             capture: std::env::var_os("XI_PREVIEW_CAPTURE").map(|_| Row::Single(4)),
             notice: None,
+            saving: Saving::default(),
         }
     }
+
+    pub(crate) fn take_live_update(&mut self) -> Option<(u64, std::collections::BTreeMap<String, String>)> {
+        if self.saving.applying.is_some() { return None; }
+        let update = self.saving.live.take()?;
+        self.saving.applying = Some(update.0);
+        Some(update)
+    }
+    pub(crate) fn take_persisted_change(&mut self) -> bool { std::mem::take(&mut self.saving.persisted) }
     fn pad(&self) -> Option<&Pad> {
         self.selected
             .and_then(|id| self.pads.iter().find(|p| p.id == id))
@@ -213,10 +244,14 @@ pub(crate) enum Msg {
     Reset,
     Discard,
     Apply,
+    SaveLater(u64),
+    Saved(u64, PadConfig, Result<String, String>),
+    LiveResult(u64, Result<String, String>),
     Rumble,
 }
 
-pub(crate) fn update(state: &mut State, msg: Msg) -> Task<Msg> {
+pub(crate) fn update(state: &mut State, msg: Msg, config: &crate::backend::Config) -> Task<Msg> {
+    let before = state.retail.edit.clone();
     match msg {
         Msg::Pads(pads) => {
             state.pads = pads;
@@ -264,21 +299,55 @@ pub(crate) fn update(state: &mut State, msg: Msg) -> Task<Msg> {
         }
         Msg::Apply => {
             state.capture = None;
-            let result = if state.preview {
-                Err(t("Design preview: nothing is written.").to_string())
-            } else {
-                let config = crate::backend::Config::default();
-                ffxi::save_retail(&config, &state.retail.edit)
-            };
-            if result.is_ok() {
-                let t = &mut state.retail;
-                t.saved = t.edit.clone();
-                t.found = true;
+            if !state.preview {
+                if state.retail.edit == state.retail.saved {
+                    state.saving.revision = state.saving.revision.wrapping_add(1);
+                    state.saving.live = Some((state.saving.revision, controller_values(&state.retail.edit)));
+                } else { return save_later(state.saving.revision); }
             }
-            state.notice = Some(match result {
-                Ok(text) => Notice { error: false, text },
-                Err(text) => Notice { error: true, text },
-            });
+        }
+        Msg::SaveLater(revision) => {
+            if state.preview || revision != state.saving.revision || state.saving.in_flight.is_some()
+                || state.retail.edit == state.retail.saved { return Task::none(); }
+            state.saving.in_flight = Some(revision);
+            let pad = state.retail.edit.clone();
+            let config = config.clone();
+            return Task::perform(async move {
+                let snapshot = pad.clone();
+                let result = tokio::task::spawn_blocking(move || ffxi::save_retail(&config, &snapshot)).await
+                    .unwrap_or_else(|_| Err(t("Could not save controller settings.").into()));
+                Msg::Saved(revision, pad, result)
+            }, |result| result);
+        }
+        Msg::Saved(revision, pad, result) => {
+            if state.saving.in_flight != Some(revision) { return Task::none(); }
+            state.saving.in_flight = None;
+            let failed = result.is_err();
+            match result {
+                Ok(_) => {
+                    state.retail.saved = pad;
+                    state.retail.found = true;
+                    state.saving.persisted = true;
+                    if revision == state.saving.revision {
+                        state.saving.live = Some((revision, controller_values(&state.retail.edit)));
+                        state.notice = Some(Notice { error: false, text: t("Saved. Applying to running games…").into() });
+                    }
+                }
+                Err(text) => state.notice = Some(Notice { error: true, text }),
+            }
+            if state.retail.edit != state.retail.saved && (!failed || revision != state.saving.revision) {
+                return save_later(state.saving.revision);
+            }
+        }
+        Msg::LiveResult(revision, result) => {
+            if state.saving.applying != Some(revision) { return Task::none(); }
+            state.saving.applying = None;
+            if revision == state.saving.revision && state.retail.edit == state.retail.saved {
+                state.notice = Some(match result {
+                    Ok(text) => Notice { error: false, text },
+                    Err(text) => Notice { error: true, text },
+                });
+            }
         }
         Msg::Rumble => {
             if let Some(p) = state.pad() {
@@ -286,7 +355,21 @@ pub(crate) fn update(state: &mut State, msg: Msg) -> Task<Msg> {
             }
         }
     }
+    if state.retail.edit != before {
+        state.saving.revision = state.saving.revision.wrapping_add(1);
+        state.saving.live = None;
+        state.notice = None;
+        if !state.preview && state.retail.edit != state.retail.saved { return save_later(state.saving.revision); }
+    }
     Task::none()
+}
+
+fn controller_values(pad: &PadConfig) -> std::collections::BTreeMap<String, String> {
+    pad.values().into_iter().map(|(name, value)| (name.to_owned(), value)).collect()
+}
+
+fn save_later(revision: u64) -> Task<Msg> {
+    Task::perform(async move { tokio::time::sleep(std::time::Duration::from_millis(200)).await; revision }, Msg::SaveLater)
 }
 
 fn watch() -> impl iced::futures::Stream<Item = Msg> {
@@ -561,7 +644,17 @@ fn device_bar<'a>(st: &'a State, c: Colors, light: bool, s: f32) -> Element<'a, 
             );
         }
     }
-    let status: Element<'a, Message> = if changes > 0 {
+    let status: Element<'a, Message> = if !st.preview {
+        let label = if changes > 0 && st.notice.as_ref().is_some_and(|notice| notice.error) { i18n::t("Controller settings could not be saved") }
+            else if st.saving.in_flight.is_some() || changes > 0 { i18n::t("Saving controller settings…") }
+            else { i18n::t("Controller settings save automatically") };
+        let mut status = row![text(label).font(BODY).size(12.5 * s).color(c.sub)].spacing(10.0 * s).align_y(Alignment::Center);
+        if st.notice.as_ref().is_some_and(|notice| notice.error) {
+            status = status.push(crate::controller_nav::button(text(i18n::t("Retry")).font(BODY).size(13.0 * s))
+                .padding([6.0 * s, 12.0 * s]).style(quiet).on_press(Message::Gamepad(Msg::Apply)));
+        }
+        status.into()
+    } else if changes > 0 {
         row![
             container(Space::new()).width(8.0 * s).height(8.0 * s).style(move |_| container::Style {
                 background: Some(c.accent.into()),
@@ -632,7 +725,7 @@ fn live_card<'a>(st: &'a State, c: Colors, light: bool, s: f32) -> Element<'a, M
         .opacity(if pad.is_some() { 1.0_f32 } else { 0.35 });
     let caption = match pad {
         Some(p) if p.family.is_playstation() => t("Press any button, move the sticks or pull L2/R2 to test it."),
-        Some(p) if p.family == Family::Xbox => t("Press any button, move the sticks or pull LT/RT to test it."),
+        Some(p) if p.family.is_xbox() => t("Press any button, move the sticks or pull LT/RT to test it."),
         Some(_) => t("Press any button or move the sticks to test it."),
         None => t("Waiting for a controller…"),
     };
@@ -840,7 +933,7 @@ fn options_card<'a>(st: &'a State, app: &'a App, c: Colors, s: f32) -> Element<'
     }
     if app.settings.launch_with == crate::ui::LaunchWith::Ashita {
         notes = notes.push(note(
-            i18n::t("Ashita applies padmode000/padsin000 from its boot configuration when set there; those take priority over these.").into(),
+            i18n::t("Ashita's boot controller settings take priority at launch. Changes here also apply to running games.").into(),
             c.sub,
         ));
     }
@@ -889,6 +982,10 @@ pub(crate) fn view(app: &App) -> Element<'_, Message> {
 mod tests {
     use super::*;
 
+    fn update(state: &mut State, message: Msg) -> Task<Msg> {
+        super::update(state, message, &crate::backend::Config::default())
+    }
+
     fn ps5_state(xinput: bool) -> State {
         let target = || {
             let mut config = PadConfig::default();
@@ -905,6 +1002,9 @@ mod tests {
                 pid: Some(0x0CE6),
                 wireless: Some(false),
                 battery: None,
+                battery_source: None,
+                battery_state: detect::BatteryState::Unknown,
+                battery_level: None,
                 rumble: false,
                 input: Input::default(),
             }],
@@ -913,7 +1013,85 @@ mod tests {
             retail: target(),
             capture: None,
             notice: None,
+            saving: Saving::default(),
         }
+    }
+
+    #[test]
+    fn rapid_edits_save_the_latest_snapshot_without_overlapping_writes() {
+        let mut state = ps5_state(false);
+        state.preview = false;
+        let background = !state.retail.edit.flag(Flag::Background);
+        let _ = update(&mut state, Msg::SetFlag(Flag::Background, background));
+        let first = state.saving.revision;
+        let first_pad = state.retail.edit.clone();
+        let _ = update(&mut state, Msg::SaveLater(first));
+        assert_eq!(state.saving.in_flight, Some(first));
+        let _ = update(&mut state, Msg::Clear(Row::Single(6)));
+        let latest = state.saving.revision;
+        assert_ne!(latest, first);
+        let _ = update(&mut state, Msg::SaveLater(latest));
+        assert_eq!(state.saving.in_flight, Some(first));
+        let _ = update(&mut state, Msg::Saved(first, first_pad, Ok("Saved".into())));
+        assert!(state.take_persisted_change());
+        assert!(state.take_live_update().is_none(), "an older disk snapshot must not be applied live");
+        let _ = update(&mut state, Msg::SaveLater(first));
+        assert!(state.saving.in_flight.is_none(), "a stale debounce must not start another write");
+        let snapshot = state.retail.edit.clone();
+        let _ = update(&mut state, Msg::SaveLater(latest));
+        let _ = update(&mut state, Msg::Saved(latest, snapshot.clone(), Ok("Saved".into())));
+        let (revision, values) = state.take_live_update().unwrap();
+        assert_eq!(revision, latest);
+        assert_eq!(values, controller_values(&snapshot));
+        assert_eq!(state.retail.saved, snapshot);
+    }
+
+    #[test]
+    fn live_updates_coalesce_and_a_stale_reply_does_not_replace_current_feedback() {
+        let mut state = ps5_state(false);
+        state.preview = false;
+        let _ = update(&mut state, Msg::Apply);
+        let (first, _) = state.take_live_update().unwrap();
+        let _ = update(&mut state, Msg::Clear(Row::Single(6)));
+        let latest = state.saving.revision;
+        let snapshot = state.retail.edit.clone();
+        let _ = update(&mut state, Msg::SaveLater(latest));
+        let _ = update(&mut state, Msg::Saved(latest, snapshot, Ok("Saved".into())));
+        assert!(state.take_live_update().is_none(), "one confirmation wait per launcher");
+        let _ = update(&mut state, Msg::LiveResult(first, Err("old failure".into())));
+        assert!(!state.notice.as_ref().unwrap().error);
+        assert_eq!(state.take_live_update().unwrap().0, latest);
+        let _ = update(&mut state, Msg::LiveResult(first, Err("old failure".into())));
+        assert_eq!(state.saving.applying, Some(latest));
+        let _ = update(&mut state, Msg::LiveResult(latest, Ok("Applied".into())));
+        assert_eq!(state.notice.as_ref().unwrap().text, "Applied");
+        assert!(state.saving.applying.is_none());
+    }
+
+    #[test]
+    fn failed_saves_keep_edits_for_retry_and_battery_refreshes_do_not_save() {
+        let mut state = ps5_state(false);
+        state.preview = false;
+        let mut pads = state.pads.clone();
+        pads[0].battery = Some(55);
+        let _ = update(&mut state, Msg::Pads(pads));
+        assert_eq!(state.saving.revision, 0);
+        assert!(state.take_live_update().is_none());
+        let before = state.retail.saved.clone();
+        let _ = update(&mut state, Msg::Clear(Row::Single(6)));
+        let revision = state.saving.revision;
+        let snapshot = state.retail.edit.clone();
+        let _ = update(&mut state, Msg::SaveLater(revision));
+        let _ = update(&mut state, Msg::Saved(revision, snapshot.clone(), Err("Access denied".into())));
+        assert_eq!(state.retail.saved, before);
+        assert_eq!(state.retail.edit, snapshot);
+        assert!(state.saving.in_flight.is_none());
+        assert!(state.notice.as_ref().unwrap().error);
+        assert!(!state.take_persisted_change());
+        assert!(state.take_live_update().is_none());
+        let _ = update(&mut state, Msg::Apply);
+        let _ = update(&mut state, Msg::SaveLater(revision));
+        assert_eq!(state.saving.in_flight, Some(revision));
     }
 
     fn press(state: &mut State, buttons: u32) {

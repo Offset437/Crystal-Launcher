@@ -3,13 +3,16 @@
 //! that exact thread/event pair. Its base destructor then joins that already
 //! joined thread again and throws from cleanup. Wake before the first join and
 //! skip only an empty thread at these two calls. POL services stay unchanged.
+//! Hook.dll 4.7.9.6 no longer has that worker in the renderer; its stock code
+//! already wakes before its one join, so that exact build is left unpatched.
 
-use std::{ffi::c_void, sync::OnceLock};
+use std::{ffi::c_void, os::windows::ffi::OsStringExt, sync::OnceLock};
 use windows_sys::Win32::{
     Foundation::{FreeLibrary, HMODULE, WAIT_TIMEOUT},
+    Security::Cryptography::{BCryptHash, BCRYPT_SHA256_ALG_HANDLE},
     System::{
         Diagnostics::Debug::{FlushInstructionCache, ReadProcessMemory},
-        LibraryLoader::GetModuleHandleExW,
+        LibraryLoader::{GetModuleFileNameW, GetModuleHandleExW},
         Memory::{VirtualProtect, PAGE_EXECUTE_READWRITE},
         Threading::{
             GetCurrentProcess, GetCurrentProcessId, GetProcessIdOfThread, GetThreadId, SetEvent,
@@ -18,6 +21,8 @@ use windows_sys::Win32::{
     },
 };
 
+// The patched build, linked 2026-10-03 15:42:28 UTC. Its file is no longer
+// installed here, so it stays keyed by PE identity plus the byte checks below.
 const TIMESTAMP: u32 = 0x6AC1_2264;
 const IMAGE_SIZE: u32 = 0x0023_1000;
 const JOIN_RVA: usize = 0x35B00;
@@ -39,6 +44,81 @@ const WAIT_STOP: [u8; 11] = [0x8B, 0x03, 0x80, 0xB8, 0x48, 0x42, 0, 0, 0, 0x74, 
 const JOIN_ENTRY: [u8; 11] = [
     0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF8, 0x56, 0x57, 0x8B, 0xF9, 0x83,
 ];
+
+// Hook.dll 4.7.9.6, linked 2026-10-06 13:00:13 UTC, 1,790,976 bytes, preferred
+// base 0x10000000 with DYNAMIC_BASE. Its core object has 4.7.9.3's layout again
+// (same code and offsets at 3DC2C..3E2F4 and 44934): the member worker is gone.
+// - 35B00 is still std::thread::join (JOIN_ENTRY). Its only rel32 callers are
+//   44934, a console command stopping its own thread at core +0x2DBC, and
+//   6EB5C below. The only other _Thrd_join (B0170) call, 36C88, is inlined in
+//   36C40 after it clears byte 101CDE3C and SetEvent(101CDE38).
+// - The queue worker is global: auto-reset CreateEventA(0,0,0,0) -> 101CDDD0
+//   (2EDF0), std::thread 101CDDC8 on routine 6CE00 (2EE10). 6D00A waits
+//   INFINITE on that event, then leaves when byte 101A13C4 is clear: the old
+//   WAIT_ARGUMENT/WAIT_STOP pair at 50C48/50C58, moved out of the object.
+// - Its owner's destructor (6EB00) clears 101A13C4, SetEvent(101CDDD0), then
+//   joins 101CDDC8 once at 6EB5C: the wake the patched build lacked.
+// - Derived teardown 5F412 (old 60459) sets the base stop byte (derived
+//   +0x4238 = base +0x4200) and joins nothing. The base destructor 3E2DB (old
+//   3E3CB) destroys +0x2DC8 and calls std::terminate (3E5E7 -> B7F59) only if
+//   the command thread is still joinable: no second join to guard.
+const V4796_SHA256: &str = "c32826605356777a8fb9507c1b238b5ede4da6cb3ef6f491424891db864a8cb5";
+const V4796_TIMESTAMP: u32 = 0x6AC4_F0DD;
+const V4796_IMAGE_SIZE: u32 = 0x0023_0000;
+const PREFERRED_BASE: u32 = 0x1000_0000;
+/// (RVA, code, offsets of absolute operands rebased with the image).
+const V4796_STOCK_WAKE: [(usize, &str, &[usize]); 8] = [
+    (
+        0x2EDF0,
+        "6a006a006a006a00ff15cc101410a3d0dd1c10c3",
+        &[10, 15],
+    ),
+    (0x2EE10, "6800ce0610b9c8dd1c10e821820000", &[1, 6]),
+    (0x35B00, "558bec83e4f856578bf983", &[]),
+    (
+        0x6D00A,
+        "6affff35d0dd1c10ff15c4101410803dc4131a1000740b",
+        &[4, 10, 16],
+    ),
+    (
+        0x6EB3D,
+        "ff35d0dd1c10c74608785a1810c605c4131a1000ff15c8101410b9c8dd1c10e89f6ffcff",
+        &[2, 9, 15, 22, 27],
+    ),
+    (
+        0x5F412,
+        "c6875d420000008b473cc687b22d000000c7473c0000000085c0740b6a2450e84a46050083c408\
+         c687384200000180bf5c42000000741e",
+        &[],
+    ),
+    (
+        0x3E2DB,
+        "8d8ec82d0000c6860042000001e813ffffff83bec02d0000000f85ed020000",
+        &[],
+    ),
+    (0x3E5E7, "e86d990700", &[]),
+];
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Build {
+    /// The 2026-10-03 build: wake the first join, guard the second.
+    Patch,
+    /// 4.7.9.6: the stock code already wakes its worker; write nothing.
+    Stock,
+}
+
+/// Recognised builds. A SHA-pinned build is hashed only after its PE identity
+/// matches; anything else is refused without reading the file.
+const PINS: [(u32, u32, Option<&str>, Build); 2] = [
+    (TIMESTAMP, IMAGE_SIZE, None, Build::Patch),
+    (
+        V4796_TIMESTAMP,
+        V4796_IMAGE_SIZE,
+        Some(V4796_SHA256),
+        Build::Stock,
+    ),
+];
+
 type Join = unsafe extern "thiscall" fn(*mut c_void);
 static ORIGINAL_JOIN: OnceLock<Join> = OnceLock::new();
 
@@ -58,19 +138,109 @@ fn read<T: Copy>(address: usize) -> Option<T> {
     (ok != 0 && bytes == std::mem::size_of::<T>()).then(|| unsafe { value.assume_init() })
 }
 
-fn verified_image(base: usize) -> bool {
-    let Some(nt) = read::<u32>(base + 0x3C)
-        .filter(|offset| *offset < 0x1000)
-        .and_then(|offset| base.checked_add(offset as usize))
-    else {
-        return false;
+fn read_bytes(address: usize, length: usize) -> Option<Vec<u8>> {
+    let mut value = vec![0; length];
+    let mut bytes = 0;
+    let ok = unsafe {
+        ReadProcessMemory(
+            GetCurrentProcess(),
+            address as *const c_void,
+            value.as_mut_ptr().cast(),
+            length,
+            &mut bytes,
+        )
     };
-    read::<u16>(base) == Some(0x5A4D)
+    (ok != 0 && bytes == length).then_some(value)
+}
+
+fn hex_bytes(hex: &str) -> Vec<u8> {
+    let digit = |b: u8| (b as char).to_digit(16).expect("hex constant") as u8;
+    hex.as_bytes()
+        .chunks_exact(2)
+        .map(|pair| digit(pair[0]) << 4 | digit(pair[1]))
+        .collect()
+}
+
+/// An x86 PE image's link timestamp and SizeOfImage.
+fn pe_identity(base: usize) -> Option<(u32, u32)> {
+    let nt = read::<u32>(base + 0x3C)
+        .filter(|offset| *offset < 0x1000)
+        .and_then(|offset| base.checked_add(offset as usize))?;
+    (read::<u16>(base) == Some(0x5A4D)
         && read::<u32>(nt) == Some(0x4550)
-        && read::<u16>(nt + 4) == Some(0x014C)
-        && read::<u32>(nt + 8) == Some(TIMESTAMP)
-        && read::<u32>(nt + 24 + 56) == Some(IMAGE_SIZE)
-        && read::<[u8; 18]>(base + 0x60459) == Some(SHUTDOWN)
+        && read::<u16>(nt + 4) == Some(0x014C))
+    .then_some((read::<u32>(nt + 8)?, read::<u32>(nt + 24 + 56)?))
+}
+
+fn pinned(
+    timestamp: u32,
+    image_size: u32,
+    sha256: impl FnOnce() -> Option<String>,
+) -> Option<Build> {
+    let &(_, _, pin, build) = PINS
+        .iter()
+        .find(|pin| (pin.0, pin.1) == (timestamp, image_size))?;
+    match pin {
+        None => Some(build),
+        Some(expected) => (sha256()? == expected).then_some(build),
+    }
+}
+
+fn sha256(bytes: &[u8]) -> Option<String> {
+    let mut digest = [0u8; 32];
+    let length = u32::try_from(bytes.len()).ok()?;
+    let status = unsafe {
+        BCryptHash(
+            BCRYPT_SHA256_ALG_HANDLE,
+            std::ptr::null(),
+            0,
+            bytes.as_ptr(),
+            length,
+            digest.as_mut_ptr(),
+            32,
+        )
+    };
+    (status == 0).then(|| digest.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+/// The file the module was mapped from (~2 ms for 1.7 MiB). The byte checks
+/// still verify the loaded image itself.
+fn module_sha256(module: HMODULE) -> Option<String> {
+    let mut path = vec![0u16; 32_768];
+    let length = unsafe { GetModuleFileNameW(module, path.as_mut_ptr(), path.len() as u32) };
+    let length = (length as usize).min(path.len());
+    if length == 0 || length == path.len() {
+        return None;
+    }
+    sha256(&std::fs::read(std::ffi::OsString::from_wide(&path[..length])).ok()?)
+}
+
+fn identify(module: HMODULE) -> Option<Build> {
+    let base = module as usize;
+    let (timestamp, image_size) = pe_identity(base)?;
+    match pinned(timestamp, image_size, || module_sha256(module))? {
+        Build::Patch => patch_layout(base).then_some(Build::Patch),
+        Build::Stock => {
+            stock_wake(base, (base as u32).wrapping_sub(PREFERRED_BASE)).then_some(Build::Stock)
+        }
+    }
+}
+
+/// `delta` is the image's load base minus its preferred base.
+fn stock_wake(base: usize, delta: u32) -> bool {
+    V4796_STOCK_WAKE.iter().all(|&(rva, code, absolute)| {
+        let mut expected = hex_bytes(code);
+        for &offset in absolute {
+            let operand = u32::from_le_bytes(expected[offset..offset + 4].try_into().unwrap());
+            expected[offset..offset + 4]
+                .copy_from_slice(&operand.wrapping_add(delta).to_le_bytes());
+        }
+        read_bytes(base + rva, expected.len()) == Some(expected)
+    })
+}
+
+fn patch_layout(base: usize) -> bool {
+    read::<[u8; 18]>(base + 0x60459) == Some(SHUTDOWN)
         && read::<[u8; 18]>(base + 0x3E3CB) == Some(BASE_SHUTDOWN)
         && read::<[u8; 12]>(base + 0x50C48) == Some(WAIT_ARGUMENT)
         && read::<[u8; 11]>(base + 0x50C58) == Some(WAIT_STOP)
@@ -224,9 +394,16 @@ impl Wakeup {
         }
         let module = Module(module);
         let base = module.0 as usize;
-        if !verified_image(base) {
-            log!("note: Windower renderer wake-up skipped: unsupported Hook.dll layout");
-            return None;
+        match identify(module.0) {
+            Some(Build::Patch) => {}
+            Some(Build::Stock) => {
+                log!("stage: Windower Hook.dll 4.7.9.6 wakes its own worker; renderer wake-up not needed");
+                return None;
+            }
+            None => {
+                log!("note: Windower renderer wake-up skipped: unsupported Hook.dll layout");
+                return None;
+            }
         }
         let join: Join = unsafe { std::mem::transmute(base + JOIN_RVA) };
         if ORIGINAL_JOIN.set(join).is_err() {
@@ -421,6 +598,128 @@ mod tests {
         // A changed call site must be left alone, rather than overwriting it.
         assert!(write_call(site, replacement, original).is_err());
         assert_eq!(read::<[u8; 5]>(site), Some(original));
+    }
+
+    #[test]
+    fn hook_builds_are_pinned_and_an_unknown_sha_is_refused() {
+        let unhashed = || -> Option<String> { panic!("only a SHA-pinned PE identity is hashed") };
+        assert_eq!(pinned(TIMESTAMP, IMAGE_SIZE, unhashed), Some(Build::Patch));
+        let stock = || Some(V4796_SHA256.to_owned());
+        assert_eq!(
+            pinned(V4796_TIMESTAMP, V4796_IMAGE_SIZE, stock),
+            Some(Build::Stock)
+        );
+        let other = || Some(format!("00{}", &V4796_SHA256[2..]));
+        assert_eq!(pinned(V4796_TIMESTAMP, V4796_IMAGE_SIZE, other), None);
+        assert_eq!(pinned(V4796_TIMESTAMP, V4796_IMAGE_SIZE, || None), None);
+        // 4.7.9.3 (linked 2026-07-18) and mixed identities: refused unhashed.
+        assert_eq!(pinned(0x6A5B_1A74, V4796_IMAGE_SIZE, unhashed), None);
+        assert_eq!(pinned(V4796_TIMESTAMP, IMAGE_SIZE, unhashed), None);
+        assert_eq!(
+            (V4796_TIMESTAMP, V4796_IMAGE_SIZE),
+            (0x6AC4_F0DD, 0x0023_0000)
+        );
+        assert_eq!(
+            V4796_SHA256,
+            "c32826605356777a8fb9507c1b238b5ede4da6cb3ef6f491424891db864a8cb5"
+        );
+    }
+
+    #[test]
+    fn sha256_is_the_standard_digest() {
+        assert_eq!(
+            sha256(b"abc").as_deref(),
+            Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        );
+        // The module path route, on this test executable's own image.
+        let module = unsafe {
+            windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(std::ptr::null())
+        };
+        let file = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+        assert_eq!(module_sha256(module), sha256(&file));
+        assert!(module_sha256(module).is_some());
+    }
+
+    /// A synthetic 4.7.9.6 image holding only the pinned code, loaded `delta`
+    /// bytes above its preferred base.
+    fn stock_image(delta: u32) -> Vec<u8> {
+        let mut image = vec![0xCC; V4796_IMAGE_SIZE as usize];
+        for &(rva, code, absolute) in &V4796_STOCK_WAKE {
+            let mut code = hex_bytes(code);
+            for &offset in absolute {
+                let value = u32::from_le_bytes(code[offset..offset + 4].try_into().unwrap());
+                assert!((PREFERRED_BASE..PREFERRED_BASE + V4796_IMAGE_SIZE).contains(&value));
+                code[offset..offset + 4].copy_from_slice(&(value + delta).to_le_bytes());
+            }
+            image[rva..rva + code.len()].copy_from_slice(&code);
+        }
+        image
+    }
+
+    #[test]
+    fn v4796_stock_wake_is_verified_byte_for_byte_after_rebasing() {
+        let delta = 0x0123_0000;
+        let mut image = stock_image(delta);
+        let base = image.as_ptr() as usize;
+        assert!(stock_wake(base, delta));
+        assert!(
+            !stock_wake(base, 0),
+            "absolute operands follow the load base"
+        );
+        assert!(!patch_layout(base), "the old patch sites are absent");
+        for &(rva, code, _) in &V4796_STOCK_WAKE {
+            for index in [rva, rva + code.len() / 2 - 1] {
+                image[index] ^= 0xFF;
+                assert!(!stock_wake(image.as_ptr() as usize, delta), "{index:#x}");
+                image[index] ^= 0xFF;
+            }
+        }
+    }
+
+    #[test]
+    fn v4796_stock_calls_reach_the_verified_join_and_terminate() {
+        let call = |rva: usize, at: usize| {
+            let (_, code, _) = V4796_STOCK_WAKE.iter().find(|site| site.0 == rva).unwrap();
+            let code = hex_bytes(code);
+            assert_eq!(code[at], 0xE8);
+            let displacement = i32::from_le_bytes(code[at + 1..at + 5].try_into().unwrap());
+            (rva + at + 5).wrapping_add(displacement as usize)
+        };
+        assert_eq!(hex_bytes(V4796_STOCK_WAKE[2].1), JOIN_ENTRY);
+        assert_eq!(call(0x6EB3D, 31), JOIN_RVA, "the one join, after SetEvent");
+        assert_eq!(call(0x2EE10, 10), 0x37040, "std::thread constructor");
+        assert_eq!(
+            call(0x3E2DB, 13),
+            0x3E200,
+            "a stream destructor, not a join"
+        );
+        assert_eq!(call(0x3E5E7, 0), 0xB7F59, "std::terminate");
+    }
+
+    #[test]
+    #[ignore = "Reads the installed Windower Hook.dll as data; nothing is loaded or run"]
+    fn installed_hook_4796_matches_the_pinned_stock_wake() {
+        let path = std::env::var_os("CRYSTAL_HOOK_DLL")
+            .unwrap_or_else(|| r"C:\Games\Final Fantasy XI Programs\Windower 4\Hook.dll".into());
+        let file = std::fs::read(path).expect("installed Hook.dll");
+        assert_eq!(sha256(&file).as_deref(), Some(V4796_SHA256));
+        let word = |at: usize| u16::from_le_bytes(file[at..at + 2].try_into().unwrap()) as usize;
+        let dword = |at: usize| u32::from_le_bytes(file[at..at + 4].try_into().unwrap()) as usize;
+        // Map headers and sections at their RVAs, unrelocated (delta 0).
+        let nt = dword(0x3C);
+        let mut image = vec![0; dword(nt + 24 + 56)];
+        let headers = dword(nt + 24 + 60);
+        image[..headers].copy_from_slice(&file[..headers]);
+        for index in 0..word(nt + 6) {
+            let header = nt + 24 + word(nt + 20) + index * 40;
+            let (rva, size, raw) = (dword(header + 12), dword(header + 16), dword(header + 20));
+            let size = size.min(image.len() - rva);
+            image[rva..rva + size].copy_from_slice(&file[raw..raw + size]);
+        }
+        let base = image.as_ptr() as usize;
+        assert_eq!(pe_identity(base), Some((V4796_TIMESTAMP, V4796_IMAGE_SIZE)));
+        assert!(stock_wake(base, 0));
+        assert!(!patch_layout(base));
     }
 
     #[test]

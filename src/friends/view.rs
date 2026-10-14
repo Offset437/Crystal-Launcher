@@ -409,12 +409,7 @@ fn sidebar<'a>(x: &Ctx<'a>, snapshot: &'a Snapshot) -> El<'a> {
         me = me.push(container(extra).padding([4, 4]));
     }
 
-    let search = text_input(t("Find a friend…"), &state.query)
-        .on_input(Message::FriendsQuery)
-        .font(BODY)
-        .size(13)
-        .padding([8, 12])
-        .style(ui::input);
+    let search = friend_query_field(&state.query);
 
     let (friends, _) = super::split_lists(&snapshot.entries, &state.query);
     let (online, offline): (Vec<&Friend>, Vec<&Friend>) = friends.into_iter().partition(|f| f.online == Some(true));
@@ -1012,44 +1007,14 @@ fn in_game_notice<'a>(x: &Ctx<'a>) -> El<'a> {
 }
 
 fn composer_view<'a>(x: &Ctx<'a>, composer: &'a Composer) -> El<'a> {
-    use iced::keyboard::{key::Named, Key};
     let c = x.c;
     let state = &x.app.friends;
     let sending = state.outgoing.as_ref().is_some_and(|o| !o.sent);
     let can_send = x.ready && !sending && state.send_request().is_some();
     let editable = !x.busy;
     let hide = privacy::on();
-    let editor = text_editor(&composer.text)
-        .placeholder(t("Write a PlayOnline message…"))
-        .size(14)
-        .padding([10, 12])
-        // Grows with its lines up to six, then scrolls inside.
-        .height(19.0 * composer.text.line_count().clamp(1, 6) as f32 + 22.0)
-        .key_binding(move |press| {
-            if matches!(press.key, Key::Named(Named::Enter)) && !press.modifiers.shift() {
-                return can_send.then_some(text_editor::Binding::Custom(Message::FriendsSend));
-            }
-            text_editor::Binding::from_key_press(press)
-        })
-        .style(move |_, _| text_editor::Style {
-            background: Color::TRANSPARENT.into(),
-            border: Border::default(),
-            placeholder: with_alpha(c.sub, 0.8),
-            // Privacy mode draws the draft blurred over a hidden one.
-            value: if hide { Color::TRANSPARENT } else { c.ink },
-            selection: with_alpha(c.accent, 0.3),
-        });
-    let editor = if editable { editor.on_action(Message::FriendsMessageEdit) } else { editor };
     let draft = composer.text.text();
-    let field: El<'a> = if hide && !draft.trim().is_empty() {
-        stack![
-            editor,
-            container(privacy::name(text(draft.clone()).font(BODY).size(14).color(c.ink), &draft, 14.0, c.ink)).padding([10, 12]).width(Length::Fill)
-        ]
-        .into()
-    } else {
-        editor.into()
-    };
+    let field = composer_field(&composer.text, c, editable, can_send);
     let send = hint(
         crate::controller_nav::button(container(icon(Icon::Send, 16.0, if can_send { c.play_text } else { with_alpha(c.sub, 0.6) })).center(34))
             .padding(0)
@@ -1068,19 +1033,15 @@ fn composer_view<'a>(x: &Ctx<'a>, composer: &'a Composer) -> El<'a> {
         });
     let mut column = column![].spacing(8);
     if composer.show_subject {
-        let subject = text_input(t("Subject (optional)"), &composer.subject)
-            .secure(hide)
-            .font(BODY)
-            .size(13)
-            .padding([8, 12])
-            .style(ui::input);
-        column = column.push(if editable { subject.on_input(Message::FriendsSubject) } else { subject });
+        column = column.push(subject_field(&composer.subject, editable));
     }
     column = column.push(shell);
     // Under the box: the subject switch, then the keys or the limits.
     let text_len = super::cp932_len(draft.trim_end_matches('\n'));
     let subject_len = super::cp932_len(&composer.subject);
-    let note: El<'a> = match (text_len, subject_len) {
+    let note: El<'a> = if hide {
+        text(t("Privacy mode")).font(BODY).size(11).color(with_alpha(c.sub, 0.85)).into()
+    } else { match (text_len, subject_len) {
         (None, _) | (_, None) if composer.show_subject || text_len.is_none() => {
             text(t("Contains characters PlayOnline can't send.")).font(BODY).size(11).color(dl_danger(c)).into()
         }
@@ -1095,13 +1056,111 @@ fn composer_view<'a>(x: &Ctx<'a>, composer: &'a Composer) -> El<'a> {
             .color(dl_danger(c))
             .into(),
         _ => text(t("Enter to send · Shift+Enter for a new line")).font(BODY).size(11).color(with_alpha(c.sub, 0.85)).into(),
-    };
+    } };
     let toggle = crate::controller_nav::button(text(if composer.show_subject { t("Remove subject") } else { t("Add subject") }).font(SEMI).size(12).color(c.accent))
         .padding(0)
         .style(|_, _| button::Style::default())
-        .on_press_maybe(editable.then_some(Message::FriendsAddSubject(!composer.show_subject)));
+        .on_press_maybe((editable && !hide).then_some(Message::FriendsAddSubject(!composer.show_subject)));
     column = column.push(row![toggle, Space::new().width(Length::Fill), note].align_y(Alignment::Center).padding([0, 4]));
     container(column).padding([12, 16]).into()
+}
+
+fn friend_query_field<'a>(value: &str) -> El<'a> {
+    text_input(t("Find a friend…"), &privacy::mask(value))
+        .on_input_maybe((!privacy::on()).then_some(Message::FriendsQuery))
+        .font(BODY).size(13).padding([8, 12]).style(ui::input).into()
+}
+
+fn composer_field<'a>(content: &'a text_editor::Content, c: Colors, editable: bool, can_send: bool) -> El<'a> {
+    if privacy::on() {
+        // Do not create an editor for the real content: it would retain its
+        // selection geometry and clipboard bindings beneath the placeholder.
+        return container(privacy::name(text("••••••••").font(BODY).size(14).color(c.ink), "", 14.0, c.ink))
+            .padding([10, 12]).width(Length::Fill).height(41).into();
+    }
+    use iced::keyboard::{key::Named, Key};
+    let editor = text_editor(content)
+        .placeholder(t("Write a PlayOnline message…"))
+        .size(14).padding([10, 12])
+        .height(19.0 * content.line_count().clamp(1, 6) as f32 + 22.0)
+        .key_binding(move |press| {
+            if matches!(press.key, Key::Named(Named::Enter)) && !press.modifiers.shift() {
+                return can_send.then_some(text_editor::Binding::Custom(Message::FriendsSend));
+            }
+            text_editor::Binding::from_key_press(press)
+        })
+        .style(move |_, _| text_editor::Style {
+            background: Color::TRANSPARENT.into(), border: Border::default(),
+            placeholder: with_alpha(c.sub, 0.8), value: c.ink, selection: with_alpha(c.accent, 0.3),
+        });
+    if editable { editor.on_action(Message::FriendsMessageEdit).into() } else { editor.into() }
+}
+
+fn subject_field<'a>(value: &str, editable: bool) -> El<'a> {
+    text_input(t("Subject (optional)"), &privacy::mask(value))
+        .font(BODY)
+        .size(13)
+        .padding([8, 12])
+        .style(ui::input)
+        .on_input_maybe((editable && !privacy::on()).then_some(Message::FriendsSubject))
+        .into()
+}
+
+#[cfg(test)]
+mod privacy_subject_tests {
+    use super::*;
+
+    #[test]
+    fn private_friend_queries_have_fixed_masks_and_disable_typing() {
+        privacy::set(true);
+        let mut expected = None;
+        for value in ["Al", "An exceptionally long friend name", "アリスドラゴン", "e\u{301}🐉"] {
+            let texts = privacy::testing::text_bounds(friend_query_field(value), iced::Size::new(500.0, 200.0));
+            assert_eq!(texts[0].0, "••••••••");
+            if let Some(expected) = &expected { assert_eq!(&texts, expected); } else { expected = Some(texts); }
+            assert!(privacy::testing::type_text(friend_query_field(value), "X").is_empty());
+        }
+        privacy::set(false);
+        let messages = privacy::testing::type_text(friend_query_field("Al"), "X");
+        assert!(matches!(messages.as_slice(), [Message::FriendsQuery(value)] if value == "AlX"));
+    }
+
+    #[test]
+    fn private_mail_drafts_use_fixed_noneditable_widgets_and_keep_the_real_content() {
+        privacy::set(true);
+        let mut expected = None;
+        for draft in ["", "Al", "An exceptionally long mail draft", "アリスドラゴン", "e\u{301}🐉", "One\nTwo\nThree\nFour\nFive\nSix\nSeven"] {
+            let content = text_editor::Content::with_text(draft);
+            let original = content.text();
+            let build = || composer_field(&content, colors(false), true, true);
+            assert_eq!(build().as_widget().size().height, Length::Fixed(41.0));
+            let texts = privacy::testing::text_bounds(build(), iced::Size::new(500.0, 200.0));
+            assert_eq!(texts[0].0, "▒▒▒▒▒▒▒▒");
+            if let Some(expected) = &expected { assert_eq!(&texts, expected); } else { expected = Some(texts); }
+            assert!(privacy::testing::type_text(build(), "X").is_empty());
+            assert_eq!(content.text(), original);
+        }
+        privacy::set(false);
+        let content = text_editor::Content::with_text("Original draft");
+        let messages = privacy::testing::type_text(composer_field(&content, colors(false), true, true), "X");
+        assert!(matches!(messages.as_slice(), [Message::FriendsMessageEdit(_)]));
+    }
+
+    #[test]
+    fn private_subjects_use_one_mask_and_never_edit_the_mail_draft() {
+        privacy::set(true);
+        let mut expected = None;
+        for value in ["Al", "An exceptionally long mail subject", "アリスドラゴン", "e\u{301}🐉"] {
+            let texts = privacy::testing::text_bounds(subject_field(value, true), iced::Size::new(500.0, 200.0));
+            assert_eq!(texts[0].0, "••••••••");
+            if let Some(expected) = &expected { assert_eq!(&texts, expected); } else { expected = Some(texts); }
+            assert!(privacy::testing::type_text(subject_field(value, true), "X").is_empty());
+        }
+        privacy::set(false);
+        let messages = privacy::testing::type_text(subject_field("Original subject", true), "X");
+        assert!(matches!(messages.as_slice(), [Message::FriendsSubject(value)] if value == "Original subjectX"));
+        assert!(privacy::testing::type_text(subject_field("Original subject", false), "X").is_empty());
+    }
 }
 
 // ---- Mailbox and block list --------------------------------------------------------

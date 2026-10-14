@@ -10,6 +10,7 @@
 
 mod ffxi_settings;
 mod native_auth;
+pub(crate) mod park;
 pub(crate) mod pipe;
 pub(crate) mod profile_access;
 pub(crate) mod tools;
@@ -69,6 +70,15 @@ pub(crate) struct Plan {
     pub auto_away_minutes: u8,
     #[serde(default)]
     pub auto_login: AutoLogin,
+    /// A pre-sign-in (sign in when Crystal opens, or the explicit sign-in): the loader
+    /// restores the Viewer's UI pauses, which cost nothing at Play (pol-spec 07c §4).
+    /// Only with `social_only`; a batch's own sign-in is a cold Play and never sets it.
+    #[serde(default)]
+    pub viewer_gaps: bool,
+    /// What started this launch, for the launch log's trigger line (pol-spec 07d §4.2).
+    /// Older window processes send none: `Play`.
+    #[serde(default)]
+    pub trigger: crate::launch_timing::LaunchTrigger,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -106,6 +116,12 @@ struct Timeouts {
     /// Windower exits once the game window exists; the launch log notes when, if within this
     /// long after the hello. Nothing waits for it.
     injector_exit: Duration,
+    /// A park closed by the window while it starts (park::park): set, the start stops before
+    /// spawning the tool or, once spawned, stops it through its injector (Windower first).
+    abort: Option<&'static AtomicBool>,
+}
+impl Timeouts {
+    fn aborted(&self) -> bool { self.abort.is_some_and(|abort| abort.load(Ordering::Acquire)) }
 }
 
 const TIMEOUTS: Timeouts = Timeouts {
@@ -114,6 +130,7 @@ const TIMEOUTS: Timeouts = Timeouts {
     send: Duration::from_secs(10),
     start: Duration::from_secs(120),
     injector_exit: Duration::from_secs(30),
+    abort: None,
 };
 
 /// What the launcher needs from a finished retail sign-in: the contract's `session` line and
@@ -133,12 +150,17 @@ pub(crate) trait SignedIn: Send + Sync + 'static {
     fn native_session_state(&self, _game: bool) -> Result<(), String> { Ok(()) }
     fn native_own_mode(&self, _mode: i32) -> Result<(), String> { Ok(()) }
     fn native_control_result(&self, _action: &str, _code: i32) -> Result<(), String> { Ok(()) }
+    fn take_controller_settings(&self) -> Option<Vec<u8>> { None }
+    fn controller_result(&self, _id: u64, _ok: bool, _message: &str) -> Result<(), String> { Ok(()) }
     /// A pending control and its "also for my groups" choice.
     fn take_native_control(&self) -> Option<(crate::session_worker::NativeControl, bool)> { None }
     fn take_native_batch(&self) -> Option<Vec<u8>> { None }
     fn native_command_listener(&self) -> Option<crate::session_worker::CommandWake> { None }
     /// The window saw input for this idle session since the last call.
     fn take_native_activity(&self) -> bool { false }
+    /// A Play was queued behind this pre-sign-in since the last call; true at most once
+    /// per session, and only where the loader has Viewer pauses to skip (07d §4.3).
+    fn take_play_pending(&self) -> bool { false }
     fn take_native_social(&self) -> Option<Zeroizing<Vec<u8>>> { None }
     fn native_social_ready(&self) -> Result<(), String> { Ok(()) }
     /// Retry only a failed local status-cache publication; no native POL operation.
@@ -149,6 +171,12 @@ pub(crate) trait SignedIn: Send + Sync + 'static {
     fn native_status(&self, _code:i32) {}
     /// The one `session` line, `\n`-terminated, in a buffer zeroed on drop.
     fn session_line(&self, install_dir: &Path) -> Result<Zeroizing<Vec<u8>>, String>;
+    /// A parked host's `credentials` line at Play (pol-spec 07d §1.2): `session_line`'s
+    /// per-Play flags and credentials without the host fields the `park` line carried.
+    /// One use, like `session_line`. Only a native sign-in can use a parked host.
+    fn credentials_line(&self) -> Result<Zeroizing<Vec<u8>>, String> {
+        Err("This sign-in cannot use a parked game host.".into())
+    }
     /// Forward a 24-byte `PresenceArgs` payload; `Ok(changed)`.
     fn forward_presence(&self, payload: &[u8]) -> Result<bool, String>;
     /// Refreshed lobby credentials, sent before the presence completion.
@@ -236,7 +264,7 @@ pub(crate) fn launch(
     plan: &Plan,
     account: Account,
     otp: Zeroizing<String>,
-    timing: Timeline,
+    mut timing: Timeline,
     progress: &mut impl FnMut(&str),
 ) -> Result<LaunchResult, String> {
     if account.region != 0 {
@@ -245,26 +273,41 @@ pub(crate) fn launch(
     if !otp.is_empty() && (otp.len() != 6 || !otp.bytes().all(|b| b.is_ascii_digit())) {
         return Err(t("Enter a six-digit one-time code, or leave it empty.").into());
     }
-    let prepared = prepare_with_progress(config, plan, &account, progress)?;
+    // The W2U at Connect comes seconds later (after the tool and polcore start): resolve
+    // its server now so that check does not pay a cold lookup on the sign-in's path, and
+    // the member-login host polcore resolves at Open(1) (08 §4 item 3). DNS only.
+    crate::patch::warm_dns();
+    crate::dns::warm(crate::dns::POL_LOGIN_HOST);
+    let prepared = prepare_with_progress(config, plan, &account, &mut timing, progress)?;
     // beside the exact loader this launch runs; never fails the launch.
     if let Some(line) = crate::dgvoodoo::sync_for_launch(&prepared.loader, plan.settings.dgvoodoo) {
         progress(&line);
     }
+    timing.stage("preparation: dgVoodoo synchronized");
     let mut authenticated=native_auth::NativeAuth::new(&account,otp,config.account_directory(&account))?;
-    authenticated.set_social_only(plan.social_only);
-    // Every Play signs in idle first, like a sign-in-only launch. The worker runs the stock
-    // FFXI version check after authentication, overlapping native startup mail/presence.
-    // GameStart still requires both the full native idle report and the check's verdict.
-    authenticated.set_deferred_start(!plan.social_only);
-    authenticated.set_invisible_login(plan.invisible_login);
-    authenticated.set_auto_away(plan.auto_away_minutes);
-    authenticated.set_auto_login(plan.auto_login);
+    configure(&mut authenticated, plan);
+    timing.stage("preparation: native authentication prepared");
     drop(account);
     let sign_in = move |_timing: &mut Timeline, progress: &mut dyn FnMut(&str)| {
         progress(t("Preparing native PlayOnline authentication..."));
         Ok(authenticated)
     };
     sign_in_then_run(prepared, sign_in, timing, progress, &mut spawn_injector, &TURNS, TIMEOUTS)
+}
+
+/// The plan's part of the session line.
+fn configure(auth: &mut native_auth::NativeAuth, plan: &Plan) {
+    auth.set_social_only(plan.social_only);
+    // Every Play signs in idle first, like a sign-in-only launch. The worker runs the stock
+    // FFXI version check (W20) once the loader reports the Viewer main menu (the presence
+    // publish), never on authentication (pol-spec 07c §5.1). GameStart still requires both
+    // the full native idle report and the check's verdict.
+    auth.set_deferred_start(!plan.social_only);
+    // Viewer pauses only where they cost nothing at Play: a pre-sign-in (07c §4).
+    auth.set_viewer_gaps(plan.social_only && plan.viewer_gaps);
+    auth.set_invisible_login(plan.invisible_login);
+    auth.set_auto_away(plan.auto_away_minutes);
+    auth.set_auto_login(plan.auto_login);
 }
 
 /// Sign in, then start the tool. Each account runs this on its own worker thread, so the
@@ -305,65 +348,99 @@ struct Prepared {
     friends_directory: Option<PathBuf>,
     /// The FFXI version check run before a deferred game start (replaced in tests).
     check: GameCheck,
+    /// The Viewer check the loader asks for at Connect (replaced in tests).
+    viewer_check: ViewerCheck,
+    /// What started this launch, for the log's trigger line (07d §4.2).
+    trigger: crate::launch_timing::LaunchTrigger,
 }
 
-/// The stock FFXI check for a game folder: `Ok(note)` to start, `Err(message)` to stop.
-type GameCheck = fn(&Path) -> Result<String, String>;
+/// The stock FFXI check for a game folder: `Ok(note)` to start, `Err(message)` to stop,
+/// with the phases of its exchange (07d §2.2: logged on every path).
+type GameCheck = fn(&Path) -> (Result<String, String>, crate::patch::CheckTiming);
+/// One stock W2U (:54000) for this sign-in, with its "network not ready" retries and the
+/// phases of every attempt; returns after the last socket closed (07c §1.2, 07d §2.3).
+type ViewerCheck = fn() -> crate::viewer::ConnectCheck;
 
 enum CheckTask {
     Waiting,
-    Running(std::thread::JoinHandle<Result<String, String>>),
+    /// The verdict, when it arrived (the join can come later) and its phases.
+    Running(std::thread::JoinHandle<(Result<String, String>, Instant, crate::patch::CheckTiming)>),
     Failed(String),
     Consumed,
 }
 
-/// One fresh check per Play, moved intact from the startup wait to the supervisor.
-/// Only the stateless public version request overlaps native startup services.
+/// The session's stock version checks, moved intact from the startup wait to the
+/// supervisor: the Viewer's W2U, answered when the loader asks between Open(0) and
+/// Open(1), and one fresh FFXI W20 per Play. W20 starts on its own connection once the
+/// loader reports the Viewer main menu, i.e. after the presence publish (07c §2, §5.1;
+/// stock r2 :53001 follows the publish), never on authentication: that put :53001
+/// beside mail and presence, an order stock cannot produce (07a presign-fast-path (1)).
 struct GameVersionCheck {
     install: PathBuf,
     directory: Option<PathBuf>,
     check: GameCheck,
+    viewer: ViewerCheck,
     task: CheckTask,
+    /// Why this sign-in's W2U got no answer, for the error if the sign-in then fails
+    /// (07d §5.6 step 4: the loader goes on after an unanswered W2U).
+    viewer_cause: Option<String>,
 }
 impl GameVersionCheck {
     fn new(prepared: &Prepared) -> Self {
-        Self { install: prepared.install_dir.clone(), directory: prepared.friends_directory.clone(), check: prepared.check, task: CheckTask::Waiting }
+        Self { install: prepared.install_dir.clone(), directory: prepared.friends_directory.clone(), check: prepared.check,
+            viewer: prepared.viewer_check, task: CheckTask::Waiting, viewer_cause: None }
     }
 
-    fn authenticated(&mut self, auth: &impl SignedIn, log: &mut SessionLog) {
+    /// Typed authentication: published for status only. W20 waits for the main menu. No
+    /// patch-host lookup here: every sign-in reached this, including those no W20 follows,
+    /// while stock looks pc001W2U.pol.com up only right before its W20 (~0.2 s before the
+    /// SYN, captures 2026-10-13), which is the W20's own lookup.
+    fn authenticated(&self, log: &mut SessionLog) {
         if let Some(directory) = &self.directory {
             if let Err(error) = crate::session_worker::publish_authenticated(directory) { log.line(&error); }
         }
+    }
+
+    /// `native_main_menu` after sign-in: a Play's W20 may go now (a sign-in-only session
+    /// checks nothing until its own Play).
+    fn main_menu(&mut self, auth: &impl SignedIn, log: &mut SessionLog) {
         if auth.start_pending() { self.start(log); }
     }
 
     fn start(&mut self, log: &mut SessionLog) {
         if !matches!(self.task, CheckTask::Waiting) { return; }
-        log.line("Signed in; checking the FFXI version while native startup services finish.");
+        log.line("Viewer main menu reached; checking the FFXI version.");
         let (install, check) = (self.install.clone(), self.check);
-        self.task = match std::thread::Builder::new().name("ffxi-version-check".into()).spawn(move || check(&install)) {
+        self.task = match std::thread::Builder::new().name("ffxi-version-check".into())
+            .spawn(move || { let (result, timing) = check(&install); (result, Instant::now(), timing) }) {
             Ok(task) => CheckTask::Running(task),
             Err(_) => CheckTask::Failed(t("Could not start the game version check.").into()),
         };
     }
 
-    fn finish(&mut self, log: &mut SessionLog) -> Result<String, String> {
-        // Older loaders may report only full idle. They still check exactly once.
+    /// The verdict and, when a check ran, when it finished.
+    fn finish(&mut self, log: &mut SessionLog) -> (Result<String, String>, Option<Instant>) {
+        // An older loader sends no `native_main_menu`; its first idle report already
+        // follows the publish, so it still checks exactly once, after the main menu.
         self.start(log);
         match std::mem::replace(&mut self.task, CheckTask::Consumed) {
-            CheckTask::Running(task) => task.join().unwrap_or_else(|_| Err(t("The game version check failed.").into())),
-            CheckTask::Failed(error) => Err(error),
-            CheckTask::Waiting | CheckTask::Consumed => Err(t("The game version check was already consumed.").into()),
+            CheckTask::Running(task) => task.join().map_or_else(|_| (Err(t("The game version check failed.").into()), None), |(result, at, timing)| {
+                for line in crate::launch_timing::check_lines("FFXI check (W20)", &timing) { log.line(&line); }
+                (result, Some(at))
+            }),
+            CheckTask::Failed(error) => (Err(error), None),
+            CheckTask::Waiting | CheckTask::Consumed => (Err(t("The game version check was already consumed.").into()), None),
         }
     }
 }
 
 #[cfg(test)]
 fn prepare(config: &Config, plan: &Plan, account: &Account) -> Result<Prepared, String> {
-    prepare_with_progress(config, plan, account, &mut |_| {})
+    prepare_with_progress(config, plan, account, &mut Timeline::begin(), &mut |_| {})
 }
 
-fn prepare_with_progress(config: &Config, plan: &Plan, account: &Account, progress: &mut dyn FnMut(&str)) -> Result<Prepared, String> {
+fn prepare_with_progress(config: &Config, plan: &Plan, account: &Account, timing: &mut Timeline, progress: &mut dyn FnMut(&str)) -> Result<Prepared, String> {
+    timing.stage("preparation: entered");
     let tool = plan.tool;
     let settings = &plan.settings;
     let configured = match tool {
@@ -386,6 +463,7 @@ fn prepare_with_progress(config: &Config, plan: &Plan, account: &Account, progre
             }
         })?)
     } else { None };
+    timing.stage("preparation: tool directory resolved");
     let loader = tools::loader_path(&settings.loader).ok_or_else(|| {
         if settings.loader.trim().is_empty() {
             tf(
@@ -398,7 +476,9 @@ fn prepare_with_progress(config: &Config, plan: &Plan, account: &Account, progre
     })?;
     let loader = crate::reshade::loader_for_launch(&loader, &settings.reshade, settings.dgvoodoo)?;
     let loader = plain_windows_path(&fs::canonicalize(&loader).unwrap_or(loader));
+    timing.stage("preparation: loader resolved");
     let install_dir = install_directory(config)?;
+    timing.stage("preparation: game directory resolved");
     let tool_dir = tool_dir.unwrap_or_else(|| install_dir.clone());
     let region = "US";
     let mut base_ini = None;
@@ -411,7 +491,7 @@ fn prepare_with_progress(config: &Config, plan: &Plan, account: &Account, progre
     // the other launch methods, including when that preference is unreadable.
     let menu = if tool == Tool::Windower { None } else { crate::game_config::retail_menu(config)? };
     match tool {
-        Tool::Vanilla => ffxi_settings = menu.map(ffxi_settings::menu_settings),
+        Tool::Vanilla => ffxi_settings = Some(ffxi_settings::menu_settings(menu)),
         Tool::Ashita => {
             let explicit = !settings.boot_ini.trim().is_empty();
             let name = if explicit { settings.boot_ini.trim() } else { tools::DEFAULT_BOOT_INI };
@@ -432,7 +512,7 @@ fn prepare_with_progress(config: &Config, plan: &Plan, account: &Account, progre
             }
             // Fails early on a loader path Ashita can't read (non-ASCII).
             tools::ashita_boot_ini(base_ini.as_deref(), &loader, "check", 0, region, &[])?;
-            ffxi_settings = menu.map(ffxi_settings::menu_settings);
+            ffxi_settings = Some(ffxi_settings::menu_settings(menu));
         }
         Tool::Windower => {
             profile = settings.windower_profile.trim().to_owned();
@@ -440,11 +520,14 @@ fn prepare_with_progress(config: &Config, plan: &Plan, account: &Account, progre
                 return Err(t("The Windower profile name can't contain quotes or control characters.").into());
             }
             profile_access = Some(profile_access::launching(&tool_dir, progress)?);
+            timing.stage("preparation: profile access acquired");
             ffxi_settings = Some(ffxi_settings::for_windower(&tool_dir, &profile)?);
         }
     }
+    timing.stage("preparation: launch settings read");
     let logs = config.logs_directory(account);
     fs::create_dir_all(&logs).map_err(|_| t("Could not create the account's log folder."))?;
+    timing.stage("preparation: log directory ready");
     Ok(Prepared {
         tool,
         tool_dir,
@@ -462,7 +545,9 @@ fn prepare_with_progress(config: &Config, plan: &Plan, account: &Account, progre
             log: logs.join(format!("{}.crystal.log", unique_id()?)),
         },
         friends_directory: Some(config.account_directory(account)),
-        check: crate::patch::gate_before_start,
+        check: crate::patch::gate_before_start_timed,
+        viewer_check: crate::viewer::check_at_connect_timed,
+        trigger: plan.trigger,
     })
 }
 
@@ -472,13 +557,13 @@ pub(crate) fn install_directory(config: &Config) -> Result<PathBuf, String> {
     let dir = match &config.game_install {
         Some(path) => plain_windows_path(path),
         None => registry_install_dir().ok_or(
-            t("The FINAL FANTASY XI folder is not known. Select it on the Downloads page."),
+            t("The FINAL FANTASY XI folder is not known. Select it in Settings."),
         )?,
     };
     for name in ["FFXi.dll", "FFXiMain.dll"] {
         if !dir.join(name).is_file() {
             return Err(tf(
-                "{folder} has no {name}. Select the FINAL FANTASY XI folder on the Downloads page.",
+                "{folder} has no {name}. Select the FINAL FANTASY XI folder in Settings.",
                 &[("folder", &dir.display()), ("name", &name)],
             ));
         }
@@ -536,6 +621,10 @@ impl SessionLog {
         timeline.mark(milestone);
         self.timing(timeline);
     }
+    fn reached_at(&mut self, timeline: &mut Timeline, milestone: Milestone, at: Instant) {
+        timeline.mark_at(milestone, at);
+        self.timing(timeline);
+    }
     /// The log as a child's stdout/stderr, so the injector's own messages land in it too.
     fn stdio(&self) -> Stdio {
         self.file
@@ -591,6 +680,9 @@ impl Injector {
                 let _ = child.wait();
             }
         }
+        // A stand-in "exits" when stopped, so tests see the stop and its order.
+        #[cfg(test)]
+        if let Injector::Fake(exited) = self { exited.store(true, Ordering::SeqCst); }
     }
 
     fn wait(&mut self) -> std::io::Result<()> {
@@ -783,8 +875,66 @@ fn presence_result(result: &Result<bool, String>) -> String {
     }
 }
 
+/// The answer to the loader's `native_viewer_check` (pol-spec 07c §1). Sent only once the
+/// W2U connection is closed; any `ok:false` stops the sign-in before Open(1).
+fn viewer_check_result_line(verdict: &crate::viewer::ConnectVerdict) -> String {
+    match verdict.reason() {
+        None => "{\"type\":\"native_viewer_check_result\",\"ok\":true}\n".into(),
+        Some(reason) => format!(
+            "{{\"type\":\"native_viewer_check_result\",\"ok\":false,\"reason\":\"{reason}\",\"error\":{}}}\n",
+            serde_json::to_string(&verdict.message()).unwrap_or_else(|_| "\"\"".into())
+        ),
+    }
+}
+
+/// `text (code)`, the OS wording with its number, as the row and the log show it.
+fn net_error_text(error: &crate::dns::NetError) -> String {
+    match error.code { Some(code) => format!("{} ({code})", error.text), None => error.text.clone() }
+}
+
+/// One stock W2U for the loader's `native_viewer_check`, on this session thread (never the
+/// window's): the loader waits up to 35 s pumping 20 ms frames and sends nothing else
+/// meanwhile, so blocking here (≤ patch::VIEWER_CHECK_BUDGET, 07d §3) delays nothing. Every
+/// request gets exactly one fresh check: there is no launcher-lifetime cache (07c §3).
+/// A first attempt that failed instantly and locally was retried with fresh DNS (07d §2.3).
+fn answer_viewer_check(pipe: &mut LoaderPipe, log: &mut SessionLog, game: &mut GameVersionCheck) -> Result<(), LoaderEnd> {
+    log.line("The loader reached Connect; checking the PlayOnline Viewer version (W2U).");
+    let crate::viewer::ConnectCheck { verdict, timing } = (game.viewer)();
+    if let Some(first) = timing.attempts.first().and_then(|attempt| attempt.error.as_ref()).filter(|error| error.network_not_ready()) {
+        log.line(&format!("Viewer check (W2U): network not ready ({}); retrying with fresh DNS for up to {} s.",
+            net_error_text(first), crate::patch::NETWORK_WAIT.as_secs()));
+    }
+    for line in crate::launch_timing::check_lines("Viewer check (W2U)", &timing) { log.line(&line); }
+    match verdict.reason() {
+        None => log.line("PlayOnline Viewer version is current; the sign-in continues."),
+        // The loader signs in anyway when the server did not answer (a7550a6). Keep the
+        // cause: if the sign-in then fails, the row says why the check failed too.
+        Some("unreachable") => {
+            log.line(&format!("The PlayOnline Viewer check got no answer; the sign-in continues: {}", verdict.message()));
+            game.viewer_cause = Some(verdict.message());
+        }
+        // Nothing reached Square Enix; the loader stops before Open(1) (07d §2.5, §5.6).
+        Some("network") => log.line(&format!("The network is not ready; the loader stops before the member login: {}", verdict.message())),
+        Some(reason) => log.line(&format!("The PlayOnline Viewer check stops the sign-in ({reason}): {}", verdict.message())),
+    }
+    if pipe.send(viewer_check_result_line(&verdict).as_bytes(), Instant::now() + Duration::from_secs(10)).is_err() {
+        log.line("Could not answer the Viewer version check; the session pipe failed.");
+        return Err(LoaderEnd::Closed);
+    }
+    Ok(())
+}
+
 fn handle_event(event: LoaderEvent, pipe: &mut LoaderPipe, auth: &impl SignedIn, log: &mut SessionLog) -> Step {
     match event {
+        // Answered by `wait_started` / `watch` (`answer_viewer_check`), which hold the check.
+        LoaderEvent::NativeViewerCheck => Step::Continue,
+        // W20 is started by `wait_started` / `watch` (`GameVersionCheck::main_menu`).
+        LoaderEvent::NativeMainMenu { code, returned } => {
+            if auth.native_core() {
+                log.line(&format!("Native POL main menu reached{} (publish result {code}).", if returned { " after FFXI returned" } else { "" }));
+            }
+            Step::Continue
+        }
         LoaderEvent::Started { pid } => {
             log.native_idle = false;
             log.native_sign_out = false;
@@ -880,11 +1030,17 @@ fn handle_event(event: LoaderEvent, pipe: &mut LoaderPipe, auth: &impl SignedIn,
             }
             Step::Continue
         }
+        LoaderEvent::ControllerResult { id, ok, message } => {
+            if let Err(error) = auth.controller_result(id, ok, &message) { log.line(&error); }
+            Step::Continue
+        }
         LoaderEvent::NativeControlResult { action, code } => {
             if auth.native_core() {
-                if code < 0 { log.native_failure = true; }
+                if code < 0 && code != -261 { log.native_failure = true; }
                 if action == "sign_out" {
-                    log.native_sign_out = code == 0 && log.native_idle;
+                    // Zero only accepts the command. Teardown reports its own
+                    // result once the core has finished signing out and closing.
+                    if code < 0 { log.native_sign_out = false; }
                 } else if action == "start_game" && code == 0 {
                     log.native_idle = false;
                     log.native_sign_out = false;
@@ -901,6 +1057,17 @@ fn handle_event(event: LoaderEvent, pipe: &mut LoaderPipe, auth: &impl SignedIn,
             log.line(&format!("FFXI returned {code}."));
             Step::Continue
         }
+        LoaderEvent::NativeSignOutComplete(code) => {
+            if auth.native_core() {
+                log.native_sign_out = code == 0;
+                log.native_idle = true;
+                if code < 0 { log.native_failure = true; }
+                if let Err(error) = auth.native_session_state(false) { log.line(&error); }
+                if let Err(error) = auth.native_control_result("sign_out", code) { log.line(&error); }
+                log.line(&format!("Native POL sign-out completed with result {code}."));
+            }
+            Step::Continue
+        }
         LoaderEvent::Exit(code) => {
             log.line(&format!("Loader reported exit code {code}."));
             Step::End(if log.native_sign_out && (code == 0 || code == -14 && log.native_shutdown_returned && !log.native_failure) {
@@ -915,9 +1082,13 @@ fn handle_event(event: LoaderEvent, pipe: &mut LoaderPipe, auth: &impl SignedIn,
             log.line("The session pipe closed.");
             Step::End(LoaderEnd::Closed)
         }
-        LoaderEvent::Hello { .. } | LoaderEvent::Unknown | LoaderEvent::NativeAuthStage(_) | LoaderEvent::Authenticated => Step::Continue,
+        // `parked` comes before credentials; the park worker reads it (park.rs, 07d §1.3).
+        LoaderEvent::Hello { .. } | LoaderEvent::Parked { .. } | LoaderEvent::Unknown | LoaderEvent::NativeAuthStage(_) | LoaderEvent::Authenticated => Step::Continue,
     }
 }
+
+/// How often a pre-sign-in's start wait looks for a queued Play between loader events.
+const PLAY_PENDING_POLL: Duration = Duration::from_millis(100);
 
 /// Until `started` (`Ok(true)`), the deadline (`Ok(false)`, start unconfirmed), or the end.
 /// `until_game`: the wait after a deferred `native_start_game`, which ends when the loader
@@ -925,7 +1096,18 @@ fn handle_event(event: LoaderEvent, pipe: &mut LoaderPipe, auth: &impl SignedIn,
 fn wait_started(pipe: &mut LoaderPipe, auth: &impl SignedIn, log: &mut SessionLog, timeout: Duration, timing:&mut Timeline, progress:&mut dyn FnMut(&str), until_game: bool, game: &mut GameVersionCheck) -> Result<bool, LoaderEnd> {
     let deadline = Instant::now() + timeout;
     loop {
-        match pipe.next_event(Some(deadline)) {
+        // A Play queued behind this pre-sign-in: the loader skips the Viewer pauses still
+        // to come (07d §4.3). Checked between events and every PLAY_PENDING_POLL meanwhile.
+        if auth.take_play_pending() {
+            if pipe.send(park::PLAY_PENDING_LINE.as_bytes(), Instant::now() + Duration::from_secs(10)).is_err() {
+                log.line("The session pipe failed.");
+                return Err(LoaderEnd::Closed);
+            }
+            log.line("A Play is waiting; the loader skips the remaining Viewer pauses.");
+        }
+        let slice = if auth.native_core() && auth.social_only() { (Instant::now() + PLAY_PENDING_POLL).min(deadline) } else { deadline };
+        match pipe.next_event(Some(slice)) {
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut && slice < deadline => continue,
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
                 log.line(&format!("No start report within {} s; the game may still be loading.", timeout.as_secs()));
                 return Ok(false);
@@ -942,9 +1124,18 @@ fn wait_started(pipe: &mut LoaderPipe, auth: &impl SignedIn, log: &mut SessionLo
                             log.line(&format!("Native POL authentication state {state}."));
                             progress(match state { 26..=28=>t("PlayOnline: authenticating Square Enix account..."),40..=41=>t("PlayOnline: selecting service..."),30=>t("PlayOnline: loading profile and friends..."),_=>t("PlayOnline: connecting...") });
                         }
+                        LoaderEvent::NativeViewerCheck=>{
+                            progress(t("PlayOnline: checking the Viewer version..."));
+                            answer_viewer_check(pipe, log, game)?;
+                            log.reached(timing,Milestone::ViewerChecked);
+                        }
                         LoaderEvent::Authenticated=>{
                             log.reached(timing,Milestone::SignInDone);
-                            game.authenticated(auth, log);
+                            game.authenticated(log);
+                        }
+                        LoaderEvent::NativeMainMenu { returned: false, .. }=>{
+                            log.reached(timing,Milestone::MainMenu);
+                            game.main_menu(auth, log);
                         }
                         _=>{},
                     }
@@ -965,10 +1156,13 @@ fn wait_started(pipe: &mut LoaderPipe, auth: &impl SignedIn, log: &mut SessionLo
 /// A Play whose session is now signed in and idle: consume its FFXI version check, then
 /// `native_start_game`. `Ok(Ok(()))`: start sent. `Ok(Err(message))`: the check says update;
 /// nothing is sent and the session stays signed in. `Err(())`: the pipe failed.
-fn start_deferred(pipe: &mut LoaderPipe, auth: &impl SignedIn, log: &mut SessionLog, game: &mut GameVersionCheck, progress: &mut dyn FnMut(&str)) -> Result<Result<(), String>, ()> {
+/// `timing`: the launch's timeline while the start wait still owns it.
+fn start_deferred(pipe: &mut LoaderPipe, auth: &impl SignedIn, log: &mut SessionLog, game: &mut GameVersionCheck, progress: &mut dyn FnMut(&str), timing: Option<&mut Timeline>) -> Result<Result<(), String>, ()> {
     progress(t("Checking the game version..."));
     log.line("Native startup services finished; awaiting the FFXI version check before starting the game.");
-    match game.finish(log) {
+    let (verdict, checked) = game.finish(log);
+    if let (Some(timing), Some(at)) = (timing, checked) { log.reached_at(timing, Milestone::GameChecked, at); }
+    match verdict {
         Err(message) => {
             log.line(&message);
             auth.deferred_start_done(Some(&message));
@@ -997,6 +1191,9 @@ fn watch(pipe: &mut LoaderPipe, auth: &impl SignedIn, log: &mut SessionLog, frie
     let mut next_publication = Instant::now() + Duration::from_secs(1);
     loop {
         if auth.native_core() {
+            if let Some(line) = auth.take_controller_settings() {
+                if pipe.send(&line, Instant::now() + Duration::from_secs(2)).is_err() { return LoaderEnd::Closed; }
+            }
             if Instant::now() >= next_publication {
                 if matches!(auth.retry_native_publication(), Ok(true)) {
                     log.line("Recovered the native PlayOnline session status cache.");
@@ -1013,6 +1210,10 @@ fn watch(pipe: &mut LoaderPipe, auth: &impl SignedIn, log: &mut SessionLog, frie
             if auth.take_native_activity()
                 && pipe.send(b"{\"type\":\"native_activity\"}\n", Instant::now() + Duration::from_secs(10)).is_err() {
                 return LoaderEnd::Closed;
+            }
+            if auth.take_play_pending() {
+                if pipe.send(park::PLAY_PENDING_LINE.as_bytes(), Instant::now() + Duration::from_secs(10)).is_err() { return LoaderEnd::Closed; }
+                log.line("A Play is waiting; the loader skips the remaining Viewer pauses.");
             }
         }
         if let Some(line) = auth.take_native_social() {
@@ -1048,13 +1249,19 @@ fn watch(pipe: &mut LoaderPipe, auth: &impl SignedIn, log: &mut SessionLog, frie
             }
             Ok(Err(message)) => log.line(&message),
             Ok(Ok(event)) => {
-                if auth.native_core() && matches!(event, LoaderEvent::Authenticated) {
-                    game.authenticated(auth, log);
+                // A sign-in that outlasted the start wait reaches its checks here.
+                if auth.native_core() {
+                    match &event {
+                        LoaderEvent::NativeViewerCheck => if let Err(end) = answer_viewer_check(pipe, log, game) { return end; },
+                        LoaderEvent::Authenticated => game.authenticated(log),
+                        LoaderEvent::NativeMainMenu { returned: false, .. } => game.main_menu(auth, log),
+                        _ => {}
+                    }
                 }
                 // A Play whose sign-in outlasted the start wait: the idle session arrives here.
                 if auth.start_pending() && matches!(event, LoaderEvent::NativeSessionState(false)) {
                     let _ = handle_event(event, pipe, auth, log);
-                    if start_deferred(pipe, auth, log, game, &mut |_| {}).is_err() {
+                    if start_deferred(pipe, auth, log, game, &mut |_| {}, None).is_err() {
                         return LoaderEnd::Closed;
                     }
                     continue;
@@ -1185,40 +1392,59 @@ fn deliver_handoff(
     })
 }
 
-/// After sign-in: start the injector, hand the loader its session, wait for the game to
-/// start, then leave the rest of the session (and the keepalive) to a supervisor thread.
-fn run<A: SignedIn>(
-    mut p: Prepared,
-    auth: A,
-    mut timing: Timeline,
-    progress: &mut dyn FnMut(&str),
-    spawn: &mut Spawner<'_>,
-    turns: &'static Turns,
-    limits: Timeouts,
-) -> Result<LaunchResult, String> {
-    let auth = Arc::new(auth);
-    let game_running = auth.game_running().unwrap_or_else(|| Arc::new(AtomicBool::new(true)));
-    let log_path = p.session.log.clone();
-    let mut log = SessionLog::open(&log_path)?;
+/// The launch log's opening lines: `first` (the park's `park start` line), else the launch
+/// clock and the trigger (07d §4.2), then the launcher image and route.
+fn open_launch_log(p: &Prepared, timing: &mut Timeline, first: Option<&str>) -> Result<SessionLog, String> {
+    let mut log = SessionLog::open(&p.session.log)?;
+    match first {
+        Some(line) => log.line(line),
+        None => clock_lines(&mut log, timing, p.trigger),
+    }
     log.line(&format!("Launcher image: {}; embedded loader SHA-256: {}",
         std::env::current_exe().ok().and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())).unwrap_or_default(),
         tools::embedded::embedded().map_or("none", |(_, hash)| hash)));
     log.line(&format!("POL-less launch through {} in {}; loader {}", p.tool.name(), p.tool_dir.display(), p.loader.display()));
     // The sign-in marks were taken before this log existed; write them now.
-    log.timing(&mut timing);
-    let fail = |log: &mut SessionLog, message: String| {
-        log.line(&message);
-        with_log(message, &log_path)
-    };
+    log.timing(timing);
+    Ok(log)
+}
 
-    // Start the supervisor before the game, so a thread failure can't leave a running game
-    // without the keepalive's owner.
-    let (sender, receiver) = std::sync::mpsc::sync_channel::<(LoaderPipe, Arc<A>, SessionLog, Instant, String, GameVersionCheck)>(1);
+/// `launch clock …` and, right after it, `launch trigger: <name>` (07d §4.2).
+fn clock_lines(log: &mut SessionLog, timing: &Timeline, trigger: crate::launch_timing::LaunchTrigger) {
+    for line in launch_clock_lines(timing, trigger) { log.line(&line); }
+}
+
+/// The two opening lines of every launch, also appended to an existing session log by the
+/// pre-signed paths (main.rs xi-start-game, session_worker::launch_command).
+pub(crate) fn launch_clock_lines(timing: &Timeline, trigger: crate::launch_timing::LaunchTrigger) -> [String; 2] {
+    let play_clock = timing.start_host_micros();
+    [format!("launch clock: play_start_host_us={} host_clock_valid={}", play_clock.unwrap_or_default(), play_clock.is_some()),
+        trigger.line()]
+}
+
+type SupervisorHandoff<A> = (LoaderPipe, Arc<A>, SessionLog, Instant, String, GameVersionCheck);
+
+/// The session's supervisor half, started before the game so a thread failure can't leave
+/// a running game without the keepalive's owner.
+struct Supervision<A: SignedIn> {
+    auth: Arc<A>,
+    game_running: Arc<AtomicBool>,
+    log_path: PathBuf,
+    sender: std::sync::mpsc::SyncSender<SupervisorHandoff<A>>,
+    alive: Arc<AtomicBool>,
+    outcome: Arc<Mutex<Option<crate::launch_log::ExitReport>>>,
+    game_check: GameVersionCheck,
+    tool: Tool,
+}
+
+fn supervise<A: SignedIn>(p: &Prepared, auth: A) -> Result<Supervision<A>, String> {
+    let auth = Arc::new(auth);
+    let game_running = auth.game_running().unwrap_or_else(|| Arc::new(AtomicBool::new(true)));
+    let (sender, receiver) = std::sync::mpsc::sync_channel::<SupervisorHandoff<A>>(1);
     let alive = Arc::new(AtomicBool::new(true));
     let outcome = Arc::new(Mutex::new(None));
     let (tracked, tracked_outcome, session) = (alive.clone(), outcome.clone(), p.session.clone());
     let friends_directory = p.friends_directory.clone();
-    let mut game_check = GameVersionCheck::new(&p);
     std::thread::Builder::new()
         .name("retail-loader-session".into())
         .spawn(move || {
@@ -1238,55 +1464,102 @@ fn run<A: SignedIn>(
             tracked.store(false, Ordering::Release);
         })
         .map_err(|_| t("Could not start the retail session supervisor."))?;
+    Ok(Supervision { auth, game_running, log_path: p.session.log.clone(), sender, alive, outcome, game_check: GameVersionCheck::new(p), tool: p.tool })
+}
 
-    let handed = (|| -> Result<(LoaderPipe, u32), String> {
-        let turn = turns.enter(p.tool, progress);
-        let process_turn = if p.tool == Tool::Windower && std::ptr::eq(turns, &TURNS) {
-            Some(crate::session_worker::windower_turn(progress)?)
-        } else {
-            None
-        };
-        let mut pipe = LoaderPipe::create().map_err(|e| tf("Could not create the session pipe ({error}).", &[("error", &e)]))?;
-        progress(&tf("Starting {tool}...", &[("tool", &p.tool.name())]));
-        let injector = spawn(&p, pipe.name(), &mut log)?;
-        let mut injector = LaunchedInjector { injector, profile_access: p.profile_access.take(), stop_on_drop: p.tool == Tool::Windower };
-        log.line(&format!("Started {}; waiting for crystal-loader on its session pipe.", p.tool.exe()));
-        log.reached(&mut timing, Milestone::ToolStarted);
-        progress(t("Waiting for crystal-loader to connect..."));
-        let tool = p.tool;
-        let accepted = pipe.accept(limits.connect, || match injector.injector.exited() {
-            Some(Some(code)) if code != 0 => Err(tf("{exe} exited with code {code} before crystal-loader connected.", &[("exe", &tool.exe()), ("code", &code)])),
-            Some(None) => Err(tf("{exe} ended before crystal-loader connected.", &[("exe", &tool.exe())])),
-            _ => Ok(()),
-        });
-        if let Err(error) = accepted {
-            injector.injector.stop();
-            return Err(accept_failure(&p, error, limits.connect));
+/// A started tool whose loader connected, said hello and runs the expected image.
+struct Host {
+    /// Declared first, so it drops first: Windower.exe is stopped before the loader's pipe
+    /// closes, and its `Core.Stop(save: true)` never rewrites settings.xml (07a).
+    injector: LaunchedInjector,
+    pipe: LoaderPipe,
+    pid: u32,
+}
+
+/// Start the tool and wait for its loader's verified hello, holding the tool's turn from
+/// spawn to hello (`turns`). Windower's update chain runs in here; any change it made to its
+/// own files is noted (07d §4.6).
+fn start_host(p: &mut Prepared, log: &mut SessionLog, timing: &mut Timeline, progress: &mut dyn FnMut(&str),
+    spawn: &mut Spawner<'_>, turns: &'static Turns, limits: Timeouts) -> Result<Host, String> {
+    let turn = turns.enter(p.tool, progress);
+    let process_turn = if p.tool == Tool::Windower && std::ptr::eq(turns, &TURNS) {
+        Some(crate::session_worker::windower_turn(progress)?)
+    } else {
+        None
+    };
+    // A park closed while it waited for its turn: nothing is started.
+    if limits.aborted() { return Err(park::ABORTED.into()); }
+    let mut pipe = LoaderPipe::create().map_err(|e| tf("Could not create the session pipe ({error}).", &[("error", &e)]))?;
+    progress(&tf("Starting {tool}...", &[("tool", &p.tool.name())]));
+    let files = (p.tool == Tool::Windower).then(|| tools::windower_files(&p.tool_dir));
+    let spawned = Instant::now();
+    let injector = spawn(p, pipe.name(), log)?;
+    let mut injector = LaunchedInjector { injector, profile_access: p.profile_access.take(), stop_on_drop: p.tool == Tool::Windower };
+    log.line(&format!("Started {}; waiting for crystal-loader on its session pipe.", p.tool.exe()));
+    log.reached(timing, Milestone::ToolStarted);
+    progress(t("Waiting for crystal-loader to connect..."));
+    let tool = p.tool;
+    let accepted = pipe.accept(limits.connect, || match injector.injector.exited() {
+        _ if limits.aborted() => Err(park::ABORTED.into()),
+        Some(Some(code)) if code != 0 => Err(tf("{exe} exited with code {code} before crystal-loader connected.", &[("exe", &tool.exe()), ("code", &code)])),
+        Some(None) => Err(tf("{exe} ended before crystal-loader connected.", &[("exe", &tool.exe())])),
+        _ => Ok(()),
+    });
+    if let Err(error) = accepted {
+        // Windower.exe first; the loader it started finds no pipe and exits (07a).
+        injector.injector.stop();
+        if limits.aborted() { return Err(park::ABORTED.into()); }
+        return Err(accept_failure(p, error, limits.connect));
+    }
+    let pid = pipe.handshake(&p.loader, limits.hello)?;
+    if let Some(before) = files {
+        let changed = tools::windower_changes(&before, &tools::windower_files(&p.tool_dir));
+        if !changed.is_empty() {
+            log.line(&format!("Windower updated during its start: {} (hello +{:.2}s)", changed.join(", "), spawned.elapsed().as_secs_f64()));
         }
-        let pid = pipe.handshake(&p.loader, limits.hello)?;
+    }
+    // The game's main thread is running, so the tool's handshake is over: the next start
+    // may go now, whatever its profile (see `turns`).
+    drop(turn);
+    drop(process_turn);
+    Ok(Host { pipe, pid, injector })
+}
+
+/// After sign-in: start the injector, hand the loader its session, wait for the game to
+/// start, then leave the rest of the session (and the keepalive) to a supervisor thread.
+fn run<A: SignedIn>(
+    mut p: Prepared,
+    auth: A,
+    mut timing: Timeline,
+    progress: &mut dyn FnMut(&str),
+    spawn: &mut Spawner<'_>,
+    turns: &'static Turns,
+    limits: Timeouts,
+) -> Result<LaunchResult, String> {
+    let mut log = open_launch_log(&p, &mut timing, None)?;
+    let supervision = supervise(&p, auth)?;
+    let auth = supervision.auth.clone();
+    let log_path = supervision.log_path.clone();
+    let handed = (|| -> Result<(LoaderPipe, u32), String> {
+        let Host { mut pipe, pid, injector } = start_host(&mut p, &mut log, &mut timing, progress, spawn, turns, limits)?;
         if auth.native_core() && !pipe.supports_native_auth() {
             return Err(t("This crystal-loader cannot perform native POL authentication. Use the loader embedded in this launcher, or update the configured loader path.").into());
         }
         if auth.native_core() && !pipe.supports_native_social() {
             return Err(t("This loader cannot retain a native PlayOnline session. Use the loader embedded in this launcher or update the configured loader path.").into());
         }
+        // The launcher sends no W2U of its own any more: an older loader would
+        // open :51240 with no :54000 in front of it, a shape stock never sends
+        // (07a w2u-at-connect). Refused before the session line, so no SE traffic.
+        if auth.native_core() && !pipe.supports_viewer_check() {
+            return Err(t("This loader does not run the PlayOnline Viewer version check. Use the loader embedded in this launcher or update the configured loader path.").into());
+        }
         log.line(&format!("crystal-loader connected: PID {pid}, image verified."));
         log.reached(&mut timing, Milestone::Hello);
-        // The game's main thread is running, so the tool's handshake is over: the next start
-        // may go now, whatever its profile (see `turns`).
-        drop(turn);
-        drop(process_turn);
         let native = auth.native_core();
         let native_batch = pipe.supports_native_batch();
         let measured = deliver_handoff(&mut log, |log| {
-            if native {
-                if let Some(directory) = &p.friends_directory {
-                    if let Err(error) = crate::session_worker::publish_native_batch(directory, native_batch) {
-                        // A status-cache failure remains nonfatal to the native session.
-                        log.line(&error);
-                    }
-                }
-            }
+            if native { publish_batch_capability(&p, native_batch, log); }
         }, |log| {
             if p.tool == Tool::Windower {
                 let hello = Instant::now();
@@ -1296,11 +1569,7 @@ fn run<A: SignedIn>(
             let line = auth.session_line(&p.install_dir)?;
             let line = match &p.ffxi_settings {
                 Some(settings) => {
-                    let source = if p.tool == Tool::Windower { "Windower profile" } else { "Crystal" };
-                    log.line(&format!("The game gets {} {source} settings in-process.", settings.count));
-                    if let Some(note) = &settings.note {
-                        log.line(note);
-                    }
+                    note_ffxi_settings(&p, settings, log);
                     ffxi_settings::splice(line, &settings.json)?
                 }
                 None => line,
@@ -1321,31 +1590,71 @@ fn run<A: SignedIn>(
         }
         Ok((pipe, pid))
     })();
-    let (mut pipe, pid) = handed.map_err(|message| fail(&mut log, message))?;
+    drop(auth);
+    let (pipe, pid) = handed.map_err(|message| fail(&mut log, &log_path, message))?;
+    finish(supervision, log, pipe, pid, timing, progress, limits)
+}
 
+/// The loader's batch-start capability, published before its session goes out. A
+/// status-cache failure stays nonfatal to the native session.
+fn publish_batch_capability(p: &Prepared, native_batch: bool, log: &mut SessionLog) {
+    if let Some(directory) = &p.friends_directory {
+        if let Err(error) = crate::session_worker::publish_native_batch(directory, native_batch) {
+            log.line(&error);
+        }
+    }
+}
+
+fn note_ffxi_settings(p: &Prepared, settings: &ffxi_settings::WindowerSettings, log: &mut SessionLog) {
+    let source = if p.tool == Tool::Windower { "Windower profile" } else { "Crystal" };
+    log.line(&format!("The game gets {} {source} settings in-process.", settings.count));
+    if let Some(note) = &settings.note {
+        log.line(note);
+    }
+}
+
+/// Log a launch failure and point it at the log.
+fn fail(log: &mut SessionLog, log_path: &Path, message: String) -> String {
+    log.line(&message);
+    with_log(message, log_path)
+}
+
+/// The session line (or a parked host's credentials) went out: wait for the sign-in and
+/// the game start, then hand the session to its supervisor.
+fn finish<A: SignedIn>(supervision: Supervision<A>, mut log: SessionLog, mut pipe: LoaderPipe, pid: u32, mut timing: Timeline,
+    progress: &mut dyn FnMut(&str), limits: Timeouts) -> Result<LaunchResult, String> {
+    let Supervision { auth, game_running, log_path, sender, alive, outcome, mut game_check, tool } = supervision;
     let started = Instant::now();
     let deferred = auth.start_pending();
     progress(if deferred { t("Signing in to PlayOnline...") } else { t("Waiting for the game to start...") });
-    let ended = |log: &mut SessionLog, end: LoaderEnd| {
+    // The loader went on after an unanswered W2U and then failed: say why the W2U failed
+    // too (07d §5.6 step 4).
+    let ended = |log: &mut SessionLog, end: LoaderEnd, cause: Option<&str>| {
         let report = classify_loader_end(&end, started.elapsed());
-        fail(log, tf("{summary} ({tool} via crystal-loader).", &[("summary", &report.message()), ("tool", &p.tool.name())]))
+        let mut message = tf("{summary} ({tool} via crystal-loader).", &[("summary", &report.message()), ("tool", &tool.name())]);
+        if let Some(cause) = cause {
+            message.push(' ');
+            message.push_str(&tf("The PlayOnline version check also failed: {cause}", &[("cause", &cause)]));
+        }
+        fail(log, &log_path, message)
     };
     let mut confirmed = match wait_started(&mut pipe, auth.as_ref(), &mut log, limits.start, &mut timing, progress, false, &mut game_check) {
         Ok(confirmed) => confirmed,
-        Err(end) => return Err(ended(&mut log, end)),
+        Err(end) => return Err(ended(&mut log, end, game_check.viewer_cause.as_deref())),
     };
-    // Full native idle is required even if the overlapping version check finished earlier.
+    // Full native idle is required even if the version check, started at the main menu,
+    // finished earlier.
     let mut blocked = None;
     if deferred && confirmed {
-        match start_deferred(&mut pipe, auth.as_ref(), &mut log, &mut game_check, progress) {
+        match start_deferred(&mut pipe, auth.as_ref(), &mut log, &mut game_check, progress, Some(&mut timing)) {
             Ok(Ok(())) => {
                 confirmed = match wait_started(&mut pipe, auth.as_ref(), &mut log, limits.start, &mut timing, progress, true, &mut game_check) {
                     Ok(confirmed) => confirmed,
-                    Err(end) => return Err(ended(&mut log, end)),
+                    Err(end) => return Err(ended(&mut log, end, None)),
                 };
             }
             Ok(Err(message)) => blocked = Some(message),
-            Err(()) => return Err(fail(&mut log, t("crystal-loader did not accept the game start.").into())),
+            Err(()) => return Err(fail(&mut log, &log_path, t("crystal-loader did not accept the game start.").into())),
         }
     }
     if confirmed && blocked.is_none() && (deferred || !auth.social_only()) {
@@ -1357,12 +1666,12 @@ fn run<A: SignedIn>(
         with_log(tf("Signed in to PlayOnline. Friends are available; start FFXI from this session without another login. Host PID {pid}.", &[("pid", &pid)]), &log_path)
     } else if confirmed {
         with_log(
-            tf("Retail authentication completed. Game PID {pid} started through {tool}.", &[("pid", &pid), ("tool", &p.tool.name())]),
+            tf("Retail authentication completed. Game PID {pid} started through {tool}.", &[("pid", &pid), ("tool", &tool.name())]),
             &log_path,
         )
     } else {
         with_log(
-            tf("Game PID {pid} is loading through {tool}; start is not yet confirmed.", &[("pid", &pid), ("tool", &p.tool.name())]),
+            tf("Game PID {pid} is loading through {tool}; start is not yet confirmed.", &[("pid", &pid), ("tool", &tool.name())]),
             &log_path,
         )
     };
@@ -1399,6 +1708,21 @@ pub(crate) fn detect_all(settings: &ToolSettings) -> Detected {
 mod tests {
     use super::*;
 
+    /// pol-spec 07c §1: the launcher's answer, as crystal-loader proto.rs parses it.
+    #[test]
+    fn viewer_check_answers_follow_the_round1_contract() {
+        use crate::viewer::ConnectVerdict;
+        let parse = |line: String| { assert!(line.ends_with('\n') && !line.trim_end().contains('\n')); serde_json::from_str::<serde_json::Value>(&line).unwrap() };
+        assert_eq!(parse(viewer_check_result_line(&ConnectVerdict::Current { version: "20110829_E".into() })),
+            serde_json::json!({"type":"native_viewer_check_result","ok":true}));
+        assert_eq!(parse(viewer_check_result_line(&ConnectVerdict::Unreachable("timed out\nagain \"x\"".into()))),
+            serde_json::json!({"type":"native_viewer_check_result","ok":false,"reason":"unreachable","error":"timed out\nagain \"x\""}));
+        assert_eq!(parse(viewer_check_result_line(&ConnectVerdict::Failed("no Viewer".into())))["reason"], "failed");
+        let outdated = parse(viewer_check_result_line(&ConnectVerdict::Outdated { local: "20110829_E".into(), remote: "20261001_0".into() }));
+        assert_eq!(outdated["reason"], "outdated");
+        assert!(outdated["error"].as_str().unwrap().contains("20261001_0"));
+    }
+
     #[test]
     fn status_controls_carry_the_groups_choice() {
         use crate::session_worker::NativeControl;
@@ -1410,7 +1734,7 @@ mod tests {
     }
 
     #[test]
-    fn only_an_idle_native_sign_out_acknowledgment_makes_an_early_zero_exit_clean() {
+    fn native_close_requires_completed_sign_out_and_preserves_failures() {
         struct Auth(bool);
         impl SignedIn for Auth {
             fn native_core(&self) -> bool { self.0 }
@@ -1430,9 +1754,10 @@ mod tests {
         };
         let idle = || LoaderEvent::NativeSessionState(false);
         let sign_out = |code| LoaderEvent::NativeControlResult { action: "sign_out".into(), code };
-        assert_eq!(end(true, vec![idle(), sign_out(0), LoaderEvent::Exit(0)]), LoaderEnd::SignedOut);
-        assert_eq!(end(true, vec![LoaderEvent::NativeSessionState(true), idle(), sign_out(0), LoaderEvent::Exit(0)]), LoaderEnd::SignedOut);
-        assert_eq!(end(false, vec![idle(), sign_out(0), LoaderEvent::Exit(0)]), LoaderEnd::Exit(0));
+        let completed = |code| pipe::parse_event(format!("{{\"type\":\"native_sign_out_complete\",\"code\":{code}}}").as_bytes()).unwrap();
+        assert_eq!(end(true, vec![idle(), sign_out(0), completed(0), LoaderEvent::Exit(0)]), LoaderEnd::SignedOut);
+        assert_eq!(end(true, vec![completed(0), LoaderEvent::Exit(0)]), LoaderEnd::SignedOut);
+        assert_eq!(end(false, vec![idle(), sign_out(0), completed(0), LoaderEvent::Exit(0)]), LoaderEnd::Exit(0));
 
         for events in [
             vec![LoaderEvent::Exit(0)],
@@ -1451,12 +1776,16 @@ mod tests {
         assert_eq!(end(true, vec![idle(), sign_out(0), LoaderEvent::Exit(-14)]), LoaderEnd::Exit(-14));
         let started = || LoaderEvent::Started { pid: Some(std::process::id()) };
         let returned = |successful| LoaderEvent::NativeGameEnded { code: -14, game_returned: successful };
-        assert_eq!(end(true, vec![started(), returned(true), idle(), sign_out(0), LoaderEvent::Exit(-14)]), LoaderEnd::SignedOut);
+        // A direct launch never returns to idle or submits a sign-out command.
+        assert_eq!(end(true, vec![LoaderEvent::NativeSessionState(true), started(), returned(true), completed(0), LoaderEvent::Exit(-14)]), LoaderEnd::SignedOut);
+        assert_eq!(end(true, vec![started(), returned(true), completed(-1038), LoaderEvent::Exit(-14)]), LoaderEnd::Exit(-14));
+        assert_eq!(end(true, vec![started(), returned(true), completed(-2046), LoaderEvent::Exit(-14)]), LoaderEnd::Exit(-14));
+        assert_eq!(end(true, vec![started(), returned(true), completed(0), LoaderEvent::Exit(-1025)]), LoaderEnd::Exit(-1025));
         for events in [
-            vec![returned(true), idle(), sign_out(0), LoaderEvent::Exit(-14)],
-            vec![started(), returned(false), idle(), sign_out(0), LoaderEvent::Exit(-14)],
+            vec![returned(true), completed(0), LoaderEvent::Exit(-14)],
+            vec![started(), returned(false), completed(0), LoaderEvent::Exit(-14)],
             vec![started(), returned(true), idle(), sign_out(-256), LoaderEvent::Exit(-14)],
-            vec![started(), LoaderEvent::NativeStatus(-1025), returned(true), idle(), sign_out(0), LoaderEvent::Exit(-14)],
+            vec![started(), LoaderEvent::NativeStatus(-1025), returned(true), completed(0), LoaderEvent::Exit(-14)],
             vec![started(), returned(true), idle(), LoaderEvent::Exit(-14)],
         ] { assert_eq!(end(true, events), LoaderEnd::Exit(-14)); }
         assert_eq!(end(true, vec![idle(), sign_out(0), LoaderEvent::Closed]), LoaderEnd::Closed);
@@ -1612,7 +1941,9 @@ mod tests {
             profile_access: None,
             session: Session { history: dir.join("history.log"), label: "Fake".into(), log: dir.join("a.crystal.log") },
             friends_directory: None,
-            check: |_| Ok("Game version matches.".into()),
+            check: |_| (Ok("Game version matches.".into()), Default::default()),
+            viewer_check: || panic!("this fixture loader never asks for the Viewer check"),
+            trigger: crate::launch_timing::LaunchTrigger::Play,
         };
         (prepared, dir)
     }
@@ -1623,6 +1954,7 @@ mod tests {
         send: Duration::from_secs(5),
         start: Duration::from_secs(5),
         injector_exit: Duration::from_millis(10),
+        abort: None,
     };
 
     #[test]
@@ -1636,7 +1968,7 @@ mod tests {
         let loader = std::thread::spawn(move || {
             let file = OpenOptions::new().read(true).write(true).open(name).unwrap();
             let mut writer = file.try_clone().unwrap();
-            writeln!(writer, r#"{{"type":"hello","v":1,"pid":{},"native_auth":true,"native_social":true}}"#,
+            writeln!(writer, r#"{{"type":"hello","v":1,"pid":{},"native_auth":true,"native_social":true,"viewer_check":true}}"#,
                 std::process::id()).unwrap();
             let mut session = String::new();
             BufReader::new(file).read_line(&mut session).unwrap();
@@ -1646,7 +1978,7 @@ mod tests {
         });
         pipe.accept(FAST.hello, || Ok(())).unwrap();
         assert_eq!(pipe.handshake(&prepared.loader, FAST.hello).unwrap(), std::process::id());
-        assert!(pipe.supports_native_auth() && pipe.supports_native_social());
+        assert!(pipe.supports_native_auth() && pipe.supports_native_social() && pipe.supports_viewer_check());
         let (publishing_tx, publishing_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let measured = std::thread::scope(|scope| {
@@ -2087,7 +2419,7 @@ mod tests {
         let plan = Plan {
             social_only: false,
             invisible_login: false,
-            auto_away_minutes: 10, auto_login: crate::pol_less::AutoLogin::default(),
+            auto_away_minutes: 10, auto_login: crate::pol_less::AutoLogin::default(), viewer_gaps: false, trigger: Default::default(),
             tool: Tool::Ashita,
             settings: ToolSettings { ashita: dir.join("none").to_string_lossy().into_owned(), ..Default::default() },
         };
@@ -2098,7 +2430,7 @@ mod tests {
         let plan = Plan {
             social_only: false,
             invisible_login: false,
-            auto_away_minutes: 10, auto_login: crate::pol_less::AutoLogin::default(),
+            auto_away_minutes: 10, auto_login: crate::pol_less::AutoLogin::default(), viewer_gaps: false, trigger: Default::default(),
             tool: Tool::Ashita,
             settings: ToolSettings {
                 ashita: dir.to_string_lossy().into_owned(),
@@ -2113,7 +2445,7 @@ mod tests {
         let plan = Plan {
             social_only: false,
             invisible_login: false,
-            auto_away_minutes: 10, auto_login: crate::pol_less::AutoLogin::default(),
+            auto_away_minutes: 10, auto_login: crate::pol_less::AutoLogin::default(), viewer_gaps: false, trigger: Default::default(),
             tool: Tool::Ashita,
             settings: ToolSettings {
                 ashita: dir.to_string_lossy().into_owned(),
@@ -2142,7 +2474,7 @@ mod tests {
             server: String::new(), pol_id: "ABCD1234".into(), pol_password: "synthetic".into(),
             se_id: "synthetic".into(), se_password: "synthetic".into(), region: 0,
             launch_with: None, ashita_boot_ini: None, windower_profile: None };
-        let plan = Plan { tool: Tool::Vanilla, social_only: false, invisible_login: false, auto_away_minutes: 10, auto_login: crate::pol_less::AutoLogin::default(),
+        let plan = Plan { tool: Tool::Vanilla, social_only: false, invisible_login: false, auto_away_minutes: 10, auto_login: crate::pol_less::AutoLogin::default(), viewer_gaps: false, trigger: Default::default(),
             settings: ToolSettings { loader: loader.to_string_lossy().into_owned(),
                 ashita: root.join("missing-ashita").to_string_lossy().into_owned(),
                 windower: root.join("missing-windower").to_string_lossy().into_owned(),
@@ -2156,7 +2488,21 @@ mod tests {
         let prepared = prepare(&config, &plan, &account).unwrap();
         assert_eq!(prepared.tool, Tool::Vanilla);
         assert_eq!(prepared.install_dir, game);
-        assert!(prepared.base_ini.is_none() && prepared.profile.is_empty() && prepared.ffxi_settings.is_none());
+        assert!(prepared.base_ini.is_none() && prepared.profile.is_empty());
+        assert_eq!(prepared.ffxi_settings.unwrap().json, "{}", "default settings still prepare the scoped live-controller store");
+        let ashita = root.join("Ashita");
+        fs::create_dir_all(ashita.join("config/boot")).unwrap();
+        fs::write(ashita.join("Ashita-cli.exe"), []).unwrap();
+        let boot = b"[boot]\ncommand=pol.exe\n[ffxi.registry]\npadmode000=1,1,0,0,0,0\n";
+        fs::write(ashita.join("config/boot/fixture.ini"), boot).unwrap();
+        let mut ashita_plan = plan.clone();
+        ashita_plan.tool = Tool::Ashita;
+        ashita_plan.settings.ashita = ashita.to_string_lossy().into_owned();
+        ashita_plan.settings.boot_ini = "fixture.ini".into();
+        let prepared = prepare(&config, &ashita_plan, &account).unwrap();
+        assert_eq!(prepared.ffxi_settings.unwrap().json, "{}");
+        assert_eq!(prepared.base_ini.as_deref(), Some(boot.as_slice()));
+        assert_eq!(fs::read(ashita.join("config/boot/fixture.ini")).unwrap(), boot);
         let menu = root.join("iced-launcher/menu-playonlineus.json");
         fs::create_dir_all(menu.parent().unwrap()).unwrap();
         fs::write(&menu, "[1600,900]").unwrap();
@@ -2193,7 +2539,7 @@ mod tests {
             se_id: "synthetic".into(), se_password: "synthetic".into(), region: 0,
             launch_with: None, ashita_boot_ini: None, windower_profile: None };
         let mut plan = Plan { tool: Tool::Windower, social_only: false, invisible_login: false,
-            auto_away_minutes: 10, auto_login: crate::pol_less::AutoLogin::default(),
+            auto_away_minutes: 10, auto_login: crate::pol_less::AutoLogin::default(), viewer_gaps: false, trigger: Default::default(),
             settings: ToolSettings { loader: loader.to_string_lossy().into_owned(),
                 windower: windower.to_string_lossy().into_owned(), ..Default::default() } };
         for retained_menu in ["[640,480]", "not valid JSON"] {
@@ -2213,6 +2559,20 @@ mod tests {
                 assert_eq!(fs::read(&plugin_file).unwrap(), plugin);
                 assert_eq!(fs::read_to_string(&menu_file).unwrap(), retained_menu);
             }
+        }
+        // A resolved directory in a retained plan must not cache its profile.
+        plan.settings.windower_profile.clear();
+        for width in [1600, 1800] {
+            fs::write(&profile_file, format!("<settings><profile name=\"\"><width>{width}</width><height>900</height></profile></settings>")).unwrap();
+            let mut timing = Timeline::begin();
+            let prepared = prepare_with_progress(&config, &plan, &account, &mut timing, &mut |_| {}).unwrap();
+            assert!(prepared.profile.is_empty());
+            let values: serde_json::Value = serde_json::from_str(&prepared.ffxi_settings.unwrap().json).unwrap();
+            assert_eq!(values["0001"], width);
+            let marks = timing.unwritten_lines();
+            assert_eq!(marks.len(), 7);
+            assert!(marks.iter().all(|line| line.contains("sign-in stage: preparation:")));
+            assert!(!marks.iter().any(|line| line.contains("ABCD1234") || line.contains("synthetic") || line.contains(&root.to_string_lossy().to_string())));
         }
         fs::remove_dir_all(root).unwrap();
     }
@@ -2272,7 +2632,7 @@ mod tests {
             let mut writer = file.try_clone().unwrap();
             let mut reader = BufReader::new(file);
             on_hello();
-            writeln!(writer, r#"{{"type":"hello","v":1,"pid":{},"native_auth":true,"native_social":true}}"#, std::process::id()).unwrap();
+            writeln!(writer, r#"{{"type":"hello","v":1,"pid":{},"native_auth":true,"native_social":true,"viewer_check":true}}"#, std::process::id()).unwrap();
             let mut line = String::new();
             reader.read_line(&mut line).unwrap();
             got.lock().unwrap().push(std::mem::take(&mut line));
@@ -2298,14 +2658,15 @@ mod tests {
     }
 
     #[test]
-    fn authenticated_check_overlaps_native_services_and_survives_both_supervisor_handoffs() {
+    fn main_menu_check_follows_the_publish_and_survives_both_supervisor_handoffs() {
         use std::sync::mpsc::{self, Receiver, Sender};
         type Signals = (Sender<()>, Receiver<Result<String, String>>, Sender<()>);
         static SIGNALS: Mutex<Option<Signals>> = Mutex::new(None);
         static CHECKS: AtomicUsize = AtomicUsize::new(0);
-        // Hold idle until the check runs: a serialized implementation cannot complete this
-        // exchange. Neither a fast success nor refusal may bypass native startup services.
-        for (late_auth, late_idle, refused) in [(false, false, false), (false, false, true), (true, false, false), (false, true, false)] {
+        // pol-spec 07c §5.1: `authenticated` arrives early and starts nothing; W20 starts on
+        // `native_main_menu`, on its own thread, and the idle report waits for it here. Neither
+        // a fast success nor a refusal may bypass the idle report.
+        for (late_menu, late_idle, refused) in [(false, false, false), (false, false, true), (true, false, false), (false, true, false)] {
             CHECKS.store(0, Ordering::SeqCst);
             let (entered_tx, entered_rx) = mpsc::channel();
             let (verdict_tx, verdict_rx) = mpsc::channel();
@@ -2318,7 +2679,7 @@ mod tests {
                 entered.send(()).unwrap();
                 let verdict = verdict.recv_timeout(Duration::from_secs(10)).unwrap();
                 finished.send(()).unwrap();
-                verdict
+                (verdict, Default::default())
             };
             let (auth, outcome) = DeferAuth::new();
             let (done, got) = (Arc::new(AtomicBool::new(false)), Arc::new(Mutex::new(Vec::new())));
@@ -2326,11 +2687,15 @@ mod tests {
             let (checking_tx, checking_rx) = mpsc::channel();
             let observed = outcome.clone();
             let mut before_idle = Some(move |writer: &mut File| {
-                if late_auth { resume_rx.recv_timeout(Duration::from_secs(10)).unwrap(); }
                 writeln!(writer, r#"{{"type":"authenticated"}}"#).unwrap();
-                // A duplicate milestone must not issue a second version request.
                 writeln!(writer, r#"{{"type":"authenticated"}}"#).unwrap();
-                entered_rx.recv_timeout(Duration::from_secs(10)).expect("the version check must start before native idle");
+                assert!(matches!(entered_rx.recv_timeout(Duration::from_millis(100)), Err(mpsc::RecvTimeoutError::Timeout)),
+                    "no W20 on authentication: stock :53001 follows the main-menu publish");
+                if late_menu { resume_rx.recv_timeout(Duration::from_secs(10)).unwrap(); }
+                writeln!(writer, r#"{{"type":"native_main_menu","code":1,"returned":false}}"#).unwrap();
+                // A duplicate signal must not issue a second version request.
+                writeln!(writer, r#"{{"type":"native_main_menu","code":0,"returned":false}}"#).unwrap();
+                entered_rx.recv_timeout(Duration::from_secs(10)).expect("the version check must start at the main menu, before native idle");
                 checking_tx.send(()).unwrap();
                 if late_idle { resume_rx.recv_timeout(Duration::from_secs(10)).unwrap(); }
                 verdict_tx.send(if refused { Err("Update required: fixture version differs.".into()) } else { Ok("matches".into()) }).unwrap();
@@ -2342,11 +2707,11 @@ mod tests {
                 loader = Some(deferred_loader_events(pipe.to_owned(), !refused, done.clone(), got.clone(), || {}, before_idle.take().unwrap()));
                 Ok(Injector::Detached)
             };
-            let limits = if late_auth || late_idle { Timeouts { start: Duration::from_millis(300), ..FAST } } else { FAST };
+            let limits = if late_menu || late_idle { Timeouts { start: Duration::from_millis(400), ..FAST } } else { FAST };
             let result = run(prepared, auth, Timeline::begin(), &mut |_| {}, &mut spawn, test_turns(), limits).unwrap();
-            if late_auth || late_idle {
+            if late_menu || late_idle {
                 assert!(result.detail.contains("not yet confirmed"), "{}", result.detail);
-                if late_auth { assert_eq!(CHECKS.load(Ordering::SeqCst), 0, "no request before authentication"); }
+                if late_menu { assert_eq!(CHECKS.load(Ordering::SeqCst), 0, "no request before the main menu"); }
                 if late_idle { checking_rx.recv_timeout(Duration::from_secs(10)).unwrap(); }
                 assert!(outcome.lock().unwrap().is_none());
                 resume_tx.send(()).unwrap();
@@ -2364,18 +2729,165 @@ mod tests {
             let sent = lines(&got);
             assert_eq!(sent.iter().filter(|line| line.contains("native_start_game")).count(), usize::from(!refused));
             let log = fs::read_to_string(dir.join("a.crystal.log")).unwrap();
-            assert!(log.find("checking the FFXI version").unwrap() < log.find("Native startup services finished").unwrap());
+            let at = |what: &str| log.find(what).unwrap_or_else(|| panic!("{what}: {log}"));
+            // A timing line ends with its label: "timing +1.20s (+0.10s) W20 done".
+            let mark = |label: &str| at(&format!(") {label}\n"));
+            assert!(mark("sign-in done") < at("Viewer main menu reached; checking the FFXI version"), "{log}");
+            assert!(at("Viewer main menu reached; checking the FFXI version") < at("Native startup services finished"), "{log}");
+            assert_eq!(log.matches("checking the FFXI version").count(), 1, "{log}");
+            if !late_menu {
+                // Timed while the start wait owns the timeline: the next live log shows them.
+                assert!(mark("main menu reached") < at("checking the FFXI version"), "{log}");
+                if !late_idle {
+                    assert!(mark("W20 done") > at("checking the FFXI version"), "{log}");
+                    if !refused { assert!(mark("W20 done") < at("Game start sent"), "{log}"); }
+                }
+            }
             fs::remove_dir_all(dir).unwrap();
         }
+    }
+
+    /// pol-spec 07c §1: each `native_viewer_check` runs the injected W2U once, on the session
+    /// thread, and answers with the exact contract line; a refusal leaves the loader to fail
+    /// the sign-in before Open(1). The late case is answered by the supervisor (`watch`).
+    #[test]
+    fn viewer_check_requests_get_one_fresh_check_and_the_exact_answer() {
+        use crate::viewer::ConnectVerdict;
+        static VERDICT: Mutex<Option<ConnectVerdict>> = Mutex::new(None);
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        let verdicts = [
+            (ConnectVerdict::Current { version: "20110829_E".into() }, false),
+            (ConnectVerdict::Current { version: "20110829_E".into() }, true),
+            (ConnectVerdict::Outdated { local: "20110829_E".into(), remote: "20261001_0".into() }, false),
+            (ConnectVerdict::Failed("fixture: no PlayOnline Viewer".into()), false),
+            (ConnectVerdict::Unreachable("fixture: connection timed out".into()), true),
+            // An unanswered W2U lets the loader go on; if it then fails, the cause is kept.
+            (ConnectVerdict::Unreachable("fixture: connection timed out".into()), false),
+            // 07d §2.5: no network after the retries: reason "network", stop before Open(1).
+            (ConnectVerdict::NetworkNotReady("fixture: No such host is known. (11001)".into()), false),
+        ];
+        for (verdict, late) in verdicts {
+            CALLS.store(0, Ordering::SeqCst);
+            *VERDICT.lock().unwrap() = Some(verdict.clone());
+            let (mut prepared, dir) = fixture(Tool::Windower);
+            prepared.viewer_check = || {
+                CALLS.fetch_add(1, Ordering::SeqCst);
+                // A lost SYN on the connect (07d §4.5): its loss note reaches the launch log.
+                let attempt = crate::patch::Attempt { resolve: Some(Duration::from_millis(3)), connect: Some(Duration::from_millis(1180)),
+                    reply: Some(Duration::from_millis(164)), close: Some(Duration::from_millis(104)), ..Default::default() };
+                crate::viewer::ConnectCheck { verdict: VERDICT.lock().unwrap().clone().unwrap(),
+                    timing: crate::patch::CheckTiming { attempts: vec![attempt], ..Default::default() } }
+            };
+            let (auth, outcome) = DeferAuth::new();
+            let (done, got) = (Arc::new(AtomicBool::new(false)), Arc::new(Mutex::new(Vec::new())));
+            let mut loader = None;
+            let mut spawn = |_: &Prepared, pipe: &str, _: &mut SessionLog| -> Result<Injector, String> {
+                let (name, done, got) = (pipe.to_owned(), done.clone(), got.clone());
+                loader = Some(std::thread::spawn(move || {
+                    let file = OpenOptions::new().read(true).write(true).open(name).unwrap();
+                    let mut writer = file.try_clone().unwrap();
+                    let mut reader = BufReader::new(file);
+                    writeln!(writer, r#"{{"type":"hello","v":1,"pid":{},"native_auth":true,"native_social":true,"viewer_check":true}}"#, std::process::id()).unwrap();
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    got.lock().unwrap().push(std::mem::take(&mut line));
+                    // Past the 200 ms start wait: the supervisor must answer instead.
+                    if late { std::thread::sleep(Duration::from_millis(600)); }
+                    writeln!(writer, r#"{{"type":"native_viewer_check"}}"#).unwrap();
+                    reader.read_line(&mut line).unwrap();
+                    let answer = std::mem::take(&mut line);
+                    got.lock().unwrap().push(answer.clone());
+                    let answer: serde_json::Value = serde_json::from_str(&answer).unwrap();
+                    if answer["ok"] == true {
+                        for event in [r#"{"type":"authenticated"}"#, r#"{"type":"native_main_menu","code":1,"returned":false}"#, r#"{"type":"native_session_state","game":false}"#] {
+                            writeln!(writer, "{event}").unwrap();
+                        }
+                        reader.read_line(&mut line).unwrap();
+                        got.lock().unwrap().push(std::mem::take(&mut line));
+                        writeln!(writer, r#"{{"type":"native_session_state","game":true}}"#).unwrap();
+                        while !done.load(Ordering::SeqCst) { std::thread::sleep(Duration::from_millis(20)); }
+                        writeln!(writer, r#"{{"type":"exit","code":0}}"#).unwrap();
+                    } else {
+                        // What the loader does with any `ok:false`: the sign-in fails before Open(1).
+                        writeln!(writer, r#"{{"type":"error","message":{}}}"#, answer["error"]).unwrap();
+                    }
+                    while reader.read_line(&mut line).map(|n| n > 0).unwrap_or(false) { got.lock().unwrap().push(std::mem::take(&mut line)); }
+                }));
+                Ok(Injector::Detached)
+            };
+            let limits = if late { Timeouts { start: Duration::from_millis(200), ..FAST } } else { FAST };
+            let result = run(prepared, auth, Timeline::begin(), &mut |_| {}, &mut spawn, test_turns(), limits);
+            let expected = viewer_check_result_line(&verdict);
+            match (&verdict, late) {
+                (ConnectVerdict::Current { .. }, _) => {
+                    let result = result.unwrap();
+                    if late { assert!(result.detail.contains("not yet confirmed"), "{}", result.detail); }
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    while outcome.lock().unwrap().is_none() { assert!(Instant::now() < deadline); std::thread::sleep(Duration::from_millis(5)); }
+                    assert_eq!(*outcome.lock().unwrap(), Some(None), "the start was released");
+                    done.store(true, Ordering::SeqCst);
+                    wait_for(&result.alive, false);
+                }
+                (_, false) => {
+                    let error = result.err().unwrap();
+                    assert!(error.contains(&verdict.message()), "{error}");
+                    assert_eq!(error.contains(&format!("The PlayOnline version check also failed: {}", verdict.message())),
+                        matches!(verdict, ConnectVerdict::Unreachable(_)), "{error}");
+                }
+                (_, true) => {
+                    // Answered by the supervisor; the loader's error ends the session there.
+                    let result = result.unwrap();
+                    wait_for(&result.alive, false);
+                    assert!(outcome.lock().unwrap().is_none(), "no game start after a refused Viewer check");
+                }
+            }
+            loader.unwrap().join().unwrap();
+            let sent = lines(&got);
+            assert_eq!(sent[1], expected);
+            if matches!(verdict, ConnectVerdict::Current { .. }) {
+                assert_eq!(sent[1], "{\"type\":\"native_viewer_check_result\",\"ok\":true}\n");
+                assert_eq!(sent[2], "{\"type\":\"native_start_game\"}\n");
+            } else {
+                assert!(sent[1].contains(&format!("\"reason\":\"{}\"", verdict.reason().unwrap())), "{}", sent[1]);
+                assert!(!sent.iter().any(|line| line.contains("native_start_game")), "{sent:?}");
+            }
+            assert_eq!(CALLS.load(Ordering::SeqCst), 1, "one W2U per request");
+            let log = fs::read_to_string(dir.join("a.crystal.log")).unwrap();
+            // 07d §4.2: the trigger right after the launch clock; §4.5: the loss note.
+            let opening: Vec<_> = log.lines().take(2).collect();
+            assert!(opening[0].contains("[launcher] launch clock: ") && opening[1].ends_with("[launcher] launch trigger: Play"), "{log}");
+            assert!(log.contains("possible packet loss: W2U connect took 1.18 s, +1.00 s over its clean 0.18 s (1.0 s SYN/DNS retry)"), "{log}");
+            if !late && matches!(verdict, ConnectVerdict::Current { .. }) {
+                // W2U is timed before the member login completes (Open(1) follows the answer).
+                assert!(log.find(") W2U done\n").unwrap() < log.find(") sign-in done\n").unwrap(), "{log}");
+            }
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    /// pol-spec 07c §3: no launcher path but the loader's Connect request reaches the Viewer
+    /// server. The window, its gates and the batch use the local readiness check only.
+    #[test]
+    fn no_viewer_network_check_outside_connect() {
+        let connect = ["check_at", "_connect"].concat();
+        let network_status = ["viewer::", "status("].concat();
+        for (file, source) in [("main.rs", include_str!("main.rs")), ("session_worker.rs", include_str!("session_worker.rs")),
+            ("session_batch.rs", include_str!("session_batch.rs")), ("ui.rs", include_str!("ui.rs"))] {
+            assert!(!source.contains(&connect), "{file} must not run the Connect-time W2U");
+            assert!(!source.contains(&network_status), "{file} must use viewer::local_status");
+        }
+        let own = include_str!("pol_less.rs");
+        assert_eq!(own.matches(&format!("viewer::{connect}")).count(), 1, "only Prepared's Connect answer");
     }
 
     #[test]
     fn native_auth_or_startup_failure_never_releases_a_checked_game() {
         static CHECKED: AtomicBool = AtomicBool::new(false);
-        for authenticated in [false, true] {
+        // `main_menu`: the failure comes after the publish, with W20 already done.
+        for main_menu in [false, true] {
             CHECKED.store(false, Ordering::SeqCst);
             let (mut prepared, dir) = fixture(Tool::Windower);
-            prepared.check = |_| { CHECKED.store(true, Ordering::SeqCst); Ok("matches".into()) };
+            prepared.check = |_| { CHECKED.store(true, Ordering::SeqCst); (Ok("matches".into()), Default::default()) };
             let (auth, outcome) = DeferAuth::new();
             let got = Arc::new(Mutex::new(Vec::new()));
             let mut loader = None;
@@ -2385,12 +2897,13 @@ mod tests {
                     let file = OpenOptions::new().read(true).write(true).open(name).unwrap();
                     let mut writer = file.try_clone().unwrap();
                     let mut reader = BufReader::new(file);
-                    writeln!(writer, r#"{{"type":"hello","v":1,"pid":{},"native_auth":true,"native_social":true}}"#, std::process::id()).unwrap();
+                    writeln!(writer, r#"{{"type":"hello","v":1,"pid":{},"native_auth":true,"native_social":true,"viewer_check":true}}"#, std::process::id()).unwrap();
                     let mut line = String::new();
                     reader.read_line(&mut line).unwrap();
                     got.lock().unwrap().push(std::mem::take(&mut line));
-                    if authenticated {
-                        writeln!(writer, r#"{{"type":"authenticated"}}"#).unwrap();
+                    writeln!(writer, r#"{{"type":"authenticated"}}"#).unwrap();
+                    if main_menu {
+                        writeln!(writer, r#"{{"type":"native_main_menu","code":1,"returned":false}}"#).unwrap();
                         wait_for(&CHECKED, true);
                     }
                     writeln!(writer, r#"{{"type":"error","message":"fixture native startup failed"}}"#).unwrap();
@@ -2403,11 +2916,40 @@ mod tests {
             let error = run(prepared, auth, Timeline::begin(), &mut |_| {}, &mut spawn, test_turns(), FAST).err().unwrap();
             assert!(error.contains("fixture native startup failed"), "{error}");
             loader.unwrap().join().unwrap();
-            assert_eq!(CHECKED.load(Ordering::SeqCst), authenticated);
+            assert_eq!(CHECKED.load(Ordering::SeqCst), main_menu, "W20 only after the main menu");
             assert!(outcome.lock().unwrap().is_none());
             assert_eq!(lines(&got).len(), 1, "no native_start_game before all native services succeed");
             fs::remove_dir_all(dir).unwrap();
         }
+    }
+
+    /// A loader from before the Connect W2U (16e26f3) passes every other hello check but never
+    /// asks for the W2U, and the launcher sends none of its own: its :51240 would go out with no
+    /// :54000 in front of it. Refused before the session line, so the loader never signs in.
+    #[test]
+    fn a_loader_without_the_viewer_check_is_refused_before_the_session_line() {
+        let (prepared, dir) = fixture(Tool::Windower);
+        let (auth, outcome) = DeferAuth::new();
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let mut loader = None;
+        let mut spawn = |_: &Prepared, name: &str, _: &mut SessionLog| -> Result<Injector, String> {
+            let (name, got) = (name.to_owned(), got.clone());
+            loader = Some(std::thread::spawn(move || {
+                let file = OpenOptions::new().read(true).write(true).open(name).unwrap();
+                let mut writer = file.try_clone().unwrap();
+                let mut reader = BufReader::new(file);
+                writeln!(writer, r#"{{"type":"hello","v":1,"pid":{},"native_auth":true,"native_social":true,"native_batch":true}}"#, std::process::id()).unwrap();
+                let mut line = String::new();
+                while reader.read_line(&mut line).map(|n| n > 0).unwrap_or(false) { got.lock().unwrap().push(std::mem::take(&mut line)); }
+            }));
+            Ok(Injector::Detached)
+        };
+        let error = run(prepared, auth, Timeline::begin(), &mut |_| {}, &mut spawn, test_turns(), FAST).err().unwrap();
+        assert!(error.contains("does not run the PlayOnline Viewer version check"), "{error}");
+        loader.unwrap().join().unwrap();
+        assert!(lines(&got).is_empty(), "no session line: {:?}", lines(&got));
+        assert!(outcome.lock().unwrap().is_none());
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -2421,7 +2963,7 @@ mod tests {
         let (mut prepared, dir) = fixture(tool);
         prepared.check = |_| {
             ORDER.lock().unwrap().push("check");
-            Ok("Game version 30260904_1 matches the official server.".into())
+            (Ok("Game version 30260904_1 matches the official server.".into()), Default::default())
         };
         let (auth, outcome) = DeferAuth::new();
         let (done, got) = (Arc::new(AtomicBool::new(false)), Arc::new(Mutex::new(Vec::new())));
@@ -2457,7 +2999,7 @@ mod tests {
     #[test]
     fn an_update_required_check_leaves_the_session_signed_in_without_a_start() {
         let (mut prepared, dir) = fixture(Tool::Windower);
-        prepared.check = |_| Err(format!("{} installed 30260904_1, official server 30260905_0. Open Downloads.", crate::patch::UPDATE_REQUIRED));
+        prepared.check = |_| (Err(format!("{} installed 30260904_1, official server 30260905_0. Open Downloads.", crate::patch::UPDATE_REQUIRED)), Default::default());
         let (auth, outcome) = DeferAuth::new();
         let (done, got) = (Arc::new(AtomicBool::new(false)), Arc::new(Mutex::new(Vec::new())));
         let mut loader = None;
@@ -2489,7 +3031,7 @@ mod tests {
         let (mut prepared, dir) = fixture(Tool::Windower);
         prepared.check = |_| {
             ORDER.lock().unwrap().push("check");
-            Ok("matches".into())
+            (Ok("matches".into()), Default::default())
         };
         let (auth, outcome) = DeferAuth::new();
         let (done, got) = (Arc::new(AtomicBool::new(false)), Arc::new(Mutex::new(Vec::new())));
@@ -2558,4 +3100,274 @@ mod tests {
             loader.join().unwrap();
             let _ = fs::remove_dir_all(dir);
         }
-    }}
+    }
+
+    // ---- the parked warm host (pol-spec 07d §1.3-1.4, §5.2) ----
+
+    fn park_hello(park: bool) -> String {
+        format!(r#"{{"type":"hello","v":1,"pid":{},"native_auth":true,"native_social":true,"native_batch":true,"viewer_check":true,"park":{park}}}"#, std::process::id())
+    }
+
+    fn retail_account() -> Account {
+        Account { label: "Parked".into(), mode: crate::backend::AccountMode::Retail, server: String::new(), pol_id: "ABCD1234".into(),
+            pol_password: "synthetic-pw".into(), se_id: "synthetic".into(), se_password: "synthetic-se".into(), region: 0,
+            launch_with: None, ashita_boot_ini: None, windower_profile: None }
+    }
+
+    fn parked_plan(trigger: crate::launch_timing::LaunchTrigger) -> Plan {
+        Plan { tool: Tool::Windower, settings: Default::default(), social_only: false, invisible_login: false, auto_away_minutes: 10,
+            auto_login: AutoLogin::default(), viewer_gaps: false, trigger }
+    }
+
+    /// 07d §1.4, §5.2: the parked host gets only the `park` line until Play; at Play the
+    /// `credentials` line, then exactly the cold flow (W2U answered, W20 after the main menu,
+    /// the deferred start), with the trigger and `parked for` lines in the launch log.
+    #[test]
+    fn a_parked_host_gets_credentials_only_at_play_then_signs_in_like_a_cold_one() {
+        let (mut prepared, dir) = fixture(Tool::Windower);
+        prepared.viewer_check = || crate::viewer::ConnectCheck { verdict: crate::viewer::ConnectVerdict::Current { version: "20110829_E".into() }, timing: Default::default() };
+        prepared.check = |_| (Ok("Game version matches.".into()), Default::default());
+        let windower = Arc::new(AtomicBool::new(false));
+        let (done, got) = (Arc::new(AtomicBool::new(false)), Arc::new(Mutex::new(Vec::new())));
+        let (parked_tx, parked_rx) = std::sync::mpsc::channel::<()>();
+        let mut loader = None;
+        let mut spawn = |_: &Prepared, pipe: &str, _: &mut SessionLog| -> Result<Injector, String> {
+            let (name, done, got) = (pipe.to_owned(), done.clone(), got.clone());
+            let parked_tx = parked_tx.clone();
+            loader = Some(std::thread::spawn(move || {
+                let file = OpenOptions::new().read(true).write(true).open(name).unwrap();
+                let mut writer = file.try_clone().unwrap();
+                let mut reader = BufReader::new(file);
+                writeln!(writer, "{}", park_hello(true)).unwrap();
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                got.lock().unwrap().push(std::mem::take(&mut line));
+                writeln!(writer, r#"{{"type":"parked","pid":{},"polcore_ms":420}}"#, std::process::id()).unwrap();
+                parked_tx.send(()).unwrap();
+                reader.read_line(&mut line).unwrap();
+                got.lock().unwrap().push(std::mem::take(&mut line));
+                writeln!(writer, r#"{{"type":"native_viewer_check"}}"#).unwrap();
+                reader.read_line(&mut line).unwrap();
+                got.lock().unwrap().push(std::mem::take(&mut line));
+                for event in [r#"{"type":"authenticated"}"#, r#"{"type":"native_main_menu","code":1,"returned":false}"#, r#"{"type":"native_session_state","game":false}"#] {
+                    writeln!(writer, "{event}").unwrap();
+                }
+                reader.read_line(&mut line).unwrap();
+                got.lock().unwrap().push(std::mem::take(&mut line));
+                writeln!(writer, r#"{{"type":"native_session_state","game":true}}"#).unwrap();
+                while !done.load(Ordering::SeqCst) { std::thread::sleep(Duration::from_millis(20)); }
+                writeln!(writer, r#"{{"type":"exit","code":0}}"#).unwrap();
+                while reader.read_line(&mut line).map(|n| n > 0).unwrap_or(false) { got.lock().unwrap().push(std::mem::take(&mut line)); }
+            }));
+            Ok(Injector::Fake(windower.clone()))
+        };
+        let parked = park::park_prepared(prepared, "Main", AutoLogin { enabled: true, character_slot: 2 }, Timeline::begin(),
+            &mut |_| {}, &mut spawn, test_turns(), FAST, Duration::from_secs(5)).unwrap();
+        parked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(parked.info.polcore_ms, Some(420));
+        assert_eq!(parked.info.loader_pid, std::process::id());
+        std::thread::sleep(Duration::from_millis(100));
+        let before = lines(&got);
+        assert_eq!(before.len(), 1, "nothing but the park line before Play: {before:?}");
+        let park: serde_json::Value = serde_json::from_str(&before[0]).unwrap();
+        assert_eq!((park["type"].as_str(), park["auto_login"]["character_slot"].as_u64()), (Some("park"), Some(2)));
+        for secret in ["native_auth", "start_game", "pol_password", "otp"] { assert!(!before[0].contains(secret), "{secret}"); }
+        assert!(!windower.load(Ordering::SeqCst), "Windower stays until the game window shows");
+        let config = Config { experiment: dir.clone(), repository: dir.clone(), game_install: None, dat_overlays: Vec::new() };
+        let result = parked.play(&config, &parked_plan(crate::launch_timing::LaunchTrigger::ParkedPlay), retail_account(),
+            Zeroizing::new(String::new()), Instant::now(), &mut |_| {}, |_, _, _| panic!("the parked host was alive")).unwrap();
+        assert!(result.detail.contains("started through Windower"), "{}", result.detail);
+        done.store(true, Ordering::SeqCst);
+        wait_for(&result.alive, false);
+        loader.unwrap().join().unwrap();
+        let sent = lines(&got);
+        let credentials: serde_json::Value = serde_json::from_str(&sent[1]).unwrap();
+        assert_eq!(credentials["type"], "credentials");
+        assert_eq!(credentials["start_game"], false, "a Play signs in idle first");
+        assert!(credentials["native_auth"]["pol_id"].is_string() && credentials.get("install_dir").is_none());
+        assert_eq!(sent[2], "{\"type\":\"native_viewer_check_result\",\"ok\":true}\n");
+        assert_eq!(sent[3], "{\"type\":\"native_start_game\"}\n");
+        let log = fs::read_to_string(dir.join("a.crystal.log")).unwrap();
+        let at = |what: &str| log.find(what).unwrap_or_else(|| panic!("{what}: {log}"));
+        assert!(at("[launcher] park start: Windower 4 Main") < at("loader hello") && at("loader hello") < at("Host parked after"), "{log}");
+        assert!(at("Host parked after") < at("launch clock: ") && at("launch clock: ") < at("launch trigger: parked Play")
+            && at("launch trigger: parked Play") < at("parked for ") && at("parked for ") < at("credentials delivered")
+            && at("credentials delivered") < at("checking the FFXI version") && at("checking the FFXI version") < at("Game start sent"), "{log}");
+        assert!(!log.contains("synthetic-pw") && !log.contains("c3ludGhldGlj"), "{log}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// 07d §1.4: no Play is coming. Windower is stopped first, then the loader's pipe closes;
+    /// nothing else reached the loader.
+    #[test]
+    fn a_park_that_ends_before_play_stops_windower_first_and_sends_nothing() {
+        let (prepared, dir) = fixture(Tool::Windower);
+        let windower = Arc::new(AtomicBool::new(false));
+        let (got, order) = (Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(None)));
+        let mut loader = None;
+        let mut spawn = |_: &Prepared, pipe: &str, _: &mut SessionLog| -> Result<Injector, String> {
+            let (name, got, order, stopped) = (pipe.to_owned(), got.clone(), order.clone(), windower.clone());
+            loader = Some(std::thread::spawn(move || {
+                let windower = stopped;
+                let file = OpenOptions::new().read(true).write(true).open(name).unwrap();
+                let mut writer = file.try_clone().unwrap();
+                let mut reader = BufReader::new(file);
+                writeln!(writer, "{}", park_hello(true)).unwrap();
+                writeln!(writer, r#"{{"type":"parked","pid":{}}}"#, std::process::id()).unwrap();
+                let mut line = String::new();
+                while reader.read_line(&mut line).map(|n| n > 0).unwrap_or(false) { got.lock().unwrap().push(std::mem::take(&mut line)); }
+                // The pipe closed: was Windower already stopped?
+                *order.lock().unwrap() = Some(windower.load(Ordering::SeqCst));
+            }));
+            Ok(Injector::Fake(windower.clone()))
+        };
+        let mut parked = park::park_prepared(prepared, "", AutoLogin::default(), Timeline::begin(), &mut |_| {}, &mut spawn, test_turns(), FAST, Duration::from_secs(5)).unwrap();
+        assert!(parked.watch(Duration::from_millis(50)).is_none(), "still parked");
+        parked.kill();
+        loader.unwrap().join().unwrap();
+        assert_eq!(*order.lock().unwrap(), Some(true), "Windower.exe is stopped before the host");
+        assert_eq!(lines(&got).len(), 1, "only the park line: {:?}", lines(&got));
+        assert!(fs::read_to_string(dir.join("a.crystal.log")).unwrap().contains("Nothing was sent."));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Finding: a park the window closes while it is still starting stops itself, never
+    /// leaving Windower.exe running: before the tool starts nothing is spawned; while waiting
+    /// for the loader, or for `parked`, Windower is stopped first and nothing but the park
+    /// line ever reached the loader.
+    #[test]
+    fn a_park_closed_while_starting_stops_windower_itself() {
+        for phase in ["before spawn", "connect", "parked"] {
+            let (prepared, dir) = fixture(Tool::Windower);
+            let abort: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(phase == "before spawn")));
+            let windower = Arc::new(AtomicBool::new(false));
+            let (spawned, got) = (Arc::new(AtomicBool::new(false)), Arc::new(Mutex::new(Vec::new())));
+            let mut loader = None;
+            let mut spawn = |_: &Prepared, pipe: &str, _: &mut SessionLog| -> Result<Injector, String> {
+                spawned.store(true, Ordering::SeqCst);
+                let (name, got) = (pipe.to_owned(), got.clone());
+                if phase == "parked" {
+                    loader = Some(std::thread::spawn(move || {
+                        let file = OpenOptions::new().read(true).write(true).open(name).unwrap();
+                        let mut writer = file.try_clone().unwrap();
+                        let mut reader = BufReader::new(file);
+                        writeln!(writer, "{}", park_hello(true)).unwrap();
+                        let mut line = String::new();
+                        while reader.read_line(&mut line).map(|n| n > 0).unwrap_or(false) { got.lock().unwrap().push(std::mem::take(&mut line)); }
+                    }));
+                }
+                Ok(Injector::Fake(windower.clone()))
+            };
+            // The window closes the park 150 ms in, whatever it is waiting for.
+            let closer = std::thread::spawn(move || { std::thread::sleep(Duration::from_millis(150)); abort.store(true, Ordering::Release); });
+            let started = Instant::now();
+            let limits = Timeouts { connect: Duration::from_secs(20), abort: Some(abort), ..FAST };
+            let result = park::park_prepared(prepared, "", AutoLogin::default(), Timeline::begin(), &mut |_| {}, &mut spawn, test_turns(), limits, Duration::from_secs(20));
+            closer.join().unwrap();
+            let error = result.err().unwrap();
+            assert!(error.starts_with(park::ABORTED), "{phase}: {error}");
+            assert!(started.elapsed() < Duration::from_secs(5), "{phase}: stopped promptly, not at a limit");
+            assert_eq!(spawned.load(Ordering::SeqCst), phase != "before spawn", "{phase}");
+            assert_eq!(windower.load(Ordering::SeqCst), phase != "before spawn", "{phase}: Windower is stopped by the park itself");
+            if let Some(loader) = loader { loader.join().unwrap(); }
+            assert!(lines(&got).iter().all(|line| line.contains("\"type\":\"park\"")), "{phase}: {:?}", lines(&got));
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    /// 07d §1.6: a hello without `park` is closed as unsupported before any line; a loader
+    /// that never parks, or ends while parking, fails the park; one that ends while parked is
+    /// seen by `watch`.
+    #[test]
+    fn park_failures_close_the_host_and_say_why() {
+        for case in ["unsupported", "error", "ended", "parked then ended"] {
+            let (prepared, dir) = fixture(Tool::Vanilla);
+            let got = Arc::new(Mutex::new(Vec::new()));
+            let mut loader = None;
+            let mut spawn = |_: &Prepared, pipe: &str, _: &mut SessionLog| -> Result<Injector, String> {
+                let (name, got) = (pipe.to_owned(), got.clone());
+                loader = Some(std::thread::spawn(move || {
+                    let file = OpenOptions::new().read(true).write(true).open(name).unwrap();
+                    let mut writer = file.try_clone().unwrap();
+                    let mut reader = BufReader::new(file);
+                    writeln!(writer, "{}", park_hello(case != "unsupported")).unwrap();
+                    let mut line = String::new();
+                    if case != "unsupported" {
+                        reader.read_line(&mut line).unwrap();
+                        got.lock().unwrap().push(std::mem::take(&mut line));
+                    }
+                    match case {
+                        "error" => writeln!(writer, r#"{{"type":"error","message":"polcore could not be created"}}"#).unwrap(),
+                        "parked then ended" => {
+                            writeln!(writer, r#"{{"type":"parked","pid":{}}}"#, std::process::id()).unwrap();
+                            return;
+                        }
+                        _ => {}
+                    }
+                    while reader.read_line(&mut line).map(|n| n > 0).unwrap_or(false) { got.lock().unwrap().push(std::mem::take(&mut line)); }
+                }));
+                Ok(Injector::Detached)
+            };
+            let result = park::park_prepared(prepared, "", AutoLogin::default(), Timeline::begin(), &mut |_| {}, &mut spawn, test_turns(), FAST, Duration::from_millis(300));
+            match case {
+                "unsupported" => assert_eq!(result.err().unwrap(), park::UNSUPPORTED),
+                "error" => assert_eq!(result.err().unwrap(), "polcore could not be created"),
+                "ended" => assert!(result.err().unwrap().contains("did not park within"), "never parked"),
+                _ => {
+                    let mut parked = result.unwrap();
+                    assert!(parked.watch(Duration::from_secs(5)).is_some(), "a host that ends while parked is reported");
+                    parked.kill();
+                }
+            }
+            loader.unwrap().join().unwrap();
+            let sent = lines(&got);
+            assert!(sent.iter().all(|line| line.contains("\"type\":\"park\"")), "{case}: {sent:?}");
+            assert_eq!(sent.len(), usize::from(case != "unsupported"), "{case}");
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    /// 07d §1.4: a host lost after frame 2 and before the credentials went out never got
+    /// them; the same worker launches cold instead.
+    #[test]
+    fn a_parked_host_lost_before_the_credentials_falls_back_cold() {
+        let (prepared, dir) = fixture(Tool::Vanilla);
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let (gone_tx, gone_rx) = std::sync::mpsc::channel::<()>();
+        let mut loader = None;
+        let mut spawn = |_: &Prepared, pipe: &str, _: &mut SessionLog| -> Result<Injector, String> {
+            let (name, got, gone_tx) = (pipe.to_owned(), got.clone(), gone_tx.clone());
+            loader = Some(std::thread::spawn(move || {
+                let file = OpenOptions::new().read(true).write(true).open(name).unwrap();
+                let mut writer = file.try_clone().unwrap();
+                let mut reader = BufReader::new(file);
+                writeln!(writer, "{}", park_hello(true)).unwrap();
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                got.lock().unwrap().push(std::mem::take(&mut line));
+                writeln!(writer, r#"{{"type":"parked","pid":{}}}"#, std::process::id()).unwrap();
+                // The host dies while parked.
+                drop(writer);
+                drop(reader);
+                gone_tx.send(()).unwrap();
+            }));
+            Ok(Injector::Detached)
+        };
+        let parked = park::park_prepared(prepared, "", AutoLogin::default(), Timeline::begin(), &mut |_| {}, &mut spawn, test_turns(), FAST, Duration::from_secs(5)).unwrap();
+        gone_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        loader.unwrap().join().unwrap();
+        let config = Config { experiment: dir.clone(), repository: dir.clone(), game_install: None, dat_overlays: Vec::new() };
+        let cold = std::cell::Cell::new(false);
+        let error = parked.play(&config, &parked_plan(crate::launch_timing::LaunchTrigger::ParkedPlay), retail_account(),
+            Zeroizing::new("123456".into()), Instant::now(), &mut |_| {}, |account, otp, _| {
+                assert_eq!((account.pol_password.as_str(), otp.as_str()), ("synthetic-pw", "123456"), "the same credentials go cold");
+                cold.set(true);
+                Err("fixture cold launch".into())
+            }).err().unwrap();
+        assert_eq!(error, "fixture cold launch");
+        assert!(cold.get());
+        assert_eq!(lines(&got).len(), 1, "the credentials never reached the dead host");
+        assert!(fs::read_to_string(dir.join("a.crystal.log")).unwrap().contains("parked host lost before Play"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+}

@@ -76,40 +76,174 @@ pub enum Availability {
     PartialOutage,
     /// Official status page reports all sixteen production worlds down.
     Outage,
-    /// An official all-world maintenance notice covers the current instant.
+    /// The status page shows all sixteen production worlds in maintenance, or an
+    /// official all-world maintenance notice's window covers the current instant.
     Maintenance,
     Unknown,
 }
+
+/// The stated window of an official all-worlds maintenance notice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaintenanceWindow {
+    pub title: String,
+    pub start: DateTime<Utc>,
+    pub end: DateTime<Utc>,
+}
+
+/// A read of the status page that shows all 16 worlds up this long after a window's start
+/// ends that window early; before it, the page may simply lag the start of maintenance.
+const EARLY_END_AFTER: chrono::Duration = chrono::Duration::minutes(15);
 
 #[derive(Debug, Clone)]
 pub struct ServiceSnapshot {
     pub news: Vec<NewsItem>,
     pub notices: Vec<NewsItem>,
     pub news_note: String,
+    /// What the official world status page itself showed (`Unknown` when it could not be
+    /// read). The Play gate's verdict combines it with `windows`: `recent_status`.
     pub availability: Availability,
     pub availability_note: String,
+    /// The stated windows of the all-worlds maintenance notices read with it. A read that
+    /// could not fetch every notice keeps the windows already known (`apply`).
+    pub windows: Vec<MaintenanceWindow>,
+    /// This read fetched the maintenance index and every all-worlds notice it reads.
+    pub windows_complete: bool,
+    /// Windows a read 15+ minutes into them showed over (every world up). Carried across
+    /// reads by `apply`, so a later unreadable or partial page does not reinstate them.
+    pub ended_early: Vec<EarlyEnd>,
+    /// When the world status page was requested (UTC, "%Y-%m-%d %H:%M:%S UTC").
     pub checked_at: String,
 }
 
+/// A window that ended early: `seen` is the read that showed every world up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EarlyEnd {
+    pub title: String,
+    pub start: DateTime<Utc>,
+    pub seen: DateTime<Utc>,
+}
+
+/// How long a status page reading counts. Official windows are absolute and never expire.
+const STATUS_FRESH: chrono::Duration = chrono::Duration::seconds(360);
+
 impl ServiceSnapshot {
-    /// Headlines may be cached; downtime must be based on a recent status read.
+    /// Headlines may be cached; downtime must be based on a recent status read. The launcher
+    /// itself asks `recent_status` (with its note) and lets a fresh play flag overrule it.
+    #[cfg(test)]
     pub fn recent_availability(&self, now: DateTime<Utc>) -> Availability {
-        let Ok(checked) = chrono::NaiveDateTime::parse_from_str(&self.checked_at, "%Y-%m-%d %H:%M:%S UTC") else {
-            return Availability::Unknown;
-        };
-        let age = now.signed_duration_since(checked.and_utc());
-        if age < chrono::Duration::zero() || age > chrono::Duration::seconds(360) {
-            return Availability::Unknown;
-        }
-        let maintenance_active = self.notices.iter().any(|notice| {
-            is_all_worlds_notice(&notice.title) && maintenance_window_active(&notice.summary, now)
+        self.recent_status(now).0
+    }
+
+    fn checked(&self) -> Option<DateTime<Utc>> {
+        NaiveDateTime::parse_from_str(&self.checked_at, "%Y-%m-%d %H:%M:%S UTC").ok().map(|checked| checked.and_utc())
+    }
+
+    /// The verdict at `now` and the note that explains it. A page reading older than six
+    /// minutes (or none) is `Unknown`, which never blocks Play; an official window that covers
+    /// now is still maintenance then (a PC that slept through its start, failed reads).
+    pub fn recent_status(&self, now: DateTime<Utc>) -> (Availability, String) {
+        let fresh = self.checked().filter(|checked| {
+            let age = now.signed_duration_since(*checked);
+            age >= chrono::Duration::zero() && age <= STATUS_FRESH
         });
-        match (self.availability, maintenance_active) {
-            // Keep the underlying outage: the scheduled end does not establish recovery.
-            (Availability::Outage, true) => Availability::Maintenance,
-            (Availability::Maintenance, false) => Availability::Unknown,
-            _ => self.availability,
+        if let Some(checked) = fresh {
+            return decide(self.availability, &self.availability_note, &self.windows, &self.ended_early, checked, now);
         }
+        match decide(Availability::Unknown, "", &self.windows, &self.ended_early, now, now) {
+            (Availability::Unknown, _) => (Availability::Unknown, self.availability_note.clone()),
+            (state, note) => (state, note.trim_end().to_owned()),
+        }
+    }
+
+    /// Remembers the windows this read ends early.
+    fn note_early_ends(&mut self) {
+        let Some(checked) = self.checked() else { return };
+        self.ended_early.retain(|early| self.windows.iter().any(|w| w.title == early.title && w.start == early.start));
+        if self.availability != Availability::Operational { return; }
+        for window in &self.windows {
+            if window.start + EARLY_END_AFTER <= checked && checked < window.end
+                && !self.ended_early.iter().any(|early| early.title == window.title && early.start == window.start) {
+                self.ended_early.push(EarlyEnd { title: window.title.clone(), start: window.start, seen: checked });
+            }
+        }
+    }
+}
+
+/// `next`'s headlines (another language's, or none) with `previous`'s status: the page
+/// reading, the windows and the read time are the same in every language, so a language
+/// switch never leaves Play ungated until the new language's first read lands.
+pub fn keep_status(previous: Option<&ServiceSnapshot>, next: Option<ServiceSnapshot>) -> Option<ServiceSnapshot> {
+    // Saved headlines alone hold no status read: nothing to keep.
+    let Some(previous) = previous.filter(|previous| previous.checked().is_some() || !previous.windows.is_empty()) else { return next };
+    let mut next = next.unwrap_or_else(empty_snapshot);
+    next.availability = previous.availability;
+    next.availability_note = previous.availability_note.clone();
+    next.windows = previous.windows.clone();
+    next.windows_complete = previous.windows_complete;
+    next.ended_early = previous.ended_early.clone();
+    next.checked_at = previous.checked_at.clone();
+    Some(next)
+}
+
+/// Which decision path `decide` took, for the live probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Decision {
+    /// Every production world shows the maintenance icon: no notice needed, and the
+    /// window's end does not end it.
+    PageMaintenance,
+    /// A window covers now and no read 15+ minutes into it shows every world up.
+    WindowFirst,
+    /// A read 15+ minutes into the window (this one, or an earlier one) shows every world up:
+    /// maintenance ended early.
+    EarlyEnd,
+    /// No window covers now, or it ended early: the page's own reading (`Unknown` when
+    /// unreadable; an outage stays an outage after a window's end, which never establishes
+    /// recovery).
+    Page,
+}
+
+/// When `window` was seen to end early: by an earlier read, or by this one.
+fn early_end_at(page: Availability, window: &MaintenanceWindow, ended_early: &[EarlyEnd], checked: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    ended_early.iter().find(|early| early.title == window.title && early.start == window.start).map(|early| early.seen)
+        .or_else(|| (page == Availability::Operational && checked >= window.start + EARLY_END_AFTER).then_some(checked))
+}
+
+fn decision_path<'a>(page: Availability, windows: &'a [MaintenanceWindow], ended_early: &[EarlyEnd], checked: DateTime<Utc>, now: DateTime<Utc>)
+    -> (Decision, Option<&'a MaintenanceWindow>, Option<DateTime<Utc>>) {
+    let active = windows.iter().find(|window| window.start <= now && now < window.end);
+    let early = active.and_then(|window| early_end_at(page, window, ended_early, checked));
+    let path = match (page, active, early) {
+        (Availability::Maintenance, _, _) => Decision::PageMaintenance,
+        (Availability::Operational, Some(_), Some(_)) => Decision::EarlyEnd,
+        (_, Some(_), None) => Decision::WindowFirst,
+        (_, _, _) => Decision::Page,
+    };
+    (path, active, early)
+}
+
+/// Window first: an official all-worlds maintenance window covering `now` is Maintenance
+/// even while the status page (published every five minutes, and late to change at
+/// 05:07 UTC on 2026-10-13) still shows the worlds up.
+fn decide(page: Availability, page_note: &str, windows: &[MaintenanceWindow], ended_early: &[EarlyEnd], checked: DateTime<Utc>, now: DateTime<Utc>)
+    -> (Availability, String) {
+    let (path, active, early) = decision_path(page, windows, ended_early, checked, now);
+    let title = active.map_or("", |window| window.title.as_str());
+    match path {
+        Decision::PageMaintenance if active.is_some() => (Availability::Maintenance, tf(
+            "{note} Scheduled maintenance notice also active: {title}.", &[("note", &page_note), ("title", &title)])),
+        Decision::PageMaintenance | Decision::Page => (page, page_note.to_owned()),
+        Decision::EarlyEnd => {
+            let minutes = active.zip(early).map_or(0, |(window, seen)| seen.signed_duration_since(window.start).num_minutes());
+            (Availability::Operational, tf(
+                "{note} All worlds were up {minutes} minutes into the scheduled maintenance ({title}), so it ended early.",
+                &[("note", &page_note), ("minutes", &minutes), ("title", &title)]))
+        }
+        Decision::WindowFirst if page == Availability::Operational => (Availability::Maintenance, tf(
+            "Official scheduled all-world maintenance window is active: {title}. The status page still shows the worlds up, but it can lag the start of maintenance.",
+            &[("title", &title)])),
+        Decision::WindowFirst => (Availability::Maintenance, format!("{} {page_note}", tf(
+            "Official scheduled all-world maintenance window is active: {title}. Completion may change.",
+            &[("title", &title)]))),
     }
 }
 
@@ -128,6 +262,9 @@ fn empty_snapshot() -> ServiceSnapshot {
         news_note: String::new(),
         availability: Availability::Unknown,
         availability_note: t("Checking official world status…").into(),
+        windows: Vec::new(),
+        windows_complete: false,
+        ended_early: Vec::new(),
         checked_at: String::new(),
     }
 }
@@ -163,7 +300,17 @@ pub fn apply(current: &mut Option<ServiceSnapshot>, update: Update) {
             current.notices = status.notices;
             current.availability = status.availability;
             current.availability_note = status.availability_note;
+            // Windows are absolute official times: a read that could not fetch every notice
+            // (common around maintenance) adds what it read and keeps the windows it missed.
+            if status.windows_complete {
+                current.windows = status.windows;
+            } else {
+                current.windows.retain(|old| !status.windows.iter().any(|new| new.title == old.title));
+                current.windows.extend(status.windows);
+            }
+            current.windows_complete = status.windows_complete;
             current.checked_at = status.checked_at;
+            current.note_early_ends();
         }
     }
 }
@@ -289,12 +436,47 @@ pub async fn refresh() -> Result<ServiceSnapshot, String> {
     refresh_with_progress(crate::i18n::current(), None, |_| {}).await
 }
 
-fn web_client() -> Result<reqwest::Client, String> {
+/// Chrome 138 reached stable on this day; a new stable major follows every 4 weeks.
+const CHROME_ANCHOR: (u32, (i32, u32, u32)) = (138, (2025, 6, 24));
+const CHROME_CADENCE_DAYS: i64 = 28;
+
+/// The Chrome major a typical player runs on `day`: the stable major by the 4-week cadence
+/// from `CHROME_ANCHOR`, minus one (users lag behind the newest release). Never older than
+/// one before the anchor, whatever the clock says.
+pub(crate) fn chrome_major(day: chrono::NaiveDate) -> u32 {
+    let (major, (year, month, date)) = CHROME_ANCHOR;
+    let anchor = chrono::NaiveDate::from_ymd_opt(year, month, date).expect("valid anchor date");
+    let releases = (day - anchor).num_days().max(0) / CHROME_CADENCE_DAYS;
+    major + u32::try_from(releases).unwrap_or(u32::MAX - major) - 1
+}
+
+/// `browser_user_agent` for `day`.
+fn browser_user_agent_on(day: chrono::NaiveDate) -> String {
+    format!("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{}.0.0.0 Safari/537.36",
+        chrome_major(day))
+}
+
+/// What a player's browser sends: Square Enix's sites (playonline.com news and status, the
+/// official installer host) see an ordinary visitor, never a third-party launcher name.
+/// Chrome on Windows 10/11 x64 in its reduced form (Windows 11 still reports NT 10.0, minor
+/// versions are zeros), its major following today's date (`chrome_major`), so no build
+/// keeps sending one fixed version. Each refresh and download builds its client, so the
+/// date is the request's. The rest of the request is not Chrome's (rustls ClientHello,
+/// HTTP/1.1, no Accept-Encoding or client hints), and stock POL never fetches these pages:
+/// its Viewer reads PML pages from wh000.pol.com with its own headers (pol-spec 10), the
+/// route that would look like POL (not taken yet: an owner decision). The one PML file Crystal
+/// reads, FFXI's play flag while a Play waits (`play_flag`), goes through this same client as a
+/// plain request (owner decision 2026-10-13).
+pub(crate) fn browser_user_agent() -> String {
+    browser_user_agent_on(chrono::Utc::now().date_naive())
+}
+
+pub(crate) fn web_client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(12))
         .connect_timeout(Duration::from_secs(5))
         .redirect(reqwest::redirect::Policy::none())
-        .user_agent("FFXI-Iced-Launcher/0.1 (public news reader)")
+        .user_agent(browser_user_agent())
         .build()
         .map_err(|e| e.to_string())
 }
@@ -304,57 +486,57 @@ pub async fn refresh_status(lang: Lang) -> Result<ServiceSnapshot, String> {
     Ok(read_status(&web_client()?, lang).await)
 }
 
-fn availability_with_notice(
-    worlds: &Result<(Availability, String), String>, active_notice: Option<&str>,
-) -> (Availability, String) {
-    match (worlds, active_notice) {
-        (Ok(status), _) => status.clone(),
-        (Err(_), Some(title)) => (Availability::Maintenance, tf(
-            "Official scheduled all-world maintenance window is active: {title}. Completion may change.",
-            &[("title", &title)],
-        )),
-        (Err(_), None) => (Availability::Unknown, t("Official world status is unavailable. This does not establish a game outage. Check official notices.").into()),
+/// The status page's own reading; an unreadable page establishes nothing.
+fn page_availability(worlds: &Result<(Availability, String), String>) -> (Availability, String) {
+    match worlds {
+        Ok(status) => status.clone(),
+        Err(error) => (Availability::Unknown, tf("{note} Official world status unavailable: {error}.", &[
+            ("note", &t("Official world status is unavailable. This does not establish a game outage. Check official notices.")),
+            ("error", error),
+        ])),
     }
 }
 
 async fn read_status(client: &reqwest::Client, lang: Lang) -> ServiceSnapshot {
     let source = sources(lang);
+    // Stamped when the page is requested, not after the notices: the 15-minute early-end
+    // check and the freshness age must describe the page reading itself.
+    let requested = Utc::now();
     let (maintenance, world_status) = tokio::join!(
         fetch_page(client, source.maintenance, lang), fetch(client, WORLD_STATUS_URL),
     );
     let mut notes = Vec::new();
+    let mut windows_complete = true;
     let mut notices = match maintenance.and_then(|body| parse_notices(&body)) {
         Ok(items) => items,
         Err(e) => {
             notes.push(tf("Maintenance notices unavailable: {error}", &[("error", &e)]));
+            windows_complete = false;
             Vec::new()
         }
     };
-    let mut active_notice = None;
+    let mut windows = Vec::new();
     for item in notices.iter_mut().filter(|n| is_all_worlds_notice(&n.title)).take(3) {
         match fetch_page(client, &item.url, lang).await {
             Ok(body) => {
                 item.summary = notice_body(&body);
-                if maintenance_window_active(&item.summary, Utc::now()) {
-                    active_notice = Some(item.title.clone());
+                // Read before the summary is shortened for display.
+                if let Some((start, end)) = notice_window(&item.summary) {
+                    windows.push(MaintenanceWindow { title: item.title.clone(), start, end });
                 }
                 item.summary = shorten(&item.summary, 1800);
             }
-            Err(e) => notes.push(tf("Maintenance detail unavailable: {error}", &[("error", &e)])),
+            Err(e) => {
+                notes.push(tf("Maintenance detail unavailable: {error}", &[("error", &e)]));
+                windows_complete = false;
+            }
         }
     }
-    let worlds = world_status.and_then(|body| parse_world_status(&body));
-    let (availability, mut availability_note) = availability_with_notice(&worlds, active_notice.as_deref());
-    if let Err(error) = worlds {
-        availability_note = tf("{note} Official world status unavailable: {error}.",
-            &[("note", &availability_note), ("error", &error)]);
-    } else if let Some(title) = active_notice {
-        availability_note = tf("{note} Scheduled maintenance notice also active: {title}.",
-            &[("note", &availability_note), ("title", &title)]);
-    }
+    let (availability, availability_note) = page_availability(&world_status.and_then(|body| parse_world_status(&body)));
     ServiceSnapshot {
-        news: Vec::new(), notices, news_note: notes.join(" "), availability, availability_note,
-        checked_at: Utc::now().format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+        news: Vec::new(), notices, news_note: notes.join(" "), availability, availability_note, windows,
+        windows_complete, ended_early: Vec::new(),
+        checked_at: requested.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
     }
 }
 
@@ -880,6 +1062,8 @@ fn parse_world_status(html: &str) -> Result<(Availability, String), String> {
                 Some("/ff11us/server/imgs/status_00.gif") => 0,
                 Some("/ff11us/server/imgs/status_01.gif") => 1,
                 Some("/ff11us/server/imgs/status_02.gif") => 2,
+                // Every world showed it during All Worlds Maintenance (Oct. 12), 05:07 UTC.
+                Some("/ff11us/server/imgs/status_04.gif") => 4,
                 _ => return Err(t("Unrecognized official world status indicator").into()),
             };
             if states.insert(name, state).is_some() {
@@ -901,12 +1085,18 @@ fn parse_world_status(html: &str) -> Result<(Availability, String), String> {
             }
         })
         .collect();
+    // A world in maintenance (4) counts as down; all of them is maintenance itself.
     let (state, text) = if affected.is_empty() {
         (
             Availability::Operational,
             t("Official status page reports all 16 production worlds up.").to_owned(),
         )
-    } else if states.values().all(|state| *state == 2) {
+    } else if states.values().all(|state| *state == 4) {
+        (
+            Availability::Maintenance,
+            t("Official status page shows all 16 production worlds in maintenance.").to_owned(),
+        )
+    } else if states.values().all(|state| matches!(*state, 2 | 4)) {
         (
             Availability::Outage,
             t("Official status page reports all 16 production worlds down.").to_owned(),
@@ -977,17 +1167,32 @@ fn is_all_worlds_notice(title: &str) -> bool {
         || (title.starts_with("全ワールド") && title.contains("メンテナンス"))
 }
 
-/// Whether an announcement's stated window covers `now`, in whichever
-/// language the page is in.
-fn maintenance_window_active(text: &str, now: DateTime<Utc>) -> bool {
-    maintenance_active(text, now) || maintenance_active_ja(text, now)
+/// An announcement's stated window, in whichever language the page is in.
+fn notice_window(text: &str) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+    window_en(text).or_else(|| window_ja(text))
 }
 
-/// The Japanese counterpart of `maintenance_active`: only the explicit window
+/// Whether an announcement's stated window covers `now` (the end is exclusive).
+#[cfg(test)]
+fn maintenance_window_active(text: &str, now: DateTime<Utc>) -> bool {
+    notice_window(text).is_some_and(|(start, end)| start <= now && now < end)
+}
+
+#[cfg(test)]
+fn maintenance_active(text: &str, now: DateTime<Utc>) -> bool {
+    window_en(text).is_some_and(|(start, end)| start <= now && now < end)
+}
+
+#[cfg(test)]
+fn maintenance_active_ja(text: &str, now: DateTime<Utc>) -> bool {
+    window_ja(text).is_some_and(|(start, end)| start <= now && now < end)
+}
+
+/// The Japanese counterpart of `window_en`: only the explicit window
 /// the notice states after "日　時：" (JST), as one start and one end,
 /// "2026年9月29日(火) 14:00より15:30頃まで" or with the end's own date. Anything
 /// else (no window, no year, an end before the start) stays unknown.
-fn maintenance_active_ja(text: &str, now: DateTime<Utc>) -> bool {
+fn window_ja(text: &str) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
     let compact: String = text
         .chars()
         .filter(|c| !c.is_whitespace() && *c != '頃')
@@ -997,10 +1202,10 @@ fn maintenance_active_ja(text: &str, now: DateTime<Utc>) -> bool {
         .or_else(|| compact.split_once("日時:"))
         .map(|(_, rest)| rest)
     else {
-        return false;
+        return None;
     };
     let Some((window, _)) = rest.split_once("まで") else {
-        return false;
+        return None;
     };
     // Weekday marks "(火)" / "（火）".
     let mut plain = String::new();
@@ -1018,13 +1223,13 @@ fn maintenance_active_ja(text: &str, now: DateTime<Utc>) -> bool {
         .or_else(|| plain.split_once("から"))
         .or_else(|| plain.split_once(['～', '〜', '~']))
     else {
-        return false;
+        return None;
     };
     let (Some(start), Some(end)) = (ja_clock(from), ja_clock(to)) else {
-        return false;
+        return None;
     };
     let (Some(year), Some((month, day))) = (start.year, start.month_day) else {
-        return false;
+        return None;
     };
     let jst = FixedOffset::east_opt(9 * 3600).expect("valid offset");
     let at = |year: i32, (month, day): (u32, u32), (hour, minute): (u32, u32)| {
@@ -1040,8 +1245,8 @@ fn maintenance_active_ja(text: &str, now: DateTime<Utc>) -> bool {
         end.time,
     );
     match (start_at, end_at) {
-        (Some(start), Some(end)) if end > start => start <= now && now < end,
-        _ => false,
+        (Some(start), Some(end)) if end > start => Some((start, end)),
+        _ => None,
     }
 }
 
@@ -1082,26 +1287,26 @@ fn ja_clock(text: &str) -> Option<JaClock> {
     Some(JaClock { year, month_day, time: (hour, minute.parse().ok()?) })
 }
 
-fn maintenance_active(text: &str, now: DateTime<Utc>) -> bool {
+fn window_en(text: &str) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
     // Deliberately accept only the official explicit, same-day PDT/PST format.
     // Unsupported/multi-day windows stay unknown rather than inventing downtime.
     let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
     let Some(rest) = normalized.split("[Date & Time]").nth(1) else {
-        return false;
+        return None;
     };
     let (date_range, offset) = if let Some((range, _)) = rest.split_once("(PDT)") {
         (range.trim(), -7 * 3600)
     } else if let Some((range, _)) = rest.split_once("(PST)") {
         (range.trim(), -8 * 3600)
     } else {
-        return false;
+        return None;
     };
     let Some((start, end)) = date_range.split_once(" to ") else {
-        return false;
+        return None;
     };
     let start = start.replace('.', "");
     let Some((day, _)) = start.rsplit_once(' ') else {
-        return false;
+        return None;
     };
     let end = format!("{day} {end}");
     let parse = |value: &str| {
@@ -1114,14 +1319,78 @@ fn maintenance_active(text: &str, now: DateTime<Utc>) -> bool {
             .map(|d| d.with_timezone(&Utc))
     };
     match (parse(&start), parse(&end)) {
-        (Some(start), Some(end)) if end > start => start <= now && now < end,
-        _ => false,
+        (Some(start), Some(end)) if end > start => Some((start, end)),
+        _ => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn square_enix_sites_see_a_browser_user_agent() {
+        let agent = browser_user_agent();
+        assert!(agent.starts_with("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/"));
+        assert!(agent.ends_with(".0.0.0 Safari/537.36"));
+        for marker in ["Launcher", "Crystal", "Iced", "XI"] { assert!(!agent.contains(marker), "{marker}"); }
+        assert!(web_client().is_ok());
+    }
+
+    #[test]
+    fn the_chrome_version_follows_the_date_one_behind_stable() {
+        let day = |y, m, d| chrono::NaiveDate::from_ymd_opt(y, m, d).unwrap();
+        // Chrome 138 stable 2025-06-24: a player then runs 137.
+        assert_eq!(chrome_major(day(2025, 6, 24)), 137);
+        assert_eq!(chrome_major(day(2025, 7, 21)), 137);
+        // Four weeks later 139 is stable, so 138.
+        assert_eq!(chrome_major(day(2025, 7, 22)), 138);
+        // 476 days on (17 releases): 155 stable, 154 sent.
+        assert_eq!(chrome_major(day(2026, 10, 13)), 154);
+        assert_eq!(chrome_major(day(2027, 6, 24)), 137 + 26);
+        // A clock before the anchor never goes older.
+        assert_eq!(chrome_major(day(2020, 1, 1)), 137);
+        assert_eq!(browser_user_agent_on(day(2026, 10, 13)),
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36");
+        // Today's is computed, never a fixed build-time number.
+        assert_eq!(browser_user_agent(), browser_user_agent_on(chrono::Utc::now().date_naive()));
+    }
+
+    /// What Crystal concludes from the live status page and notices right now (Play gate).
+    #[tokio::test]
+    #[ignore = "Manual public-network probe; reads the official status page and notices without credentials"]
+    async fn live_status_probe() {
+        let started = std::time::Instant::now();
+        let client = web_client().unwrap();
+        let s = read_status(&client, Lang::En).await;
+        let now = Utc::now();
+        let checked = s.checked().unwrap();
+        let (path, active, early) = decision_path(s.availability, &s.windows, &s.ended_early, checked, now);
+        let (verdict, note) = s.recent_status(now);
+        println!("PROBE took {} ms; page={:?}; recent={verdict:?}; path={path:?}; active window={:?}; ended early at={early:?}; windows complete={}",
+            started.elapsed().as_millis(), s.availability, active.map(|w| &w.title), s.windows_complete);
+        // As the launcher holds it: through `apply`, which also remembers an early end.
+        let mut held = None;
+        apply(&mut held, Update::Status(s.clone()));
+        let held = held.unwrap();
+        println!("PROBE applied: recent={:?}; ended_early={:?}", held.recent_availability(now), held.ended_early);
+        println!("PROBE page note: {}", s.availability_note);
+        println!("PROBE gate note: {note}");
+        println!("PROBE news_note: {}", s.news_note);
+        for w in &s.windows { println!("PROBE window: {:?} {} to {} (now inside: {})", w.title, w.start, w.end, w.start <= now && now < w.end); }
+        for n in &s.notices { println!("PROBE notice: {:?} all_worlds={} active={} summary[..300]={:?}", n.title, is_all_worlds_notice(&n.title), maintenance_window_active(&n.summary, now), n.summary.chars().take(300).collect::<String>()); }
+        // The markup the parser reads: each world's heading and status icon.
+        if let Ok(body) = fetch(&client, WORLD_STATUS_URL).await {
+            let document = Html::parse_document(&body);
+            let selector = Selector::parse("#bc_zone2 h2, #bc_zone2 img.img_status").unwrap();
+            let line: Vec<String> = document.select(&selector).map(|node| match node.value().name() {
+                "h2" => node.text().collect::<String>().trim().to_owned(),
+                _ => format!("={}", node.value().attr("src").unwrap_or("?")),
+            }).collect();
+            println!("PROBE worlds: {}", line.join(" "));
+        }
+    }
+
     #[tokio::test]
     #[ignore = "Manual public-network probe; contacts official feeds without credentials"]
     async fn live_headline_probe() {
@@ -1310,7 +1579,18 @@ mod tests {
         let (state, note) = parse_world_status(&partial).unwrap();
         assert_eq!(state, Availability::PartialOutage);
         assert!(note.contains("Bahamut (down)"));
+        // The maintenance icon every world showed at 05:07 UTC on 2026-10-13.
+        let (state, note) = parse_world_status(&page("04")).unwrap();
+        assert_eq!(state, Availability::Maintenance);
+        assert!(note.contains("all 16 production worlds in maintenance"), "{note}");
+        let mixed = page("00").replacen("status_00.gif", "status_04.gif", 2);
+        let (state, note) = parse_world_status(&mixed).unwrap();
+        assert_eq!(state, Availability::PartialOutage);
+        assert!(note.contains("Bahamut (down)") && note.contains("Shiva (down)") && !note.contains("Phoenix"), "{note}");
+        let down = page("04").replacen("status_04.gif", "status_02.gif", 1);
+        assert_eq!(parse_world_status(&down).unwrap().0, Availability::Outage, "all down, some for maintenance");
         assert!(parse_world_status(&page("03")).is_err());
+        assert!(parse_world_status(&page("05")).is_err(), "no invented icons");
         assert!(parse_world_status("<div id='bc_zone2'><h2>Asura</h2></div>").is_err());
     }
     #[test]
@@ -1336,41 +1616,180 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn downtime_requires_a_recent_read_and_an_unexpired_maintenance_window() {
-        let now = instant("2026-09-29T06:29:59Z");
+    /// All Worlds Maintenance (Oct. 12): 22:00 to 23:30 PDT = 05:00 to 06:30 UTC on Oct 13.
+    fn oct12_window() -> MaintenanceWindow {
+        let text = "[Date & Time] Oct. 12, 2026 22:00 to 23:30 (PDT) [Details]";
+        let (start, end) = notice_window(text).unwrap();
+        assert_eq!((start, end), (instant("2026-10-13T05:00:00Z"), instant("2026-10-13T06:30:00Z")));
+        MaintenanceWindow { title: "All Worlds Maintenance (Oct. 12)".into(), start, end }
+    }
+    /// A snapshot read at `checked` (UTC, "2026-10-13 05:07:00") whose page showed `page`.
+    fn read_at(checked: &str, page: Availability) -> ServiceSnapshot {
         let mut snapshot = empty_snapshot();
-        snapshot.availability = Availability::Maintenance;
-        snapshot.checked_at = "2026-09-29 06:29:00 UTC".into();
-        snapshot.notices.push(NewsItem {
-            title: "All Worlds Maintenance (Sep. 28)".into(),
-            summary: "[Date & Time] Sep. 28, 2026 22:00 to 23:30 (PDT) [Details]".into(),
-            ..Default::default()
-        });
-        assert_eq!(snapshot.recent_availability(now), Availability::Maintenance);
-        assert_eq!(snapshot.recent_availability(instant("2026-09-29T06:30:00Z")), Availability::Unknown);
-        snapshot.availability = Availability::Outage;
-        assert_eq!(snapshot.recent_availability(now), Availability::Maintenance);
-        assert_eq!(snapshot.recent_availability(instant("2026-09-29T06:30:00Z")), Availability::Outage,
-            "A scheduled end cannot override a recent explicit all-world outage");
-        snapshot.checked_at = "2026-09-29 06:23:58 UTC".into();
-        assert_eq!(snapshot.recent_availability(now), Availability::Unknown);
-        snapshot.checked_at = "2026-09-29 06:30:00 UTC".into();
-        assert_eq!(snapshot.recent_availability(now), Availability::Unknown);
-        snapshot.checked_at = "cached".into();
-        assert_eq!(snapshot.recent_availability(now), Availability::Unknown);
+        snapshot.availability = page;
+        snapshot.availability_note = "page note".into();
+        snapshot.windows.push(oct12_window());
+        snapshot.checked_at = format!("{checked} UTC");
+        snapshot
     }
 
     #[test]
-    fn live_world_status_wins_over_announcements_and_errors_do_not_imply_outage() {
-        assert_eq!(availability_with_notice(&Ok((Availability::Operational, "up".into())), Some("Maintenance")).0,
-            Availability::Operational);
-        assert_eq!(availability_with_notice(&Ok((Availability::PartialOutage, "some down".into())), Some("Maintenance")).0,
-            Availability::PartialOutage);
-        assert_eq!(availability_with_notice(&Ok((Availability::Outage, "down".into())), Some("Maintenance")).0,
-            Availability::Outage);
-        assert_eq!(availability_with_notice(&Ok((Availability::Outage, "down".into())), None).0, Availability::Outage);
-        assert_eq!(availability_with_notice(&Err("unavailable".into()), None).0, Availability::Unknown);
+    fn downtime_requires_a_recent_read_and_an_unexpired_maintenance_window() {
+        let now = instant("2026-10-13T06:29:59Z");
+        // The page could not be read: the window alone is maintenance, its end is not recovery.
+        let mut snapshot = read_at("2026-10-13 06:29:00", Availability::Unknown);
+        assert_eq!(snapshot.recent_availability(now), Availability::Maintenance);
+        assert_eq!(snapshot.recent_availability(instant("2026-10-13T06:30:00Z")), Availability::Unknown);
+        snapshot.availability = Availability::Outage;
+        assert_eq!(snapshot.recent_availability(now), Availability::Maintenance);
+        assert_eq!(snapshot.recent_availability(instant("2026-10-13T06:30:00Z")), Availability::Outage,
+            "A scheduled end cannot override a recent explicit all-world outage");
+        // Only the page's reading expires: a stale, future or missing read inside the window
+        // is still maintenance; outside it, Unknown.
+        for checked in ["2026-10-13 06:23:58 UTC", "2026-10-13 06:30:00 UTC", "cached"] {
+            snapshot.checked_at = checked.into();
+            assert_eq!(snapshot.recent_availability(now), Availability::Maintenance, "{checked}");
+            assert_eq!(snapshot.recent_availability(instant("2026-10-13T06:40:00Z")), Availability::Unknown, "{checked}");
+        }
+    }
+
+    /// Review finding: a PC that slept from 04:30 with the window parsed woke at 05:07; the
+    /// read was stale, so the window was ignored and Play allowed.
+    #[test]
+    fn a_stale_read_still_honours_an_active_window() {
+        let snapshot = read_at("2026-10-13 04:30:00", Availability::Operational);
+        let (state, note) = snapshot.recent_status(instant("2026-10-13T05:07:00Z"));
+        assert_eq!(state, Availability::Maintenance);
+        assert!(note.contains("All Worlds Maintenance (Oct. 12)") && note.ends_with("Completion may change."), "{note}");
+        assert_eq!(snapshot.recent_status(instant("2026-10-13T04:45:00Z")), (Availability::Unknown, "page note".into()));
+    }
+
+    /// Review finding: a read whose notice fetch failed replaced the known windows with none.
+    #[test]
+    fn a_read_without_its_notices_keeps_the_known_windows() {
+        let mut current = Some(read_at("2026-10-13 04:58:00", Availability::Operational));
+        let mut failed = read_at("2026-10-13 05:03:00", Availability::Operational);
+        failed.windows.clear();
+        failed.windows_complete = false;
+        apply(&mut current, Update::Status(failed));
+        let snapshot = current.as_ref().unwrap();
+        assert_eq!(snapshot.windows, vec![oct12_window()]);
+        assert_eq!(snapshot.recent_availability(instant("2026-10-13T05:03:30Z")), Availability::Maintenance);
+        // A complete read is authoritative: a withdrawn notice takes its window with it.
+        let mut complete = read_at("2026-10-13 05:04:00", Availability::Operational);
+        complete.windows.clear();
+        complete.windows_complete = true;
+        apply(&mut current, Update::Status(complete));
+        assert!(current.as_ref().unwrap().windows.is_empty());
+    }
+
+    /// Review finding: an early end was not remembered, so the next unreadable or partial page
+    /// inside the window refused Play again while the game was up.
+    #[test]
+    fn an_early_end_is_remembered_for_later_reads_in_that_window() {
+        let mut current = None;
+        apply(&mut current, Update::Status(read_at("2026-10-13 05:40:00", Availability::Operational)));
+        let (state, note) = current.as_ref().unwrap().recent_status(instant("2026-10-13T05:41:00Z"));
+        assert_eq!(state, Availability::Operational);
+        assert!(note.contains("40 minutes into the scheduled maintenance"), "{note}");
+        for page in [Availability::Unknown, Availability::PartialOutage] {
+            let mut later = current.clone();
+            apply(&mut later, Update::Status(read_at("2026-10-13 05:45:00", page)));
+            assert_eq!(later.as_ref().unwrap().recent_availability(instant("2026-10-13T05:45:30Z")), page, "{page:?}");
+            // Stale reads too: the window no longer applies.
+            assert_eq!(later.as_ref().unwrap().recent_availability(instant("2026-10-13T06:00:00Z")), Availability::Unknown, "{page:?}");
+        }
+        // The page's own maintenance or outage still blocks.
+        for page in [Availability::Maintenance, Availability::Outage] {
+            let mut later = current.clone();
+            apply(&mut later, Update::Status(read_at("2026-10-13 05:45:00", page)));
+            assert_eq!(later.as_ref().unwrap().recent_availability(instant("2026-10-13T05:45:30Z")), page, "{page:?}");
+        }
+        // A read before the 15-minute mark ends nothing.
+        let mut early = None;
+        apply(&mut early, Update::Status(read_at("2026-10-13 05:10:00", Availability::Operational)));
+        assert!(early.as_ref().unwrap().ended_early.is_empty());
+    }
+
+    /// Review finding: a language switch replaced the snapshot with the cached headlines,
+    /// whose availability is Unknown with no windows.
+    #[test]
+    fn a_language_switch_keeps_the_status() {
+        let previous = read_at("2026-10-13 05:07:00", Availability::Operational);
+        let mut cached = empty_snapshot();
+        cached.news.push(NewsItem { title: "headline".into(), ..Default::default() });
+        for next in [None, Some(cached)] {
+            let kept = keep_status(Some(&previous), next.clone()).unwrap();
+            assert_eq!(kept.news.len(), next.map_or(0, |n| n.news.len()));
+            assert_eq!((kept.windows.clone(), kept.checked_at.clone()), (previous.windows.clone(), previous.checked_at.clone()));
+            assert_eq!(kept.recent_availability(instant("2026-10-13T05:07:30Z")), Availability::Maintenance);
+        }
+        assert!(keep_status(None, None).is_none());
+        assert!(keep_status(Some(&empty_snapshot()), None).is_none(), "headlines alone hold no status");
+    }
+
+    /// 2026-10-13: Play at 05:07:40 UTC passed while the page still showed the worlds up.
+    #[test]
+    fn an_active_window_beats_a_status_page_that_still_shows_worlds_up() {
+        let now = instant("2026-10-13T05:07:40Z");
+        let snapshot = read_at("2026-10-13 05:07:21", Availability::Operational);
+        let (state, note) = snapshot.recent_status(now);
+        assert_eq!(state, Availability::Maintenance);
+        assert!(note.contains("All Worlds Maintenance (Oct. 12)") && note.contains("still shows the worlds up"), "{note}");
+        // Partial or unreadable pages during the window are maintenance too.
+        for page in [Availability::PartialOutage, Availability::Unknown, Availability::Outage] {
+            assert_eq!(read_at("2026-10-13 05:07:21", page).recent_availability(now), Availability::Maintenance, "{page:?}");
+        }
+        // 14:59 into the window is still too early to trust the page.
+        assert_eq!(read_at("2026-10-13 05:14:59", Availability::Operational)
+            .recent_availability(instant("2026-10-13T05:15:30Z")), Availability::Maintenance);
+        // Before and after the window the page decides.
+        assert_eq!(read_at("2026-10-13 04:59:00", Availability::Operational)
+            .recent_availability(instant("2026-10-13T04:59:59Z")), Availability::Operational);
+        assert_eq!(read_at("2026-10-13 06:30:00", Availability::Operational)
+            .recent_availability(instant("2026-10-13T06:30:10Z")), Availability::Operational);
+    }
+
+    #[test]
+    fn all_worlds_up_fifteen_minutes_into_the_window_ends_it_early() {
+        let snapshot = read_at("2026-10-13 05:15:00", Availability::Operational);
+        let (state, note) = snapshot.recent_status(instant("2026-10-13T05:16:00Z"));
+        assert_eq!(state, Availability::Operational);
+        assert!(note.starts_with("page note") && note.contains("15 minutes into the scheduled maintenance") && note.contains("ended early"), "{note}");
+        let (path, _, _) = decision_path(Availability::Operational, &snapshot.windows, &[], instant("2026-10-13T05:15:00Z"), instant("2026-10-13T05:16:00Z"));
+        assert_eq!(path, Decision::EarlyEnd);
+        // A partial page 15+ minutes in is still maintenance.
+        assert_eq!(read_at("2026-10-13 05:40:00", Availability::PartialOutage)
+            .recent_availability(instant("2026-10-13T05:41:00Z")), Availability::Maintenance);
+    }
+
+    #[test]
+    fn the_maintenance_icon_is_maintenance_with_or_without_a_window() {
+        // Window ended, page still on status_04: maintenance runs over.
+        let snapshot = read_at("2026-10-13 06:35:00", Availability::Maintenance);
+        let (state, note) = snapshot.recent_status(instant("2026-10-13T06:35:30Z"));
+        assert_eq!((state, note.as_str()), (Availability::Maintenance, "page note"));
+        // No notice at all (unannounced maintenance).
+        let mut unannounced = read_at("2026-10-13 12:00:00", Availability::Maintenance);
+        unannounced.windows.clear();
+        assert_eq!(unannounced.recent_availability(instant("2026-10-13T12:01:00Z")), Availability::Maintenance);
+        // During the window both are named.
+        let (state, note) = read_at("2026-10-13 05:10:00", Availability::Maintenance).recent_status(instant("2026-10-13T05:10:30Z"));
+        assert_eq!(state, Availability::Maintenance);
+        assert!(note.contains("page note") && note.contains("notice also active"), "{note}");
+        // A stale read still establishes nothing.
+        assert_eq!(snapshot.recent_availability(instant("2026-10-13T06:45:00Z")), Availability::Unknown);
+    }
+
+    #[test]
+    fn an_unreadable_status_page_does_not_imply_outage() {
+        let (state, note) = page_availability(&Err("unavailable".into()));
+        assert_eq!(state, Availability::Unknown);
+        assert!(note.contains("unavailable"));
+        assert_eq!(page_availability(&Ok((Availability::Operational, "up".into()))), (Availability::Operational, "up".into()));
+        let mut snapshot = read_at("2026-10-13 07:00:00", Availability::Unknown);
+        snapshot.windows.clear();
+        assert_eq!(snapshot.recent_availability(instant("2026-10-13T07:01:00Z")), Availability::Unknown);
     }
     #[test]
     fn maintenance_index_and_url_boundaries() {

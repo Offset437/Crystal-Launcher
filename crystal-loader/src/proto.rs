@@ -232,7 +232,25 @@ pub struct Credentials {
     pub auth_code: [u8; AUTH_CODE_LEN],
 }
 
-pub enum ServiceEvent { Presence(PresenceResult), Credentials(Credentials), Friends(FriendRecords), FriendsFailed, SessionStatus(i32), NativeFriendsRefresh, NativeStartGame, NativeBatchGame(String), NativeSignOut, NativeStatus { mode: i32, groups: bool }, NativeActivity, NativeSocial(NativeSocialRequest) }
+pub enum ServiceEvent { Presence(PresenceResult), Credentials(Credentials), Friends(FriendRecords), FriendsFailed, SessionStatus(i32), NativeFriendsRefresh, NativeStartGame, NativeBatchGame(String), NativeSignOut, NativeStatus { mode: i32, groups: bool }, NativeActivity, NativeSocial(NativeSocialRequest), ViewerCheck(ViewerCheckResult), NativePlayPending, ControllerSettings { id: u64, settings: FfxiSettings, deadline_ms: u64 } }
+
+/// The launcher's answer to `native_viewer_check`: the Viewer's own W2U
+/// (:54000) verdict for this Connect (pol-spec 07a w2u-at-connect, 07c §1).
+/// The launcher sends it only after the W2U connection is closed. Outdated,
+/// Failed and NetworkNotReady stop the sign-in before Open(1) with the
+/// launcher's (localized) text; Unreachable (sent, no usable reply) signs in
+/// anyway (owner 2026-10-12, a7550a6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ViewerCheckResult {
+    Current,
+    Outdated(String),
+    Failed(String),
+    Unreachable(String),
+    /// `reason:"network"`: resolution or the local connect failed instantly on
+    /// every attempt of the launcher's capped retry (pol-spec 07d §2.3): nothing
+    /// reached Square Enix and Open(1) would only end in -19 (08 §1 row 8).
+    NetworkNotReady(String),
+}
 
 pub enum NativeSocialRequest {
     Inbox { id: String, folder: u8, page: u32 },
@@ -296,10 +314,55 @@ fn social_request(root: &Value<'_>) -> Result<NativeSocialRequest, ProtoError> {
     Err(ProtoError::Field("action", "unknown social operation"))
 }
 
+/// `{"type":"native_viewer_check_result","ok":true}` or `"ok":false` with
+/// `"reason"` (`outdated` | `failed` | `unreachable`) and `"error"` (text).
+fn viewer_check_result(root: &Value<'_>) -> Result<ViewerCheckResult, ProtoError> {
+    match root.get("ok") {
+        Some(Value::Bool(true)) => Ok(ViewerCheckResult::Current),
+        Some(Value::Bool(false)) => {
+            let error = root.get("error").and_then(Value::as_jstr).and_then(|s| s.decode().ok()).unwrap_or_default();
+            let reason = root.get("reason").and_then(Value::as_jstr).ok_or(ProtoError::Missing("reason"))?;
+            if reason.eq_str("outdated") { Ok(ViewerCheckResult::Outdated(error)) }
+            else if reason.eq_str("failed") { Ok(ViewerCheckResult::Failed(error)) }
+            else if reason.eq_str("unreachable") { Ok(ViewerCheckResult::Unreachable(error)) }
+            else if reason.eq_str("network") { Ok(ViewerCheckResult::NetworkNotReady(error)) }
+            else { Err(ProtoError::Field("reason", "unknown Viewer check verdict")) }
+        }
+        _ => Err(ProtoError::Field("ok", "must be a boolean")),
+    }
+}
+
 pub fn parse_service_event(line: &[u8]) -> Result<Option<ServiceEvent>, ProtoError> {
     if line.len() > MAX_LINE { return Err(ProtoError::LineTooLong); }
     let root = json::parse(strip_eol(line)).map_err(ProtoError::Json)?;
+    if let Value::Object(fields) = &root {
+        if fields.iter().filter(|(name, _)| name.eq_str("type")).count() != 1 {
+            return Err(ProtoError::Field("type", "command type must be unambiguous"));
+        }
+    }
     let t = root.get("type").and_then(Value::as_jstr).ok_or(ProtoError::Missing("type"))?;
+    if t.eq_str("controller_settings") {
+        let Value::Object(fields) = &root else { return Err(ProtoError::Field("settings", "invalid controller command")); };
+        for required in ["type", "request_id", "deadline_ms", "settings"] {
+            if fields.iter().filter(|(name, _)| name.eq_str(required)).count() != 1 {
+                return Err(ProtoError::Field("settings", "controller command fields must be unambiguous"));
+            }
+        }
+        let id = match root.get("request_id") { Some(Value::Number(n)) => n.parse::<u64>().ok(), _ => None }
+            .filter(|id| *id != 0).ok_or(ProtoError::Field("request_id", "must be a nonzero unsigned integer"))?;
+        let deadline_ms = match root.get("deadline_ms") { Some(Value::Number(n)) => n.parse::<u64>().ok(), _ => None }
+            .filter(|value| *value != 0).ok_or(ProtoError::Field("deadline_ms", "must be a nonzero unsigned integer"))?;
+        let Some(Value::Object(fields)) = root.get("settings") else { return Err(ProtoError::Missing("settings")); };
+        if fields.iter().any(|(_, value)| !matches!(value, Value::Str(_))) {
+            return Err(ProtoError::Field("settings", "controller values must be strings"));
+        }
+        let settings = parse_ffxi_settings(fields)?;
+        if !(2..=3).contains(&settings.len()) || settings.get("padmode000").is_none() || settings.get("padsin000").is_none()
+            || settings.names().any(|name| !["padmode000", "padsin000", "padguid000"].iter().any(|allowed| name.eq_ignore_ascii_case(allowed))) {
+            return Err(ProtoError::Field("settings", "only controller settings are allowed"));
+        }
+        return Ok(Some(ServiceEvent::ControllerSettings { id, settings, deadline_ms }));
+    }
     if t.eq_str("native_social") { return Ok(Some(ServiceEvent::NativeSocial(social_request(&root)?))); }
     if t.eq_str("native_friends_refresh") { return Ok(Some(ServiceEvent::NativeFriendsRefresh)); }
     if t.eq_str("native_start_game") { return Ok(Some(ServiceEvent::NativeStartGame)); }
@@ -309,7 +372,9 @@ pub fn parse_service_event(line: &[u8]) -> Result<Option<ServiceEvent>, ProtoErr
         return Ok(Some(ServiceEvent::NativeBatchGame(String::from_utf8(token.to_vec()).map_err(|_| ProtoError::Field("token", "invalid gate"))?)));
     }
     if t.eq_str("native_sign_out") { return Ok(Some(ServiceEvent::NativeSignOut)); }
+    if t.eq_str("native_viewer_check_result") { return viewer_check_result(&root).map(|r| Some(ServiceEvent::ViewerCheck(r))); }
     if t.eq_str("native_activity") { return Ok(Some(ServiceEvent::NativeActivity)); }
+    if t.eq_str("native_play_pending") { return Ok(Some(ServiceEvent::NativePlayPending)); }
     for (name, mode) in [("native_visible", 0), ("native_away", 1), ("native_invisible", 4)] {
         if t.eq_str(name) {
             // The status dialog's "apply to groups" (app 10031b2b); stock default on.
@@ -364,6 +429,11 @@ pub struct Session {
     /// Accepted for compatibility and ignored: the Viewer sends no status at
     /// sign-in (pol-spec 01 D5, owner decision 1).
     pub invisible_login: bool,
+    /// Restore the Viewer's machine-paced UI gaps (op7 → 374 ≈1.05 s, mail
+    /// list → publish ≈1.6 s; pol-spec 07a stock-faithful-pacing). Sent true
+    /// only for a sign-in-only (pre-sign-in) session, never on a cold Play
+    /// (owner decision 2026-10-12). Absent = false.
+    pub viewer_gaps: bool,
     /// Viewer auto-Away minutes: 0 off, else 10..=60; absent = 10 (app table
     /// 10490d00, default index 0).
     pub auto_away_minutes: u32,
@@ -493,7 +563,7 @@ impl fmt::Display for ProtoError {
     }
 }
 
-const KNOWN_FIELDS: [&str; 18] = ["type", "v", "region", "lang", "install_dir", "pol_install_dir", "v_key", "auth_code", "pol_records", "content_ids", "ffxi_settings", "account_id", "native_auth", "start_game", "keep_session", "invisible_login", "auto_away_minutes", "auto_login"];
+const KNOWN_FIELDS: [&str; 19] = ["type", "v", "region", "lang", "install_dir", "pol_install_dir", "v_key", "auth_code", "pol_records", "content_ids", "ffxi_settings", "account_id", "native_auth", "start_game", "keep_session", "invisible_login", "viewer_gaps", "auto_away_minutes", "auto_login"];
 
 /// Parses and validates the launcher's `session` line (without its `\n`).
 pub fn parse_session(line: &[u8]) -> Result<Session, ProtoError> {
@@ -610,7 +680,8 @@ pub fn parse_session(line: &[u8]) -> Result<Session, ProtoError> {
     let start_game = flag("start_game", true)?;
     let keep_session = flag("keep_session", false)?;
     let invisible_login = flag("invisible_login", false)?;
-    if (!start_game || keep_session || invisible_login) && native_auth.is_none() {
+    let viewer_gaps = flag("viewer_gaps", false)?;
+    if (!start_game || keep_session || invisible_login || viewer_gaps) && native_auth.is_none() {
         return Err(ProtoError::Field("keep_session", "requires native authentication"));
     }
     let auto_away_minutes = match get("auto_away_minutes") {
@@ -623,7 +694,175 @@ pub fn parse_session(line: &[u8]) -> Result<Session, ProtoError> {
     if auto_login.enabled && native_auth.is_none() {
         return Err(ProtoError::Field("auto_login", "requires native authentication"));
     }
-    Ok(Session { version, region, lang, install_dir, pol_install_dir, secrets, native_auth, start_game, keep_session, invisible_login, auto_away_minutes, auto_login, pol_records, content_ids, ffxi_settings })
+    Ok(Session { version, region, lang, install_dir, pol_install_dir, secrets, native_auth, start_game, keep_session, invisible_login, viewer_gaps, auto_away_minutes, auto_login, pol_records, content_ids, ffxi_settings })
+}
+
+// --- round 2: the parked warm host (pol-spec 07d §1; 07a parked-warm-host) ---
+
+/// Set when this loader can park: `park` line → polcore created (COM, paths,
+/// SetAreaCode/SetParamInit, function table) → wait without a timeout for the
+/// `credentials` line → the normal sign-in. Advertised in the hello; the
+/// launcher sends `park` only to a loader that says so.
+pub const PARK: bool = true;
+
+/// The `park` line: everything the host needs before polcore creation and
+/// nothing secret. Never carries credentials, keys, records or the per-Play
+/// flags (those come in `credentials`).
+#[derive(Debug)]
+pub struct Park {
+    pub version: i64,
+    pub region: Region,
+    pub lang: String,
+    pub install_dir: Option<String>,
+    pub pol_install_dir: Option<String>,
+    pub auto_login: AutoLogin,
+    pub ffxi_settings: Option<FfxiSettings>,
+}
+
+/// The `credentials` line sent to a parked host at Play: the native
+/// credentials (OTP included) and the per-Play session flags.
+pub struct Unpark {
+    pub native_auth: NativeCredentials,
+    pub start_game: bool,
+    pub keep_session: bool,
+    pub invisible_login: bool,
+    pub viewer_gaps: bool,
+    pub auto_away_minutes: u32,
+}
+
+impl fmt::Debug for Unpark {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("Unpark([redacted])") }
+}
+
+/// The first launcher line after the hello.
+#[derive(Debug)]
+pub enum FirstLine {
+    /// Today's direct `session` line (every older launcher, every cold launch).
+    Session(Session),
+    /// A credential-less park (round 2).
+    Park(Park),
+}
+
+impl Park {
+    /// The session a direct `session` line with the same fields gives, so the
+    /// parked path continues exactly like the cold one (07d §1.4).
+    pub fn into_session(self, unpark: Unpark) -> Session {
+        let Unpark { native_auth, start_game, keep_session, invisible_login, viewer_gaps, auto_away_minutes } = unpark;
+        Session {
+            version: self.version, region: self.region, lang: self.lang, install_dir: self.install_dir,
+            pol_install_dir: self.pol_install_dir,
+            secrets: Box::new(Secrets { v_key: [0; V_KEY_LEN], auth_code: [0; AUTH_CODE_LEN], account_id: 0 }),
+            native_auth: Some(native_auth), start_game, keep_session, invisible_login, viewer_gaps,
+            auto_away_minutes, auto_login: self.auto_login, pol_records: None, content_ids: Vec::new(),
+            ffxi_settings: self.ffxi_settings,
+        }
+    }
+}
+
+/// Secret or session-key fields: never in a `park` line, never in `credentials`
+/// except `native_auth`.
+const SECRET_FIELDS: [&str; 6] = ["v_key", "auth_code", "account_id", "pol_records", "content_ids", "native_auth"];
+/// Per-Play flags: only in `credentials` (or a direct `session`).
+const PLAY_FIELDS: [&str; 5] = ["start_game", "keep_session", "invisible_login", "viewer_gaps", "auto_away_minutes"];
+/// Host fields: only in `park` (or a direct `session`).
+const HOST_FIELDS: [&str; 6] = ["region", "lang", "install_dir", "pol_install_dir", "ffxi_settings", "auto_login"];
+
+/// Parses the first launcher line: `session` (unchanged) or `park`.
+pub fn parse_first_line(line: &[u8]) -> Result<FirstLine, ProtoError> {
+    if line.len() > MAX_LINE { return Err(ProtoError::LineTooLong); }
+    let root = json::parse(strip_eol(line)).map_err(ProtoError::Json)?;
+    match root.get("type").and_then(Value::as_jstr) {
+        Some(t) if t.eq_str("park") => parse_park(&root).map(FirstLine::Park),
+        _ => parse_session(line).map(FirstLine::Session),
+    }
+}
+
+fn duplicate_known(root: &Value<'_>, known: &[&'static str]) -> Result<(), ProtoError> {
+    let Value::Object(fields) = root else { return Err(ProtoError::NotAnObject) };
+    for k in known {
+        if fields.iter().filter(|(f, _)| f.eq_str(k)).count() > 1 { return Err(ProtoError::DuplicateField(k)); }
+    }
+    Ok(())
+}
+
+fn parse_park(root: &Value<'_>) -> Result<Park, ProtoError> {
+    duplicate_known(root, &["type", "v"])?;
+    duplicate_known(root, &HOST_FIELDS)?;
+    let get = |k: &'static str| root.get(k);
+    if let Some(k) = SECRET_FIELDS.into_iter().find(|&k| get(k).is_some()) {
+        return Err(ProtoError::Field(k, "never part of a park line"));
+    }
+    if let Some(k) = PLAY_FIELDS.into_iter().find(|&k| get(k).is_some()) {
+        return Err(ProtoError::Field(k, "belongs in the credentials line"));
+    }
+    let version = get("v").ok_or(ProtoError::Missing("v"))?.as_i64().ok_or(ProtoError::Field("v", "not an integer"))?;
+    if version != PROTOCOL_VERSION { return Err(ProtoError::UnsupportedVersion(version)); }
+    // A park exists only for a native sign-in, which is verified for US only.
+    let region = match plain_str(get("region"), "region")? {
+        Some(b"US") => Region::Us,
+        Some(_) => return Err(ProtoError::Field("region", "a park requires the US region")),
+        None => return Err(ProtoError::Missing("region")),
+    };
+    let text = |k: &'static str| -> Result<Option<String>, ProtoError> {
+        match get(k) {
+            Some(Value::Str(s)) => Ok(Some(s.decode().map_err(|_| ProtoError::Field(k, "bad string"))?).filter(|s| !s.is_empty())),
+            Some(Value::Null) | None => Ok(None),
+            Some(_) => Err(ProtoError::Field(k, "not a string")),
+        }
+    };
+    let lang = text("lang")?.unwrap_or_else(|| region.name().to_string());
+    let install_dir = text("install_dir")?;
+    let pol_install_dir = text("pol_install_dir")?;
+    if pol_install_dir.as_ref().is_some_and(|p| p.len() > 32_767 || p.contains('\0')) {
+        return Err(ProtoError::Field("pol_install_dir", "invalid folder path"));
+    }
+    let ffxi_settings = match get("ffxi_settings") {
+        Some(Value::Null) | None => None,
+        Some(Value::Object(fields)) => Some(parse_ffxi_settings(fields)?),
+        Some(_) => return Err(ProtoError::Field("ffxi_settings", "must be an object or null")),
+    };
+    let auto_login = parse_auto_login(get("auto_login"))?;
+    Ok(Park { version, region, lang, install_dir, pol_install_dir, auto_login, ffxi_settings })
+}
+
+/// Parses the `credentials` line a parked host waits for (no timeout).
+pub fn parse_credentials(line: &[u8]) -> Result<Unpark, ProtoError> {
+    if line.len() > MAX_LINE { return Err(ProtoError::LineTooLong); }
+    let root = json::parse(strip_eol(line)).map_err(ProtoError::Json)?;
+    duplicate_known(&root, &["type"])?;
+    duplicate_known(&root, &PLAY_FIELDS)?;
+    duplicate_known(&root, &SECRET_FIELDS)?;
+    let get = |k: &'static str| root.get(k);
+    match get("type").and_then(Value::as_jstr) {
+        Some(t) if t.eq_str("credentials") => {}
+        Some(_) => return Err(ProtoError::WrongType),
+        None => return Err(ProtoError::Missing("type")),
+    }
+    if let Some(k) = SECRET_FIELDS.into_iter().filter(|&k| k != "native_auth").find(|&k| get(k).is_some()) {
+        return Err(ProtoError::Field(k, "never part of a credentials line"));
+    }
+    if let Some(k) = HOST_FIELDS.into_iter().find(|&k| get(k).is_some()) {
+        return Err(ProtoError::Field(k, "belongs in the park line"));
+    }
+    let native_auth = parse_native_credentials(get("native_auth").ok_or(ProtoError::Missing("native_auth"))?)?;
+    let flag = |key, default| match get(key) {
+        None => Ok(default),
+        Some(Value::Bool(value)) => Ok(*value),
+        _ => Err(ProtoError::Field(key, "must be a boolean")),
+    };
+    let auto_away_minutes = match get("auto_away_minutes") {
+        None => 10,
+        Some(value) => value.as_i64().filter(|m| *m == 0 || (10..=60).contains(m))
+            .ok_or(ProtoError::Field("auto_away_minutes", "must be 0 or 10-60"))? as u32,
+    };
+    Ok(Unpark {
+        native_auth,
+        start_game: flag("start_game", true)?,
+        keep_session: flag("keep_session", false)?,
+        invisible_login: flag("invisible_login", false)?,
+        viewer_gaps: flag("viewer_gaps", false)?,
+        auto_away_minutes,
+    })
 }
 
 /// `ffxi_settings`: value name -> JSON number (`REG_DWORD`, -2^31..2^32-1) or string (`REG_SZ`).
@@ -684,12 +923,29 @@ pub fn json_string(s: &str) -> String {
 
 // --- loader -> launcher lines (each ends in '\n') ---
 
+/// `viewer_check`: this loader asks for the sign-in's W2U at Connect
+/// (`native_viewer_check`, 07c §1). The launcher sends no W2U of its own, so
+/// it refuses a native sign-in from a loader without it. `park`: it accepts a
+/// `park` line before credentials (07d §1).
 pub fn hello_line(pid: u32) -> String {
-    format!("{{\"type\":\"hello\",\"v\":{PROTOCOL_VERSION},\"pid\":{pid},\"native_auth\":true,\"native_social\":true,\"native_batch\":true}}\n")
+    format!("{{\"type\":\"hello\",\"v\":{PROTOCOL_VERSION},\"pid\":{pid},\"native_auth\":true,\"native_social\":true,\"native_batch\":true,\"viewer_check\":true,\"park\":{PARK}}}\n")
+}
+
+/// The park reached its end point: polcore created, SetAreaCode/SetParamInit
+/// done, function table validated; nothing networked. `polcore_ms` is the
+/// instance creation time (polcore's second-boundary wait, 08 §2). Sent once,
+/// then the host waits for `credentials` with no timeout (07d §1.3).
+pub fn parked_line(pid: u32, polcore_ms: u64) -> String {
+    format!("{{\"type\":\"parked\",\"pid\":{pid},\"polcore_ms\":{polcore_ms}}}\n")
 }
 
 pub fn started_line(pid: u32) -> String {
     format!("{{\"type\":\"started\",\"pid\":{pid}}}\n")
+}
+
+/// Local controller acknowledgement. Request zero advertises the scoped live service.
+pub fn controller_result(id: u64, ok: bool, message: &str) -> String {
+    format!("{{\"type\":\"controller_result\",\"request_id\":{id},\"ok\":{ok},\"message\":{}}}\n", json_string(message))
 }
 
 pub fn presence_line(payload: &[u8]) -> String {
@@ -702,6 +958,24 @@ pub fn exit_line(code: i32) -> String {
 
 pub fn error_line(message: &str) -> String {
     format!("{{\"type\":\"error\",\"message\":{}}}\n", json_string(message))
+}
+
+/// Ask the launcher for the Viewer's W2U (:54000) check of this Connect: sent
+/// once per sign-in, after Open(0) reached 838 == 2 and before Open(1)
+/// (pol-spec 07a w2u-at-connect F3/F4, 07c §1). The answer is
+/// `native_viewer_check_result` (`ViewerCheckResult`).
+pub fn viewer_check_line() -> String {
+    "{\"type\":\"native_viewer_check\"}\n".into()
+}
+
+/// The Viewer reached its main menu: the app-1000 presence publish (376/377,
+/// `publish_viewer`) has completed, after sign-in (`returned` false) or after
+/// a game (`returned` true). `code` is the publish job's result, 0 when no
+/// publish was needed. Sent before the idle report (`native_session_state`
+/// false, `native_social_ready`); the launcher starts W20 (:53001) only
+/// after it (07c §2).
+pub fn main_menu_line(code: i32, returned: bool) -> String {
+    format!("{{\"type\":\"native_main_menu\",\"code\":{code},\"returned\":{returned}}}\n")
 }
 
 /// The `presence` payload: slot 195's six arguments exactly as FFXiMain passed
@@ -729,6 +1003,32 @@ pub fn parse_hello(line: &[u8]) -> Result<(i64, u32), ProtoError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn controller_commands_are_correlated_and_cannot_change_other_settings() {
+        let command = r#"{"type":"controller_settings","request_id":18446744073709551615,"deadline_ms":123456,"settings":{"padmode000":"1,1,0,0,1,1","padsin000":"1,2,3"}}"#;
+        assert!(matches!(parse_service_event(command.as_bytes()),
+            Ok(Some(ServiceEvent::ControllerSettings { id: u64::MAX, deadline_ms: 123456, settings })) if settings.len() == 2));
+        for (index, invalid) in [
+            command.replace("18446744073709551615", "0"),
+            command.replace("18446744073709551615", "-1"),
+            command.replace("18446744073709551615", "1.5"),
+            command.replace("18446744073709551615", "18446744073709551616"),
+            command.replace("123456", "0"),
+            command.replace("123456", "-1"),
+            command.replace("\"padmode000\"", "\"0001\""),
+            command.replace("\"padsin000\":\"1,2,3\"", "\"padsin000\":42"),
+            command.replace("\"settings\":", "\"request_id\":1,\"settings\":"),
+            command.replace("\"settings\":", "\"deadline_ms\":999,\"settings\":"),
+            command.replace("\"settings\":", "\"type\":\"native_start_game\",\"settings\":"),
+            command.replace("\"padsin000\":", "\"padmode000\":\"1,1,1,1,1,1\",\"padsin000\":"),
+        ].into_iter().enumerate() { assert!(parse_service_event(invalid.as_bytes()).is_err(), "invalid controller case {index}"); }
+        let line = controller_result(u64::MAX, false, "Cannot apply \"settings\".");
+        let reply = json::parse(line.trim().as_bytes()).unwrap();
+        assert_eq!(reply.get("request_id"), Some(&Value::Number("18446744073709551615")));
+        assert_eq!(reply.get("ok"), Some(&Value::Bool(false)));
+        assert_eq!(reply.get("message").unwrap().as_jstr().unwrap().decode().unwrap(), "Cannot apply \"settings\".");
+    }
     #[test]
     fn native_social_actions_preserve_text_and_u64_ids_and_reject_ambiguous_requests() {
         let send = br#"{"type":"native_social","id":"0123456789abcdef0123456789abcdef","action":"send","alternate":false,"slot":199,"uid":18446744073709551615,"subject":"quoted\"subject","message":"line\nline"}"#;
@@ -1029,16 +1329,98 @@ mod tests {
     }
 
     #[test]
+    fn viewer_check_results_follow_the_round1_contract() {
+        let parse = |line: &str| match parse_service_event(line.as_bytes()) { Ok(Some(ServiceEvent::ViewerCheck(r))) => Ok(r), Ok(_) => Err(None), Err(e) => Err(Some(e)) };
+        assert_eq!(parse(r#"{"type":"native_viewer_check_result","ok":true}"#), Ok(ViewerCheckResult::Current));
+        assert_eq!(parse(r#"{"type":"native_viewer_check_result","ok":false,"reason":"outdated","error":"Update \"now\""}"#),
+            Ok(ViewerCheckResult::Outdated("Update \"now\"".into())));
+        assert_eq!(parse(r#"{"type":"native_viewer_check_result","ok":false,"reason":"failed","error":"x"}"#), Ok(ViewerCheckResult::Failed("x".into())));
+        assert_eq!(parse(r#"{"type":"native_viewer_check_result","ok":false,"reason":"unreachable"}"#), Ok(ViewerCheckResult::Unreachable(String::new())));
+        for bad in [r#"{"type":"native_viewer_check_result"}"#, r#"{"type":"native_viewer_check_result","ok":false}"#,
+            r#"{"type":"native_viewer_check_result","ok":false,"reason":"later"}"#, r#"{"type":"native_viewer_check_result","ok":1}"#] {
+            assert!(matches!(parse(bad), Err(Some(_))), "{bad}");
+        }
+        assert_eq!(viewer_check_line(), "{\"type\":\"native_viewer_check\"}\n");
+        assert_eq!(main_menu_line(1, false), "{\"type\":\"native_main_menu\",\"code\":1,\"returned\":false}\n");
+        let native = native_fields();
+        assert!(!parse_session(line(&native).as_bytes()).unwrap().viewer_gaps, "absent = cold-path pacing");
+        assert!(parse_session(line(&format!("{native},\"start_game\":false,\"viewer_gaps\":true")).as_bytes()).unwrap().viewer_gaps);
+        assert!(parse_session(line(&format!("{native},\"viewer_gaps\":1")).as_bytes()).is_err());
+        assert!(parse_session(line(&format!("{native},\"viewer_gaps\":true,\"viewer_gaps\":true")).as_bytes()).is_err());
+        assert!(parse_session(line(&format!("{},\"viewer_gaps\":true", keys())).as_bytes()).is_err(), "requires native authentication");
+    }
+
+    #[test]
     fn event_lines_are_valid_json() {
-        for l in [hello_line(12), started_line(12), presence_line(&presence_payload([-2, -1, 0, -2, -1, 1])), exit_line(-14), error_line("bad \"thing\"\n\u{1}")] {
+        for l in [hello_line(12), started_line(12), presence_line(&presence_payload([-2, -1, 0, -2, -1, 1])), exit_line(-14), error_line("bad \"thing\"\n\u{1}"), viewer_check_line(), main_menu_line(-2046, true)] {
             assert!(l.ends_with('\n'));
             json::parse(l.trim_end().as_bytes()).unwrap();
         }
         assert_eq!(parse_hello(hello_line(77).as_bytes()).unwrap(), (1, 77));
         let hello = hello_line(77);
         assert_eq!(json::parse(hello.as_bytes()).unwrap().get("native_batch"), Some(&json::Value::Bool(true)));
-        let p = presence_payload([-2, -1, 0, -2, -1, 1]);
+        assert_eq!(json::parse(hello.as_bytes()).unwrap().get("viewer_check"), Some(&json::Value::Bool(true)));
+        let p =presence_payload([-2, -1, 0, -2, -1, 1]);
         assert_eq!(&p[..4], &(-2i32).to_le_bytes());
         assert_eq!(&p[20..], &1i32.to_le_bytes());
+    }
+
+    // pol-spec 07d §1: the launcher's exact park line (pol_less::park::park_line).
+    const PARK_LINE: &str = r#"{"type":"park","v":1,"region":"US","lang":"US","pol_install_dir":"C:\\Games\\PlayOnlineViewer","install_dir":"C:\\Games\\SquareEnix\\FINAL FANTASY XI","auto_login":{"enabled":true,"character_slot":3},"ffxi_settings":{"0001":1920,"padmode000":"0,0,0,0,1,0"}}"#;
+
+    fn credentials_line(extra: &str) -> String {
+        format!("{{\"type\":\"credentials\",\"start_game\":false,\"keep_session\":false,\"invisible_login\":false,\"viewer_gaps\":false,\"auto_away_minutes\":20,{}{extra}}}\n", native_fields())
+    }
+
+    #[test]
+    fn round2_park_and_credentials_lines_rebuild_the_direct_session() {
+        let FirstLine::Park(park) = parse_first_line(PARK_LINE.as_bytes()).unwrap() else { panic!("not a park") };
+        assert_eq!((park.region, park.lang.as_str()), (Region::Us, "US"));
+        assert_eq!(park.auto_login, AutoLogin { enabled: true, character_slot: 3 });
+        assert_eq!(park.ffxi_settings.as_ref().map(|s| s.len()), Some(2));
+        let session = park.into_session(parse_credentials(credentials_line("").as_bytes()).unwrap());
+        let direct = parse_session(line(&format!("\"pol_install_dir\":\"C:\\\\Games\\\\PlayOnlineViewer\",\"auto_login\":{{\"enabled\":true,\"character_slot\":3}},\"ffxi_settings\":{{\"0001\":1920,\"padmode000\":\"0,0,0,0,1,0\"}},\"start_game\":false,\"auto_away_minutes\":20,{}", native_fields())).as_bytes()).unwrap();
+        assert_eq!((session.region, &session.lang, &session.install_dir, &session.pol_install_dir), (direct.region, &direct.lang, &direct.install_dir, &direct.pol_install_dir));
+        assert_eq!((session.start_game, session.keep_session, session.invisible_login, session.viewer_gaps, session.auto_away_minutes, session.auto_login),
+            (direct.start_game, direct.keep_session, direct.invisible_login, direct.viewer_gaps, direct.auto_away_minutes, direct.auto_login));
+        assert_eq!(session.ffxi_settings.as_ref().map(|s| s.len()), direct.ffxi_settings.as_ref().map(|s| s.len()));
+        let (a, b) = (session.native_auth.as_ref().unwrap(), direct.native_auth.as_ref().unwrap());
+        assert_eq!((a.pol_id, a.otp, &a.profile_key), (b.pol_id, b.otp, &b.profile_key));
+        assert!(session.pol_records.is_none() && session.content_ids.is_empty() && session.secrets.account_id == 0);
+        // The direct session line still parses as before.
+        assert!(matches!(parse_first_line(line(&native_fields()).as_bytes()), Ok(FirstLine::Session(_))));
+    }
+
+    #[test]
+    fn round2_a_park_never_carries_secrets_or_play_flags_and_credentials_never_carry_host_fields() {
+        let park = PARK_LINE.strip_suffix('}').unwrap();
+        for extra in [format!(",{}", native_fields()), format!(",{}", keys()), ",\"account_id\":\"0123456789abcdef\"".into(),
+            ",\"start_game\":false".into(), ",\"viewer_gaps\":true".into(), ",\"auto_away_minutes\":10".into()] {
+            let bad = format!("{park}{extra}}}");
+            let error = parse_first_line(bad.as_bytes()).unwrap_err().to_string();
+            assert!(!error.contains("fake password"), "{error}");
+        }
+        assert!(parse_first_line(PARK_LINE.replace("\"US\",\"lang\"", "\"EU\",\"lang\"").as_bytes()).is_err(), "US only");
+        assert!(parse_first_line(PARK_LINE.replace("\"v\":1", "\"v\":2").as_bytes()).is_err());
+        assert!(parse_first_line(PARK_LINE.replace("\"lang\":\"US\"", "\"lang\":\"US\",\"lang\":\"US\"").as_bytes()).is_err());
+        for extra in [",\"region\":\"US\"", ",\"install_dir\":\"C:\\\\x\"", ",\"ffxi_settings\":{}", ",\"auto_login\":{}", ",\"pol_records\":null"] {
+            assert!(parse_credentials(credentials_line(extra).as_bytes()).is_err(), "{extra}");
+        }
+        assert!(parse_credentials(credentials_line("").replace("credentials", "session").as_bytes()).is_err());
+        assert!(parse_credentials(b"{\"type\":\"credentials\"}").is_err(), "native_auth is required");
+        let defaults = parse_credentials(format!("{{\"type\":\"credentials\",{}}}", native_fields()).as_bytes()).unwrap();
+        assert!(defaults.start_game && !defaults.keep_session && !defaults.viewer_gaps && defaults.auto_away_minutes == 10);
+        assert!(!format!("{defaults:?}").contains("fake password"));
+    }
+
+    #[test]
+    fn round2_service_lines_and_hello_follow_the_contract() {
+        assert!(matches!(parse_service_event(br#"{"type":"native_play_pending"}"#), Ok(Some(ServiceEvent::NativePlayPending))));
+        let parse = |line: &str| match parse_service_event(line.as_bytes()) { Ok(Some(ServiceEvent::ViewerCheck(r))) => Some(r), _ => None };
+        assert_eq!(parse(r#"{"type":"native_viewer_check_result","ok":false,"reason":"network","error":"DNS: No such host is known. (11001)"}"#),
+            Some(ViewerCheckResult::NetworkNotReady("DNS: No such host is known. (11001)".into())));
+        let hello = hello_line(77);
+        assert_eq!(json::parse(hello.trim_end().as_bytes()).unwrap().get("park"), Some(&json::Value::Bool(PARK)));
+        assert_eq!(parked_line(77, 431), "{\"type\":\"parked\",\"pid\":77,\"polcore_ms\":431}\n");
     }
 }

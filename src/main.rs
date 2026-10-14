@@ -5,6 +5,7 @@ mod account_import;
 mod account_import_ui;
 mod account_order;
 mod discovery;
+mod dns;
 mod controller_nav;
 mod dgvoodoo;
 mod reshade;
@@ -23,11 +24,13 @@ mod prereqs;
 mod settings_page;
 mod operation;
 mod patch;
+mod play_flag;
 mod pol_less;
 mod privacy;
 mod services;
 mod self_update;
 mod session_worker;
+mod stock_socket;
 mod ui;
 mod updater;
 mod viewer;
@@ -39,14 +42,14 @@ use iced::{window, Font, Subscription, Task};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeSet, HashMap},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc, Arc,
     },
     time::{Duration, Instant},
 };
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 #[derive(Clone, Copy)]
 pub(crate) enum Field {
@@ -154,11 +157,27 @@ pub(crate) struct Settings {
     /// Per-account PlayOnline Auto-Away minutes (0 = off); absent = 10.
     #[serde(default)]
     pub account_auto_away: HashMap<String, u8>,
-    /// Opt-in background POL sign-in on this GUI's first account load.
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
-    pub account_startup_signin: BTreeSet<String>,
+    /// Files before 2026-10-13: the per-account "Sign in when Crystal opens" choice. Read only to
+    /// migrate it (`migrate_startup_signin`) and never written again.
+    #[serde(default, rename = "account_startup_signin", skip_serializing)]
+    legacy_startup_signin: BTreeSet<String>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub account_auto_login: HashMap<String, pol_less::AutoLogin>,
+    /// Accounts whose last successful sign-in took a one-time code (learned, never the code):
+    /// a "Wait and play" released after a restart asks for a code instead of signing in
+    /// without one, and Crystal never signs them in by itself.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub account_otp: BTreeSet<String>,
+    /// Accounts whose last successful sign-in took no one-time code (learned the same way; never
+    /// in `account_otp` too). Only these are signed in by Crystal itself (`presigns`). An account
+    /// in neither set has not been seen signing in yet.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub account_no_otp: BTreeSet<String>,
+    /// Settings → System, "Sign accounts in when Crystal opens" (owner decision 2026-10-13): the
+    /// one switch for Crystal's own sign-ins, at its start and after a game closes. On by
+    /// default, older files too.
+    #[serde(default = "default_true")]
+    pub auto_sign_in: bool,
     /// The launcher's own UI language (Settings page). Absent = follow the
     /// Windows display language. The game's language is never changed here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -200,8 +219,11 @@ impl Default for Settings {
             account_installs: HashMap::new(),
             account_overlays: HashMap::new(),
             account_auto_away: HashMap::new(),
-            account_startup_signin: BTreeSet::new(),
+            legacy_startup_signin: BTreeSet::new(),
             account_auto_login: HashMap::new(),
+            account_otp: BTreeSet::new(),
+            account_no_otp: BTreeSet::new(),
+            auto_sign_in: true,
             language: None,
             privacy: false,
             dgvoodoo: true,
@@ -240,7 +262,121 @@ pub(crate) struct AccountRow {
     play_timing: Option<launch_timing::Timeline>,
     /// How the last client ended, while `status` still holds its (English) summary.
     exit: Option<launch_log::ExitReport>,
+    /// What started the sign-in in flight (pol-spec 07d §4.2), for its failure handling.
+    launch_trigger: Option<launch_timing::LaunchTrigger>,
+    /// A sign-in that failed on the network starts again once DNS answers (07d §5.4-5.5).
+    network_wait: Option<NetworkWait>,
+    /// The sign-in in flight (or last) took the row's one-time code, which is now spent: no
+    /// automatic second sign-in may follow it, since it would go without a code and be refused
+    /// (07d §5.4) until the user types a new one.
+    otp_spent: bool,
+    /// The row's session came from an earlier window's worker whose record does not say whether
+    /// its sign-in took a code (workers before the field existed write none), so `otp_spent` is
+    /// a guess: nothing that session does teaches that the account signs in without one.
+    otp_unknown: bool,
+    /// The sign-in in flight (or last) is one Crystal started by itself without a code
+    /// (`LaunchTrigger::is_presign`), also when a Play has since queued on it: only such a
+    /// sign-in's refusal marks the account as one that may need a code (owner decision
+    /// 2026-10-13). A user's own Play or Connect never changes what Crystal knows that way.
+    presign_login: bool,
+    /// The running session's game was seen running: its end is a game end.
+    game_seen: bool,
+    /// The user signed out or edited the account during the running session: its end signs
+    /// nothing back in.
+    resign_declined: bool,
+    /// A sign-in after the game closed, waiting for its session to end fully.
+    resign: Option<Resign>,
 }
+
+/// Owner decision 2026-10-12, "Sign it back in automatically": a pre-signed account (one Crystal
+/// signs in by itself, `Settings::presigns`) whose game closed (its session signed out and
+/// closed) signs in again, so the next Play is a pre-signed one. Square Enix sees a sign-out and
+/// then a fresh sign-in, as from a user who quits FFXI and reopens PlayOnline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Resign {
+    /// The row's launch generation at the game's end: a launch since (Play, Connect) wins.
+    generation: u64,
+    /// When the game's end was seen.
+    ended: Instant,
+    /// Since when the row has been free (host exited, sign-out done, worker record closed).
+    free_since: Option<Instant>,
+    /// An unclean end: the connectivity probe must see the network first.
+    network: bool,
+    /// The ended session's host (loader) PID. Its worker's record closing is not enough: a
+    /// pipe failure ends the session while a hung loader may still hold its polcore session.
+    host: Option<u32>,
+}
+
+/// How long the row stays free after the previous session ended before the sign-in after a
+/// game starts. A stock user who quits FFXI has to reopen the PlayOnline Viewer, wait for it
+/// to load and click through to sign in, which takes seconds; an instant sign-in would be
+/// traffic no stock Viewer produces. At least 3 s (owner, 2026-10-12); 5 s here.
+const RESIGN_DELAY: Duration = Duration::from_secs(5);
+
+/// What a row does when its connectivity probe succeeds (pol-spec 07d §5.4-5.5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NetworkWait {
+    /// Re-issue the Play queued behind a failed pre-sign-in, keeping its click time.
+    Reissue(Instant),
+    /// The one retry of a startup sign-in.
+    StartupRetry,
+    /// A game ended uncleanly: its sign-in after the game waits for the network first.
+    AfterGame,
+    /// The one retry of a sign-in after a game.
+    AfterGameRetry,
+}
+
+/// A Play clicked before this window's first status read finished (owner, 2026-10-13: Play
+/// at 05:07:40 UTC, 19 s into Crystal's start, went through during All Worlds Maintenance).
+struct HeldPlay {
+    keys: Vec<String>,
+    clicked: Instant,
+    trigger: Option<launch_timing::LaunchTrigger>,
+    since: Instant,
+    /// What each held row and the status line said before the hold, restored at release.
+    rows: Vec<(String, String)>,
+    status: String,
+}
+
+/// The longest a Play waits for the first status read. A read that fails or takes longer
+/// establishes nothing, and the Play proceeds as without one.
+const STATUS_HOLD_LIMIT: Duration = Duration::from_secs(10);
+
+/// A Play that found FFXI down (owner decision 2026-10-13, "Wait and play"): instead of being
+/// refused, it starts as soon as FFXI is back (`release_waiting_plays`). Accounts clicked together
+/// wait, and start, together. Waits live in this window only and are never saved: a Crystal
+/// restart drops them, and the user presses Play again.
+struct WaitingPlay {
+    keys: Vec<String>,
+    /// Accounts whose one-time code was typed for this Play: they sign in with a code.
+    otp: Vec<String>,
+    /// When the wait began.
+    armed: Instant,
+    /// The codes typed for this Play, taken off the rows. A release within OTP_KEEP of `armed`
+    /// (the immediate flag read, when the official status lags behind a flag already at 1)
+    /// still uses them; after that they are stale and dropped (`expire_wait_codes`), and the
+    /// release asks the user for a new one.
+    codes: Vec<(String, Zeroizing<String>)>,
+}
+
+/// How long a one-time code typed for a Play that then waits stays usable for that Play.
+const OTP_KEEP: Duration = Duration::from_secs(20);
+
+/// The Update that Plays released from a wait asked for (their version check said one is
+/// required). Crystal starts it by itself; the Round 5 re-issue starts the Plays when it succeeds.
+struct WaitUpdate {
+    keys: Vec<String>,
+    /// The Update has started: its end starts the Plays again, or their rows say why not.
+    started: bool,
+    /// The account game folder it updates (`None`: the Settings one). A Play it starts again
+    /// whose own folder is another one may ask for (and start) another Update; one in this
+    /// folder may not, so a folder that keeps refusing never loops.
+    folder: Option<PathBuf>,
+}
+
+/// How long a startup sign-in waits for a still-running session of its account to end
+/// before it is skipped (07d §5.5: the previous game's host may take seconds to close).
+const STARTUP_WAIT_LIMIT: Duration = Duration::from_secs(60);
 impl Drop for AccountRow {
     fn drop(&mut self) {
         self.otp.zeroize();
@@ -273,13 +409,56 @@ impl AccountRow {
         self.status = report.summary.clone();
         self.exit = Some(report);
     }
+    /// The user acted on the account (sign-out, edit): no sign-in after its game, pending or
+    /// still to come from the running session.
+    fn decline_resign(&mut self) {
+        self.resign_declined = self.pid.is_some() || self.busy;
+        self.drop_resign();
+    }
+    /// Forget a pending sign-in after a game, or its one network retry, and its promise on the row.
+    fn drop_resign(&mut self) {
+        self.resign = None;
+        if self.network_wait == Some(NetworkWait::AfterGame) { self.network_wait = None; }
+        if self.network_wait == Some(NetworkWait::AfterGameRetry) {
+            self.network_wait = None;
+            let promise = format!(" · {}", t("Crystal will try again when the network is back."));
+            if let Some(shown) = self.status.strip_suffix(&promise).map(str::to_owned) { self.status = shown; }
+        }
+        if let Some(shown) = self.status.strip_suffix(&resign_note()).map(str::to_owned) { self.status = shown; }
+    }
 }
+
+/// The row's note while it signs back in after a game.
+fn resign_note() -> String {
+    format!(" · {}", t("Signing back in after the game closed."))
+}
+
+/// Whether the ended session's host process still runs. One this process may not open (an
+/// elevated host) counts as running: a sign-in after the game then waits for its limit.
+#[cfg(not(test))]
+fn host_running(pid: u32) -> bool {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::{Foundation::{CloseHandle, GetLastError, ERROR_ACCESS_DENIED, WAIT_TIMEOUT},
+            System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE}};
+        let raw = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+        if raw.is_null() { return unsafe { GetLastError() } == ERROR_ACCESS_DENIED; }
+        let running = unsafe { WaitForSingleObject(raw, 0) } == WAIT_TIMEOUT;
+        unsafe { CloseHandle(raw) };
+        running
+    }
+    #[cfg(not(windows))]
+    { let _ = pid; false }
+}
+#[cfg(test)]
+thread_local! { static RUNNING_HOSTS: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) }; }
+#[cfg(test)]
+fn host_running(pid: u32) -> bool { RUNNING_HOSTS.with(|hosts| hosts.borrow().contains(&pid)) }
 pub(crate) struct Editor {
     pub key: Option<String>,
     pub account: Account,
     pub game_install: String,
     pub dat_overlays: Vec<String>,
-    pub startup_signin: bool,
     pub auto_login: pol_less::AutoLogin,
 }
 
@@ -319,11 +498,39 @@ enum WorkerEvent {
     Friends(u64, String, bool, Option<friends::Snapshot>),
     /// The stock FFXI version check ran before starting the game from a signed-in session:
     /// what it found, then whether the start request went out.
-    StartGame(String, patch::PatchReport, Result<String, String>),
+    /// A signed-in session's Play: W20's report (absent when it never ran) and the outcome.
+    StartGame(String, Option<patch::PatchReport>, Result<String, String>),
+    /// A row's connectivity probe (07d §5.5): the patch server resolves again (`true`), or
+    /// it gave up after `session_worker::NETWORK_PROBE_LIMIT` (`false`). Sent `for_launch`.
+    NetworkBack(String, bool),
     /// A line for the status bar that outlives the account's progress lines.
     Notice(String),
     WindowerProfileProgress(String),
     Viewer(u64, viewer::Status),
+    /// An interrupted update found at a Play was finished or undone (`Ok`), or could not
+    /// be: the held launch then starts, or its rows say why.
+    InterruptedUpdate(Box<Recovered>),
+}
+/// A launch waiting for something local (an interrupted update's recovery) before it starts.
+#[derive(Clone, Debug)]
+struct HeldLaunch {
+    keys: Vec<String>,
+    social_only: bool,
+    clicked: Instant,
+    trigger: Option<launch_timing::LaunchTrigger>,
+}
+/// The outcome of finishing interrupted updates for a held launch.
+#[derive(Clone)]
+struct Recovered {
+    held: HeldLaunch,
+    /// The folders whose journals were finished or undone.
+    folders: Vec<PathBuf>,
+    /// Every parked host was closed first (PlayOnline's folder was among them, or a retry).
+    parks_closed: bool,
+    result: Result<(), String>,
+    /// After a success, the Settings game folder's and PlayOnline's local state again.
+    game: Option<patch::PatchReport>,
+    viewer: Option<viewer::Status>,
 }
 impl WorkerEvent {
     fn for_launch(self, key: &str, generation: u64) -> Self {
@@ -394,7 +601,6 @@ pub(crate) enum Message {
     EditorRegion(u8),
     // the editor's Launch section (None = use the default).
     EditorLaunchWith(Option<ui::LaunchWith>),
-    EditorStartupSignin(bool),
     EditorAutoLogin(bool),
     EditorCharacterSlot(u8),
     AccountImport(account_import_ui::Msg),
@@ -409,6 +615,8 @@ pub(crate) enum Message {
     SetLightTheme(bool),
     SetLanguage(i18n::Lang),
     SetPrivacy(bool),
+    /// Settings → System: "Sign accounts in when Crystal opens".
+    AutoSignIn(bool),
     ChooseProfile(String),
     SetLaunchWith(ui::LaunchWith),
     WikiQueryChanged(String),
@@ -434,6 +642,8 @@ pub(crate) enum Message {
     StartMaintenance(MaintenanceKind),
     MaintenanceFinished(MaintenanceKind, Result<String, String>, Option<patch::PatchReport>),
     CancelMaintenance,
+    /// Show or hide Downloads → Troubleshooting (Check files, Repair files).
+    ToggleTroubleshooting,
     SaveSettings,
     Refresh,
     OpenUrl(String),
@@ -444,6 +654,10 @@ pub(crate) enum Message {
     /// The finished news refresh, its request generation and language.
     ServicesLoaded(u64, i18n::Lang, Result<services::ServiceSnapshot, String>),
     ServiceStatusLoaded(u64, i18n::Lang, Result<services::ServiceSnapshot, String>),
+    /// A read of FFXI's play flag, made while a Play waits.
+    PlayFlagLoaded(play_flag::Reading),
+    /// Cancel these accounts' "Wait and play".
+    CancelWait(Vec<String>),
     PatchLoaded(u64, patch::PatchReport),
     ViewerLoaded(u64, viewer::Status),
     CloseRequested,
@@ -509,6 +723,41 @@ pub(crate) struct App {
     pub status: String,
     pub vault_ready: bool,
     startup_signin_pending: bool,
+    /// Startup sign-ins whose row was still busy with a previous session, and since when
+    /// (07d §5.5): each starts once its row is free, or is skipped after STARTUP_WAIT_LIMIT.
+    startup_waiting: Vec<(String, Instant)>,
+    /// When the startup sign-ins were issued (the parks start after them, 07d §5.7).
+    startup_issued: Option<Instant>,
+    /// The `launcher start` history line was written (07d §4.4).
+    launcher_start_logged: bool,
+    /// This window's first official status read has finished (either way): until it has, a
+    /// Play has only a missing or cached status to go on, so it is held (`hold_for_status`).
+    status_read_done: bool,
+    /// A hold reached STATUS_HOLD_LIMIT without a read: later Plays are not held either.
+    status_hold_spent: bool,
+    /// Plays clicked before the first status read, waiting for it.
+    held_plays: Vec<HeldPlay>,
+    /// Plays waiting for FFXI to come back ("Wait and play").
+    waiting_plays: Vec<WaitingPlay>,
+    /// The last read of FFXI's play flag, and when the next is due (only while a Play waits).
+    play_flag: play_flag::Known,
+    flag_schedule: play_flag::Schedule,
+    /// Accounts released from a wait whose Play is still starting: an update it asks for
+    /// starts by itself (`wait_update`).
+    released: Vec<String>,
+    wait_update: Option<WaitUpdate>,
+    /// Tests: record `start_launch` calls instead of starting workers.
+    #[cfg(test)]
+    launches: Option<Vec<(Vec<String>, bool, Instant, Option<launch_timing::LaunchTrigger>)>>,
+    /// Parked warm hosts for cold Plays, one per account, tool and profile (07d §1.5).
+    parks: pol_less::park::Pool<session_worker::ParkWorker>,
+    /// Each wanted park key's last fingerprint; re-read every FINGERPRINT_EVERY.
+    park_prints: std::collections::BTreeMap<pol_less::park::ParkKey, pol_less::park::Fingerprint>,
+    /// When the fingerprints were read; `None` re-reads them at the next tend (after a
+    /// settings save, a profile-editor close or an installation change).
+    park_checked: Option<Instant>,
+    /// The last pool tend (at most once a second).
+    park_tended: Option<Instant>,
     pub confirm_close: bool,
     pub pending_delete: Option<String>,
     pub wiki_query: String,
@@ -522,6 +771,20 @@ pub(crate) struct App {
     pub installer_error: Option<String>,
     pub maintenance_tone: ResultTone,
     pub maintenance_cancelled: bool,
+    /// What the running Update covers: (PlayOnline, FINAL FANTASY XI).
+    update_scope: (bool, bool),
+    /// Downloads → Troubleshooting is expanded.
+    pub troubleshooting_open: bool,
+    /// An interrupted update is being finished before a launch: `Some(true)` when that
+    /// includes PlayOnline's folder (whose files parked hosts hold).
+    recovering: Option<bool>,
+    /// The game folder `patch` describes when it is not the Settings one: an account's own
+    /// folder whose W20 refused a Play. The main button's Update updates that folder.
+    patch_folder: Option<PathBuf>,
+    /// Plays a version check refused for an update (account key, click), and those an
+    /// Update started from them: started again when that Update succeeds (proposal 09).
+    refused_plays: Vec<(String, Instant)>,
+    reissue_after_update: Vec<(String, Instant)>,
     active_operation: Option<operation::Operation>,
     config: Config,
     sender: mpsc::Sender<WorkerEvent>,
@@ -601,6 +864,23 @@ impl App {
             status: t("Loading saved accounts…").into(),
             vault_ready: false,
             startup_signin_pending: !preview,
+            startup_waiting: Vec::new(),
+            startup_issued: None,
+            launcher_start_logged: false,
+            status_read_done: preview,
+            status_hold_spent: false,
+            held_plays: Vec::new(),
+            waiting_plays: Vec::new(),
+            play_flag: play_flag::Known::default(),
+            flag_schedule: play_flag::Schedule::default(),
+            released: Vec::new(),
+            wait_update: None,
+            #[cfg(test)]
+            launches: None,
+            parks: Default::default(),
+            park_prints: Default::default(),
+            park_checked: None,
+            park_tended: None,
             confirm_close: false,
             pending_delete: None,
             wiki_query: String::new(),
@@ -614,6 +894,12 @@ impl App {
             installer_error: None,
             maintenance_tone: ResultTone::Unverified,
             maintenance_cancelled: false,
+            update_scope: (true, true),
+            troubleshooting_open: false,
+            recovering: None,
+            patch_folder: None,
+            refused_plays: Vec::new(),
+            reissue_after_update: Vec::new(),
             active_operation: None,
             config: config.clone(),
             sender,
@@ -723,7 +1009,7 @@ impl App {
                         state: patch::PatchState::Required,
                         local_version: t("Not initialized").into(),
                         remote_version: "20110829_E".into(),
-                        detail: t("PlayOnline has not completed its initial update. Open Downloads and choose Update.").into(),
+                        detail: t("PlayOnline has not completed its initial update. Press Update to finish it.").into(),
                         source_url: None, files_verified: None,
                     },
                     core_error: None,
@@ -804,7 +1090,7 @@ impl App {
                     account,
                     game_install: String::new(),
                     dat_overlays: Vec::new(),
-                    startup_signin: false, auto_login: pol_less::AutoLogin::default(),
+                    auto_login: pol_less::AutoLogin::default(),
                 });
             }
             if std::env::args().any(|a| a == "--preview-live-news") {
@@ -829,7 +1115,7 @@ impl App {
         );
         let checks = app.refresh();
         let installation = app.find_installation(true);
-        let viewer = app.start_viewer_check(false);
+        let viewer = app.start_viewer_check();
         let launcher = if app.settings.launcher_auto_updates && !matches!(app.self_update, self_update::State::Error(_)) { Task::done(Message::SelfUpdate(self_update::Msg::Check)) } else { Task::none() };
         (app, Task::batch([accounts, checks, viewer, launcher, installation]))
     }
@@ -846,6 +1132,7 @@ impl App {
             || self.installation_loading
             || self.viewer_loading
             || self.friends.pending.is_some()
+            || !self.held_plays.is_empty()
             || self.accounts.iter().any(|a| a.busy || a.batch_pending);
         let tick = Duration::from_millis(if busy { 100 } else { 1000 });
         Subscription::batch([
@@ -880,6 +1167,20 @@ impl App {
             .filter_map(|r| seen.insert(r.key.clone()).then(|| r.key.clone()))
             .collect()
     }
+    /// Whether `key`'s Play waits for FFXI to come back.
+    pub(crate) fn is_waiting(&self, key: &str) -> bool {
+        self.waiting_plays.iter().any(|wait| wait.keys.iter().any(|waiting| waiting == key))
+    }
+    /// Whether `key`'s Play, released from its wait, is held for the Update it asked for, which
+    /// is running.
+    pub(crate) fn waited_update_running(&self, key: &str) -> bool {
+        self.maintenance == Some(MaintenanceKind::Update)
+            && self.wait_update.as_ref().is_some_and(|update| update.started && update.keys.iter().any(|known| known == key))
+    }
+    /// The selected accounts "Wait and play" would set waiting: launchable, not waiting yet.
+    pub(crate) fn wait_keys(&self) -> Vec<String> {
+        self.launch_keys(true).into_iter().filter(|key| !self.is_waiting(key)).collect()
+    }
     fn has_sessions(&self) -> bool {
         self.accounts.iter().any(|r| r.busy || r.batch_pending || r.pid.is_some()
             || !self.preview && session_worker::find(&self.config, &r.account).is_some())
@@ -901,16 +1202,62 @@ impl App {
 
     pub(crate) fn sessions_block_update(&self) -> bool { self.update_sessions().is_none() }
     pub fn launch_blocked(&self) -> bool {
-        self.installation_loading
-            || self.reshade.busy
+        self.installation_loading || self.files_changing() || self.recovering.is_some()
+    }
+
+    /// Game, PlayOnline, ReShade or Crystal files are being written: what a parked pol.exe
+    /// (polcore.dll loaded) must not hold open. A read-only installation scan is not, and
+    /// neither is finishing an interrupted update in a game folder only.
+    fn files_changing(&self) -> bool {
+        self.reshade.busy
+            || self.recovering == Some(true)
             || self.maintenance.is_some_and(MaintenanceKind::blocks_launch)
             || matches!(self.self_update, self_update::State::Applying)
     }
 
+    /// What the running file operation is called: an Update names what it updates.
+    pub(crate) fn maintenance_label(&self) -> &'static str {
+        match (self.maintenance, self.update_scope) {
+            (Some(MaintenanceKind::Update), (true, false)) => t("Updating PlayOnline"),
+            (Some(MaintenanceKind::Update), (false, true)) => t("Updating FINAL FANTASY XI"),
+            (Some(kind), _) => kind.label(),
+            (None, _) => t("Working"),
+        }
+    }
+
+    /// What an Update now covers: PlayOnline when its last sign-in check or local state
+    /// says it needs one, FINAL FANTASY XI when its version check did, or when nothing
+    /// says so (the Play button's Update). A game update never asks for PlayOnline's file
+    /// list, as stock never does (capture 2026-10-13 00:49).
+    fn update_scope(&self) -> (bool, bool) {
+        let viewer = self.viewer.as_ref().is_some_and(viewer::Status::requires_update);
+        let game = self.patch.as_ref().is_some_and(|report| report.state == patch::PatchState::Required);
+        (viewer, game || !viewer)
+    }
+
+    /// The Play gate's verdict and the note that explains it: the official status (Round 4),
+    /// over which a fresh read of FFXI's play flag wins both ways (`play_flag::decide`).
+    fn service_status(&self) -> (services::Availability, String) {
+        if self.preview {
+            return self.services.as_ref().map_or((services::Availability::Unknown, String::new()),
+                |snapshot| (snapshot.availability, snapshot.availability_note.clone()));
+        }
+        let now = chrono::Utc::now();
+        let official = self.services.as_ref().map_or((services::Availability::Unknown, String::new()), |snapshot| snapshot.recent_status(now));
+        play_flag::decide(&self.play_flag, official, now)
+    }
+
     pub fn service_availability(&self) -> services::Availability {
-        self.services.as_ref().map_or(services::Availability::Unknown, |snapshot| {
-            if self.preview { snapshot.availability } else { snapshot.recent_availability(chrono::Utc::now()) }
-        })
+        self.service_status().0
+    }
+
+    /// The note that explains `service_availability`, as a waiting Play shows it.
+    pub fn service_note(&self) -> String {
+        self.service_status().1
+    }
+
+    fn service_down(&self) -> bool {
+        matches!(self.service_availability(), services::Availability::Maintenance | services::Availability::Outage)
     }
 
     pub fn main_action(&self) -> MainAction {
@@ -945,7 +1292,12 @@ impl App {
                 self.show_details = false;
                 return task;
             }
-            MainAction::Maintenance | MainAction::Offline => self.show_details = true,
+            // "Wait and play": the selected accounts wait for FFXI (`wait_for_service`). With
+            // nothing left to set waiting, the button explains the downtime.
+            MainAction::Maintenance | MainAction::Offline => {
+                let keys = self.wait_keys();
+                if self.preview || keys.is_empty() { self.show_details = true; } else { self.start(keys); }
+            }
         }
         Task::none()
     }
@@ -1059,8 +1411,9 @@ impl App {
                     self.installation_generation = self.installation_generation.wrapping_add(1);
                     self.installation_loading = false;
                     self.patch = None;
+                    self.patch_folder = None;
                     self.maintenance_result =
-                        t("Selected installation has not been checked. Use Check files to verify it.")
+                        t("Game folder selected. Play checks its version before FINAL FANTASY XI starts.")
                             .into();
                     self.maintenance_tone = ResultTone::Unverified;
                 }
@@ -1081,13 +1434,14 @@ impl App {
             MaintenanceKind::Check | MaintenanceKind::Update | MaintenanceKind::Repair
         );
         if game_operation && self.installation_loading { return Task::none(); }
+        let account_folder = self.update_account_folder(kind);
         if !game_operation {
             // Pressing an installer step selects its current folder. The old
             // extra confirmation left all three buttons disabled on first use.
             self.settings.installer_selected = false;
             self.select_path(true);
             if !self.settings.installer_selected { return Task::none(); }
-        } else if game_operation && !self.settings.install_selected {
+        } else if game_operation && !self.settings.install_selected && account_folder.is_none() {
             self.status =
                 t("Select the target folder explicitly before starting this operation.").into();
             return Task::none();
@@ -1106,7 +1460,18 @@ impl App {
             if !game_operation { self.installer_error = Some(self.status.clone()); }
             return Task::none();
         }
-        let install = PathBuf::from(&self.settings.install_path);
+        // A parked pol.exe has polcore.dll loaded: close every park before files change (07d §1.5).
+        if kind.blocks_launch() { self.close_parks(); }
+        // The Plays refused for this update start again when it succeeds (those released from a
+        // wait too, whoever started it).
+        if kind == MaintenanceKind::Update {
+            self.reissue_after_update = std::mem::take(&mut self.refused_plays);
+            if let Some(update) = &mut self.wait_update {
+                update.started = true;
+                update.folder = account_folder.clone();
+            }
+        }
+        let install = account_folder.unwrap_or_else(|| PathBuf::from(&self.settings.install_path));
         let dir = PathBuf::from(&self.settings.installer_path);
         let op = operation::Operation::default();
         if matches!(kind, MaintenanceKind::Update | MaintenanceKind::Repair) { op.begin_update(); }
@@ -1115,14 +1480,17 @@ impl App {
             op.progress("SignOut", 0, idle_sessions.len() as u64,
                 t("Signing out idle PlayOnline sessions before updating"));
         }
+        // Check and Repair cover both components; an Update what needs it.
+        let (update_viewer, update_game) = if kind == MaintenanceKind::Update { self.update_scope() } else { (true, true) };
+        self.update_scope = (update_viewer, update_game);
         self.active_operation = Some(op.clone());
         self.maintenance = Some(kind);
         self.maintenance_cancelled = false;
         self.maintenance_progress = op.snapshot();
         self.maintenance_result.clear();
         self.maintenance_tone = ResultTone::Done;
-        self.status = kind.label().into();
-        if game_operation { self.viewer_generation += 1; self.viewer_loading = true; }
+        self.status = self.maintenance_label().into();
+        if game_operation && update_viewer { self.viewer_generation += 1; self.viewer_loading = true; }
         let viewer_generation = self.viewer_generation;
         let previous_viewer_version = self.viewer.as_ref().map(|v| v.version.remote_version.clone())
             .filter(|version| patch::valid_viewer_version(version));
@@ -1141,30 +1509,34 @@ impl App {
                         MaintenanceKind::Update => updater::Mode::Update,
                         _ => updater::Mode::Repair,
                     };
-                    // The updater asked the official server for its version; the interface
-                    // shows that answer instead of sending a request of its own.
+                    // An Update asked the official server for its version; the interface shows
+                    // that answer instead of sending a request of its own. Check is offline.
                     let folder = install.clone();
-                    let pol_folder = patch::registry_install_folder("1000");
-                    let result = match pol_folder.clone() {
-                        Some(pol) => updater::run_combined(pol, install, mode, op).await,
-                        None => Err(updater::CombinedFailure::from(t("PlayOnline Viewer is not installed. Run official setup and select PlayOnline Viewer.").to_owned())),
+                    let pol_folder = if update_viewer { patch::registry_install_folder("1000") } else { None };
+                    let result = match (pol_folder.clone(), update_viewer) {
+                        (None, true) => Err(updater::CombinedFailure::from(t("PlayOnline Viewer is not installed. Run official setup and select PlayOnline Viewer.").to_owned())),
+                        (pol, _) => updater::run_combined(pol, update_game.then_some(install), mode, op).await,
                     };
                     // Refresh POL even after a partial failure: its verified
                     // transaction may have completed before the game stopped.
                     if let Some(pol) = pol_folder {
-                        let remote = match &result { Ok(report) => Some(report.viewer.version.clone()),
-                            Err(error) => error.viewer_version.clone().or(previous_viewer_version) };
+                        let remote = if mode == updater::Mode::Check { previous_viewer_version } else { match &result {
+                            Ok(report) => report.viewer.as_ref().map(|viewer| viewer.version.clone()),
+                            Err(error) => error.viewer_version.clone().or(previous_viewer_version) } };
                         let _ = tokio::task::spawn_blocking(move || {
                             let _ = sender.send(WorkerEvent::Viewer(viewer_generation, viewer::after_check(pol, remote.as_deref())));
                         }).await;
-                    } else {
+                    } else if update_viewer {
                         let _ = sender.send(WorkerEvent::Viewer(viewer_generation, viewer::unavailable(
                             t("PlayOnline Viewer is not installed. Run official setup and select PlayOnline Viewer.").into())));
                     }
                     return match result {
                         Ok(report) => {
                             let summary = report.summary();
-                            let shown = tokio::task::spawn_blocking(move || patch::report_after_operation(&folder, &report.game, mode)).await.ok();
+                            let shown = match report.game {
+                                Some(game) => tokio::task::spawn_blocking(move || patch::report_after_operation(&folder, &game, mode)).await.ok(),
+                                None => None,
+                            };
                             (Ok(summary), shown)
                         }
                         Err(error) => (Err(error.message), None),
@@ -1181,7 +1553,7 @@ impl App {
                             Ok(t("Extractor finished. Choose Run setup. If you extracted elsewhere, browse to that FFXIFullSetup_US folder first.").into())
                         } else {
                             installer::install(&dir)?;
-                            Ok(t("Setup closed. Crystal will look for the installed FFXI folder. PlayOnline Viewer installs only when selected in the wizard. Check files before updating.").into())
+                            Ok(t("Setup closed. Crystal will look for the installed FFXI folder. PlayOnline Viewer installs only when selected in the wizard. Then press Update to install the official updates.").into())
                         }
                     }).await.unwrap_or_else(|_| Err(t("Installer worker could not complete.").into()))
                 }
@@ -1343,6 +1715,14 @@ impl App {
                     timing: String::new(),
                     play_timing: None,
                     exit: None,
+                    launch_trigger: None,
+                    network_wait: None,
+                    otp_spent: false,
+                    otp_unknown: false,
+                    presign_login: false,
+                    game_seen: false,
+                    resign_declined: false,
+                    resign: None,
                 }
             };
             if !row.batch_requested {
@@ -1357,6 +1737,14 @@ impl App {
             if let Some(session) = reconnect {
                 row.busy = true;
                 row.preparing_session = session.preparing_social();
+                // A code spent in an earlier window is still spent (no sign-in after its game).
+                // An older worker's record does not say; its "no code" teaches nothing.
+                let used = session.otp_used();
+                (row.otp_spent, row.otp_unknown) = (used.unwrap_or(false), used.is_none());
+                // Whatever that window started it as, this one did not sign it in.
+                row.presign_login = false;
+                // A reconnect is no Play: nothing an earlier batch left classifies its end.
+                row.launch_trigger = None;
                 row.launch_generation = row.launch_generation.wrapping_add(1);
                 let generation = row.launch_generation;
                 row.status = t("Reconnecting to the background session…").into();
@@ -1407,13 +1795,15 @@ impl App {
         self.start_mode_at(keys, social_only, Instant::now());
     }
 
-    fn start_viewer_check(&mut self, force: bool) -> Task<Message> {
+    /// Local Viewer readiness for the UI. Stock sends no W2U (:54000) without a Connect, so
+    /// launcher start and setup never query the server; each sign-in asks once (07c §3).
+    fn start_viewer_check(&mut self) -> Task<Message> {
         if self.preview || self.viewer_loading { return Task::none(); }
         self.viewer_loading = true;
         self.viewer_generation += 1;
         let generation = self.viewer_generation;
         Task::perform(async move {
-            tokio::task::spawn_blocking(move || viewer::status(force)).await
+            tokio::task::spawn_blocking(viewer::local_status).await
                 .unwrap_or_else(|e| viewer::unavailable(e.to_string()))
         }, move |report| Message::ViewerLoaded(generation, report))
     }
@@ -1440,25 +1830,35 @@ impl App {
         }).collect()
     }
 
-    fn start_together(&mut self, keys: Vec<(String, Option<session_worker::BackgroundSession>)>, clicked: Instant) {
+    fn start_together(&mut self, keys: Vec<(String, Option<session_worker::BackgroundSession>)>, clicked: Instant, trigger: launch_timing::LaunchTrigger) {
         let mut jobs = Vec::new();
         let mut generations = HashMap::new();
         for (key, session) in keys {
             let Some(row) = self.accounts.iter_mut().find(|row| row.key == key
                 && (row.can_play() || row.queued_signin_play() && row.queued_play == Some(clicked))) else { continue; };
-            let Some(via) = self.settings.launch_plan(&row.account) else { continue; };
+            let Some(mut via) = self.launch_tools.launch_plan(&self.settings, &row.account) else { continue; };
+            via.trigger = trigger;
+            row.launch_trigger = Some(trigger);
+            row.network_wait = None;
             let config = self.settings.config_for(&self.config, &row.account);
+            // The pre-sign-in already used the row's code unless a new one was typed since.
+            let presign_otp_spent = row.otp_spent && row.otp.is_empty();
+            row.otp_spent = presign_otp_spent || !row.otp.is_empty();
+            // An existing session keeps what is known of its own sign-in (a pre-sign-in's refusal
+            // still arrives here); a new one is this Play's own sign-in.
             let job = match session {
                 Some(session) => session_worker::BatchAccount::existing(key.clone(), config, row.account.clone(),
-                    std::mem::take(&mut row.otp), via, &session),
+                    std::mem::take(&mut row.otp), via, &session).with_otp_spent(presign_otp_spent),
                 None if row.busy || row.pid.is_some() => {
                     row.queued_play = None;
                     row.problem = true;
                     row.status = t("The background session ended before Play could start. Sign in again.").into();
                     continue;
                 }
-                None => session_worker::BatchAccount::new(key.clone(), config, row.account.clone(),
-                    std::mem::take(&mut row.otp), via),
+                None => {
+                    (row.otp_unknown, row.presign_login) = (false, false);
+                    session_worker::BatchAccount::new(key.clone(), config, row.account.clone(), std::mem::take(&mut row.otp), via)
+                }
             };
             jobs.push(job);
             row.launch_generation = row.launch_generation.wrapping_add(1);
@@ -1476,6 +1876,9 @@ impl App {
         }
         let count = jobs.len();
         if count == 0 { return; }
+        // A batch signs its accounts in itself (cold): their parked hosts close (07d §1.5).
+        let batch_keys: Vec<String> = jobs.iter().map(|job| job.key.clone()).collect();
+        self.close_parks_for(&batch_keys);
         // The batch owner is another headless Crystal process. The interface only
         // receives its progress; its lifetime does not control the game handoff.
         let sender = self.sender.clone();
@@ -1518,6 +1921,393 @@ impl App {
     }
 
     fn start_mode_at(&mut self, keys: Vec<String>, social_only: bool, clicked: Instant) {
+        self.start_launch(keys, social_only, clicked, None);
+    }
+
+    /// `trigger`: what started this launch, for its log (07d §4.2); `None` names it by the
+    /// path it takes (Play, Connect, pre-signed, queued or batch Play).
+    /// Every Play path (single, pre-signed, queued behind a pre-sign-in, batch, a reissue)
+    /// comes through here and is held until this window's first status read has finished.
+    /// A sign-in only (startup, Connect) is never gated: PlayOnline is up during FFXI
+    /// maintenance and a stock user can sign in then.
+    fn start_launch(&mut self, keys: Vec<String>, social_only: bool, clicked: Instant, trigger: Option<launch_timing::LaunchTrigger>) {
+        // A new Play replaces a refused one an Update would have started again.
+        if !social_only { self.refused_plays.retain(|(key, _)| !keys.contains(key)); }
+        if !social_only && self.hold_for_status(&keys, clicked, trigger) { return; }
+        self.start_launch_now(keys, social_only, clicked, trigger);
+    }
+
+    /// A Play of `key` was refused because an update is required: an Update started while
+    /// this stands starts that Play again when it succeeds (proposal 09 phase 1).
+    fn note_refused_play(&mut self, key: &str, clicked: Instant) {
+        self.refused_plays.retain(|(known, _)| known != key);
+        self.refused_plays.push((key.to_owned(), clicked));
+        // A Play released from a wait has nobody to press Update: it starts by itself.
+        if let Some(at) = self.released.iter().position(|released| released == key) {
+            self.released.remove(at);
+            let update = self.wait_update.get_or_insert(WaitUpdate { keys: Vec::new(), started: false, folder: None });
+            if !update.started && !update.keys.iter().any(|known| known == key) { update.keys.push(key.to_owned()); }
+        }
+    }
+
+    /// Whether `key`'s sign-ins take a one-time code, as its last successful one did (or as a
+    /// code-less one the login refused suggests). Kept in Settings (only this yes or no, never a
+    /// code), so a later window knows it before any sign-in there: a "Wait and play" released
+    /// then asks for a code instead of signing in without one, and only an account known to
+    /// need none is signed in by Crystal itself (`Settings::presigns`).
+    fn note_otp_account(&mut self, key: &str, uses: bool) {
+        if self.settings.note_sign_in(key, uses) && !self.preview {
+            // Unsaved, it still holds for this window.
+            let _ = save_settings(&self.config, &self.settings);
+        }
+    }
+
+    /// The game folder `key`'s launches use when it is not the Settings one (the account's
+    /// own folder), for the Update its W20 refusal asks for.
+    fn account_game_folder(&self, key: &str) -> Option<PathBuf> {
+        let row = self.accounts.iter().find(|row| row.key == key)?;
+        let folder = self.settings.config_for(&self.config, &row.account).game_install?;
+        let plain = |path: &Path| backend::plain_windows_path(path).to_string_lossy().trim_end_matches(['\\', '/']).to_ascii_lowercase();
+        let settings = PathBuf::from(&self.settings.install_path);
+        (!self.settings.install_selected || plain(&folder) != plain(&settings)).then_some(folder)
+    }
+
+    /// The game folder an operation of `kind` changes when it is not the Settings one: an
+    /// Update the W20 of an account with its own folder asked for updates that folder.
+    fn update_account_folder(&self, kind: MaintenanceKind) -> Option<PathBuf> {
+        self.patch_folder.clone().filter(|_| kind == MaintenanceKind::Update && self.update_scope().1)
+    }
+
+    /// A W20 verdict for `key`'s game folder becomes the window's FFXI report.
+    fn set_patch_from_row(&mut self, key: &str, report: patch::PatchReport) {
+        self.patch_generation += 1;
+        self.patch_loading = false;
+        self.patch_folder = self.account_game_folder(key);
+        self.patch = Some(report);
+    }
+
+    /// Holds a Play clicked before the first status read (in flight, or not yet started)
+    /// instead of gating it on a missing or cached status. Off the interface thread: the read
+    /// is async, and `release_held_plays` runs when it lands or at STATUS_HOLD_LIMIT.
+    fn hold_for_status(&mut self, keys: &[String], clicked: Instant, trigger: Option<launch_timing::LaunchTrigger>) -> bool {
+        if self.preview || self.status_read_done || self.status_hold_spent { return false; }
+        let held: BTreeSet<&String> = self.held_plays.iter().flat_map(|play| &play.keys).collect();
+        let keys: Vec<String> = keys.iter().filter(|key| !held.contains(key)).cloned().collect();
+        let checking = t("Checking whether FINAL FANTASY XI is up…");
+        let mut rows = Vec::new();
+        for row in self.accounts.iter_mut().filter(|row| keys.contains(&row.key)) {
+            rows.push((row.key.clone(), std::mem::replace(&mut row.status, checking.into())));
+            row.problem = false;
+        }
+        let before = std::mem::replace(&mut self.status, checking.into());
+        let status = if before == checking { self.held_plays.first().map(|play| play.status.clone()).unwrap_or_default() } else { before };
+        if !keys.is_empty() {
+            self.held_plays.push(HeldPlay { keys, clicked, trigger, since: Instant::now(), rows, status });
+        }
+        true
+    }
+
+    /// Held Plays go through the normal gate once the first status read has finished; one held
+    /// for STATUS_HOLD_LIMIT proceeds as without a read (Unknown never blocks). An account save
+    /// in progress keeps them held (`start_launch_now` would drop them), and an account deleted
+    /// meanwhile is left out.
+    fn release_held_plays(&mut self, now: Instant) {
+        if self.held_plays.is_empty() || self.vault_saving { return; }
+        let read = self.status_read_done;
+        let (due, waiting): (Vec<HeldPlay>, Vec<HeldPlay>) = std::mem::take(&mut self.held_plays).into_iter()
+            .partition(|play| read || now.saturating_duration_since(play.since) >= STATUS_HOLD_LIMIT);
+        self.held_plays = waiting;
+        if !read && !due.is_empty() { self.status_hold_spent = true; }
+        let checking = t("Checking whether FINAL FANTASY XI is up…");
+        for play in due {
+            // Rows that still say they are checking get back what they said; the launch (or its
+            // refusal) replaces that.
+            for (key, before) in play.rows {
+                if let Some(row) = self.accounts.iter_mut().find(|row| row.key == key && row.status == checking) { row.status = before; }
+            }
+            if self.status == checking { self.status = play.status; }
+            let keys: Vec<String> = play.keys.into_iter().filter(|key| self.accounts.iter().any(|row| row.key == *key)).collect();
+            if !keys.is_empty() { self.start_launch_now(keys, false, play.clicked, play.trigger); }
+        }
+    }
+
+    /// PlayOnline's folder and, for a Play, each launching account's game folder that holds
+    /// an interrupted update's journal (one metadata read per folder). A sign-in only
+    /// (startup, Connect) never touches a game folder, so its journals wait for a Play.
+    fn interrupted_updates(&self, keys: &[String], social_only: bool) -> Vec<PathBuf> {
+        let interrupted = |folder: &Path| std::fs::symlink_metadata(folder.join(".xi-updater").join("transaction.json")).is_ok();
+        let mut folders: Vec<PathBuf> = self.viewer.as_ref().and_then(|status| status.folder.clone())
+            .filter(|folder| interrupted(folder)).into_iter().collect();
+        if social_only { return folders; }
+        for row in self.accounts.iter().filter(|row| keys.contains(&row.key)) {
+            if let Some(folder) = self.settings.config_for(&self.config, &row.account).game_install {
+                if interrupted(&folder) && !folders.contains(&folder) { folders.push(folder); }
+            }
+        }
+        folders
+    }
+
+    /// Finish or undo the interrupted updates off the UI thread, then start the held launch
+    /// (`WorkerEvent::InterruptedUpdate`). Parked hosts hold PlayOnline's files, so they close
+    /// first when PlayOnline's folder is among `folders` or `close_parks` asks (a retry after
+    /// a park kept the liveness check from passing); a game folder alone leaves other
+    /// accounts their parks.
+    fn finish_interrupted_updates(&mut self, folders: Vec<PathBuf>, held: HeldLaunch, close_parks: bool) {
+        let note = t("Finishing an interrupted update…");
+        for row in self.accounts.iter_mut().filter(|row| held.keys.contains(&row.key) && !row.busy) {
+            row.status = note.into();
+            row.problem = false;
+        }
+        self.status = note.into();
+        let pol_folder = self.viewer.as_ref().and_then(|status| status.folder.clone());
+        let parks_closed = close_parks || pol_folder.as_ref().is_some_and(|pol| folders.contains(pol));
+        self.recovering = Some(parks_closed);
+        let parks = if parks_closed { self.parks.drain(None) } else { Vec::new() };
+        let sender = self.sender.clone();
+        let keys = held.keys.clone();
+        let install = (!self.preview && self.settings.install_selected && !self.settings.install_path.trim().is_empty())
+            .then(|| PathBuf::from(&self.settings.install_path));
+        let spawned = std::thread::Builder::new().name("finish-update".into()).spawn(move || {
+            pol_less::park::close_workers(parks);
+            let result = folders.iter().try_for_each(|folder| updater::recover_interrupted(folder).map(|_| ()));
+            // The window's reports said "interrupted": read them again.
+            let (game, viewer) = if result.is_ok() {
+                (install.map(|install| patch::local_report(&install)), Some(viewer::local_status()))
+            } else { (None, None) };
+            let _ = sender.send(WorkerEvent::InterruptedUpdate(Box::new(Recovered { held, folders, parks_closed, result, game, viewer })));
+        });
+        if spawned.is_err() {
+            self.recovering = None;
+            self.refuse_interrupted(&keys, t("Could not start the worker that finishes it.").into());
+        }
+    }
+
+    fn refuse_interrupted(&mut self, keys: &[String], error: String) {
+        let shown = tf("Could not finish an interrupted update: {error}", &[("error", &error)]);
+        for row in self.accounts.iter_mut().filter(|row| keys.contains(&row.key) && !row.busy) {
+            row.status = shown.clone();
+            row.problem = true;
+            row.queued_play = None;
+        }
+        self.status = shown;
+    }
+
+    fn interrupted_update_finished(&mut self, done: Recovered) {
+        let Recovered { held, folders, parks_closed, result, game, viewer } = done;
+        self.recovering = None;
+        // Only a report that said "interrupted" is replaced: a server verdict stays.
+        let interrupted = |state: patch::PatchState| state == patch::PatchState::Interrupted;
+        if let Some(report) = game.filter(|_| self.patch_folder.is_none() && self.patch.as_ref().is_none_or(|p| interrupted(p.state))) {
+            self.patch_generation += 1;
+            self.patch_loading = false;
+            self.patch = Some(report);
+        }
+        if let Some(status) = viewer.filter(|_| self.viewer.as_ref().is_none_or(|v| interrupted(v.version.state))) {
+            self.viewer_generation += 1;
+            self.viewer_loading = false;
+            self.viewer = Some(status);
+        }
+        match result {
+            // Never a loop: a journal that came back is reported, not finished again.
+            Ok(()) if !self.interrupted_updates(&held.keys, held.social_only).is_empty() =>
+                self.refuse_interrupted(&held.keys, t("Another update started meanwhile.").into()),
+            Ok(()) => {
+                let keys: Vec<String> = held.keys.into_iter().filter(|key| self.accounts.iter().any(|row| row.key == *key)).collect();
+                if !keys.is_empty() { self.start_launch_now(keys, held.social_only, held.clicked, held.trigger); }
+            }
+            // A parked host (an elevated one cannot be inspected) may be what kept the
+            // liveness check from passing: once more with the parks closed.
+            Err(_) if !parks_closed && !self.parks.is_empty() => self.finish_interrupted_updates(folders, held, true),
+            Err(error) => self.refuse_interrupted(&held.keys, error),
+        }
+    }
+
+    /// This window's first status read has finished, whatever it found.
+    fn note_status_read(&mut self) {
+        self.status_read_done = true;
+        self.release_held_plays(Instant::now());
+    }
+
+    /// A Play that finds FFXI down for maintenance (or every world down) waits for it instead of
+    /// being refused (owner decision 2026-10-13, "Wait and play"): at a click, at a held Play's
+    /// release and at a queued Play's release alike. Nothing signs in, and nothing goes to
+    /// PlayOnline or the game servers, because of a wait: the only traffic is one read of the
+    /// play flag a minute (`read_play_flag`). An account already waiting is not added again. A
+    /// one-time code typed for the Play goes with it (`WaitingPlay::codes`).
+    fn wait_for_service(&mut self, keys: &[String]) {
+        let headline = self.wait_headline();
+        let mut wait = WaitingPlay { keys: Vec::new(), otp: Vec::new(), armed: Instant::now(), codes: Vec::new() };
+        for row in self.accounts.iter_mut().filter(|row| keys.contains(&row.key)) {
+            row.queued_play = None;
+            if !row.can_play() || row.account.mode != AccountMode::Retail || wait.keys.contains(&row.key)
+                || self.waiting_plays.iter().any(|waiting| waiting.keys.contains(&row.key)) { continue; }
+            if !row.otp.is_empty() {
+                wait.codes.push((row.key.clone(), Zeroizing::new(std::mem::take(&mut row.otp))));
+                wait.otp.push(row.key.clone());
+            }
+            if !row.busy {
+                row.status = headline.into();
+                row.problem = false;
+            }
+            wait.keys.push(row.key.clone());
+        }
+        if wait.keys.is_empty() { return; }
+        self.waiting_plays.push(wait);
+        self.status = headline.into();
+    }
+
+    /// Codes typed for waiting Plays are stale OTP_KEEP after the wait began: dropped (zeroed).
+    fn expire_wait_codes(&mut self) {
+        for wait in self.waiting_plays.iter_mut().filter(|wait| wait.armed.elapsed() > OTP_KEEP) { wait.codes.clear(); }
+    }
+
+    /// These accounts no longer wait; codes kept for them are dropped. Once nothing waits, the
+    /// status line stops promising a start.
+    fn unwait(&mut self, keys: &[String]) {
+        for wait in &mut self.waiting_plays {
+            wait.keys.retain(|key| !keys.contains(key));
+            wait.otp.retain(|key| !keys.contains(key));
+            wait.codes.retain(|(key, _)| !keys.contains(key));
+        }
+        self.waiting_plays.retain(|wait| !wait.keys.is_empty());
+        let headlines = [t("FFXI is down for maintenance. Starting as soon as it's back…"), t("FFXI's worlds are down. Starting as soon as they're back…")];
+        if self.waiting_plays.is_empty() && headlines.contains(&self.status.as_str()) {
+            let note = self.service_note();
+            self.status = if self.service_down() && !note.is_empty() { note }
+                else { t("Ready. Select accounts or use Launch all. Games continue when you close Crystal.").into() };
+        }
+    }
+
+    /// What a waiting Play says: maintenance, or every world down.
+    pub(crate) fn wait_headline(&self) -> &'static str {
+        if self.service_availability() == services::Availability::Outage {
+            t("FFXI's worlds are down. Starting as soon as they're back…")
+        } else {
+            t("FFXI is down for maintenance. Starting as soon as it's back…")
+        }
+    }
+
+    /// The line under a waiting row's headline: when the play flag was last read, and the
+    /// server's own status line, or the official status the gate falls back on.
+    pub(crate) fn wait_detail(&self) -> String {
+        let Some(checked) = self.play_flag.checked() else { return String::new() };
+        let time = checked.with_timezone(&chrono::Local).format("%H:%M:%S").to_string();
+        let mut parts = vec![tf("Last checked: {time}", &[("time", &time)])];
+        // The server's own line, or what the gate goes by (the official status, or an outage
+        // the flag does not end).
+        match self.play_flag.fresh(chrono::Utc::now()) {
+            Some(play_flag::Flag::Down(Some(status))) => parts.push(status.clone()),
+            _ => parts.push(self.service_note()),
+        }
+        parts.retain(|part| !part.is_empty());
+        parts.join(" · ")
+    }
+
+    /// Cancel drops these accounts' waits; their rows say what an idle row says.
+    fn cancel_wait(&mut self, keys: &[String]) {
+        let keys: Vec<String> = keys.iter().filter(|key| self.is_waiting(key)).cloned().collect();
+        self.unwait(&keys);
+        for row in self.accounts.iter_mut().filter(|row| keys.contains(&row.key) && !row.busy) {
+            row.problem = false;
+            row.status = if row.pid.is_some() { t("Signed in to PlayOnline · FFXI is closed") } else { t("Ready to launch") }.into();
+        }
+    }
+
+    /// One read of FFXI's play flag when one is due: only while a Play waits, one at a time,
+    /// every minute, and at once when the first wait starts or the PC wakes (`play_flag::Schedule`).
+    fn read_play_flag(&mut self) -> Task<Message> {
+        let now = Instant::now();
+        if self.preview || !self.flag_schedule.due(!self.waiting_plays.is_empty(), now) { return Task::none(); }
+        self.flag_schedule.begin(now);
+        Task::perform(play_flag::read(), Message::PlayFlagLoaded)
+    }
+
+    /// FFXI is known to be up: a fresh play flag of 1, or without one an official verdict of up.
+    /// Unknown (a stale or failed status read, no read since the PC woke) is not.
+    fn service_up(&self) -> bool {
+        matches!(self.service_availability(), services::Availability::Operational | services::Availability::PartialOutage)
+    }
+
+    /// Waiting Plays start once FFXI is known to be back (`service_up`), each group through the
+    /// normal start path (`start_launch`: the multi-account gate and stagger, a sign-in where
+    /// there is no session). `from_read`: a flag read has just landed. Between reads only a fresh
+    /// play flag of 1 releases, so a reading that has just gone stale, or a PC that has just
+    /// woken, waits for the read that is due instead of the official status deciding alone. An
+    /// account that signs in with a one-time code starts only with a code typed within OTP_KEEP;
+    /// otherwise it waits for the user (an older code is stale, and no code would be refused).
+    fn release_waiting_plays(&mut self, from_read: bool) {
+        if self.waiting_plays.is_empty() || self.preview { return; }
+        let flag_up = self.play_flag.fresh(chrono::Utc::now()) == Some(&play_flag::Flag::Up);
+        if !(from_read || flag_up) || !self.service_up() { return; }
+        let otp_note = t("FFXI is back — enter your one-time password to start");
+        for wait in std::mem::take(&mut self.waiting_plays) {
+            // Checked for each group: starting one (an interrupted update it finishes first) can
+            // pause launches, and the next group then keeps waiting.
+            if !self.vault_ready || self.vault_saving || self.launch_blocked() {
+                self.waiting_plays.push(wait);
+                continue;
+            }
+            let codes_fresh = wait.armed.elapsed() <= OTP_KEEP;
+            let mut keys = Vec::new();
+            for row in self.accounts.iter_mut().filter(|row| wait.keys.contains(&row.key)) {
+                if row.pid.is_some() || row.busy {
+                    keys.push(row.key.clone());
+                    continue;
+                }
+                if codes_fresh && row.otp.is_empty() {
+                    if let Some((_, code)) = wait.codes.iter().find(|(key, _)| *key == row.key) { row.otp = code.as_str().to_owned(); }
+                }
+                let otp = wait.otp.contains(&row.key) || row.otp_spent || !row.otp.is_empty()
+                    || self.settings.account_otp.contains(&row.key);
+                if otp && !(codes_fresh && !row.otp.is_empty()) {
+                    row.otp.zeroize();
+                    row.status = otp_note.into();
+                    row.problem = true;
+                    self.status = otp_note.into();
+                } else {
+                    keys.push(row.key.clone());
+                }
+            }
+            if keys.is_empty() { continue; }
+            self.start_launch(keys.clone(), false, Instant::now(), None);
+            self.released.retain(|key| !keys.contains(key));
+            self.released.extend(keys);
+        }
+    }
+
+    /// The Update the released Plays asked for starts once none of them is still starting (it
+    /// signs their idle sessions out first); its end starts them again (the Round 5 re-issue in
+    /// `MaintenanceFinished`), or their rows say why it could not run.
+    fn start_waited_update(&mut self) -> Task<Message> {
+        if !self.wait_update.as_ref().is_some_and(|update| !update.started) || !self.released.is_empty()
+            || self.preview || self.maintenance.is_some() || self.launch_blocked() { return Task::none(); }
+        let task = self.start_maintenance(MaintenanceKind::Update);
+        if self.maintenance != Some(MaintenanceKind::Update) {
+            let keys = self.wait_update.take().map(|update| update.keys).unwrap_or_default();
+            let error = self.status.clone();
+            self.waited_update_failed(&keys, &error);
+        }
+        task
+    }
+
+    fn waited_update_failed(&mut self, keys: &[String], error: &str) {
+        if keys.is_empty() { return; }
+        let shown = tf("Could not update FFXI before it starts: {error}", &[("error", &error)]);
+        for row in self.accounts.iter_mut().filter(|row| keys.contains(&row.key) && !row.busy) {
+            row.status = shown.clone();
+            row.problem = true;
+        }
+        self.status = shown;
+    }
+
+    fn start_launch_now(&mut self, keys: Vec<String>, social_only: bool, clicked: Instant, trigger: Option<launch_timing::LaunchTrigger>) {
+        use launch_timing::LaunchTrigger;
+        // A Play the downtime gate below sets waiting is not recorded: it waits, as it would.
+        #[cfg(test)]
+        if self.launches.is_some() && (social_only || self.preview || !self.service_down()) {
+            if let Some(launches) = &mut self.launches { launches.push((keys, social_only, clicked, trigger)); }
+            return;
+        }
         if self.launch_blocked() {
             self.status = t("Game launches are paused while files are being changed or official setup is running.").into();
             return;
@@ -1525,9 +2315,18 @@ impl App {
         if self.preview || !self.vault_ready || self.vault_saving {
             return;
         }
-        if !social_only && matches!(self.service_availability(), services::Availability::Maintenance | services::Availability::Outage) {
-            self.show_details = true;
-            self.status = self.services.as_ref().map(|snapshot| snapshot.availability_note.clone()).unwrap_or_default();
+        if !social_only && self.service_down() {
+            self.wait_for_service(&keys);
+            return;
+        }
+        // A Play that goes ahead now replaces a wait for the same accounts (one whose release
+        // was held back while launches were paused), so the wait cannot start them a second time.
+        if !social_only { self.unwait(&keys); }
+        // An interrupted update in a folder this launch uses is finished (or undone) first,
+        // instead of refusing the launch; the launch then goes on by itself.
+        let interrupted = self.interrupted_updates(&keys, social_only);
+        if !interrupted.is_empty() {
+            self.finish_interrupted_updates(interrupted, HeldLaunch { keys, social_only, clicked, trigger }, false);
             return;
         }
         if !social_only {
@@ -1537,15 +2336,21 @@ impl App {
                 let unpublished = sessions.iter().any(|(key, session)| session.is_none()
                     && self.accounts.iter().any(|row| row.key == *key && (row.busy || row.pid.is_some())));
                 if !unpublished {
-                    self.start_together(sessions, clicked);
+                    self.start_together(sessions, clicked, trigger.unwrap_or(LaunchTrigger::BatchPlay));
                     return;
                 }
             }
+            // A batch (and a Play queued behind a batch-capable pre-sign-in) is released to the
+            // game by the separate batch-coordinator process when the sign-in reaches the main
+            // menu. That process cannot see this window's status reads, so the gate above (after
+            // the first-read hold) is the guard for it; a maintenance that begins between the
+            // click and that release is not re-checked. A Play this window queues itself is
+            // re-checked at its release (`start_queued_plays`).
             if let [key] = together.as_slice() {
                 if self.accounts.iter().any(|row| row.key == *key && row.busy && row.preparing_session) {
                     let sessions = self.batch_sessions(together);
                     if sessions[0].1.as_ref().is_some_and(session_worker::BackgroundSession::supports_batch_start) {
-                        self.start_together(sessions, clicked);
+                        self.start_together(sessions, clicked, trigger.unwrap_or(LaunchTrigger::QueuedPlay));
                         return;
                     }
                 }
@@ -1574,6 +2379,12 @@ impl App {
                 if !social_only {
                     row.queued_play = Some(clicked);
                     row.status = t("FFXI will start when sign-in finishes.").into();
+                    // The pre-sign-in skips the Viewer pauses still to come (07d §4.3).
+                    if !self.preview {
+                        let (config, account) = (self.settings.config_for(&self.config, &row.account), row.account.clone());
+                        let _ = std::thread::Builder::new().name("play-pending".into())
+                            .spawn(move || { let _ = session_worker::note_play_pending(&config, &account); });
+                    }
                 }
                 continue;
             }
@@ -1598,7 +2409,8 @@ impl App {
             let generation = row.launch_generation;
             if row.pid.is_some() {
                 // The stock FFXI version check runs immediately before the game starts, here
-                // as well as in a Play that signs in: off the interface thread, then the request.
+                // as well as in a Play that signs in: off the interface thread, once the
+                // session's Viewer main menu is up and idle (07c §5.3), then the request.
                 let install = match pol_less::install_directory(&config) {
                     Ok(install) => install,
                     Err(error) => { row.status = error; row.problem = true; continue; }
@@ -1614,16 +2426,31 @@ impl App {
                 // beside it (or take Crystal's copy away) before the start.
                 let dgvoodoo = self.settings.dgvoodoo;
                 let loader_setting = self.settings.loader_path.clone();
+                // The trigger and W20 lines go to the session's own log (07d §4.2, §5.3;
+                // 08 §4 item 6: they were dropped on this thread).
+                let log = row.log.clone();
+                let trigger = trigger.unwrap_or(LaunchTrigger::PreSignedPlay);
                 let spawned = std::thread::Builder::new().name("xi-start-game".into()).spawn(move || {
+                    crate::dns::warm(crate::dns::GAME_PATCH_HOST);
+                    if let Some(log) = &log {
+                        launch_log::append_launcher_lines(log, &pol_less::launch_clock_lines(&launch_timing::Timeline::begin_at(clicked), trigger));
+                    }
                     if let Some(loader) = pol_less::tools::loader_path(&loader_setting) {
                         let _ = dgvoodoo::sync_for_launch(&loader, dgvoodoo);
                     }
-                    let check = patch::check_before_launch(&install);
-                    let report = match &check {
-                        patch::LaunchCheck::Start(r) | patch::LaunchCheck::Update(r) | patch::LaunchCheck::Unverified(r) => r.clone(),
-                    };
-                    let result = patch::gate(check).and_then(|note| {
-                        session_worker::request_native_control(&config, &account, session_worker::NativeControl::StartGame).map(|()| note)
+                    let mut report = None;
+                    let waiting = (sender.clone(), worker_key.clone());
+                    let result = session_worker::start_signed_in(&config, &account, &mut |line| {
+                        let _ = waiting.0.send(WorkerEvent::Progress(waiting.1.clone(), line.to_owned()).for_launch(&waiting.1, generation));
+                    }, || {
+                        let (check, timing) = patch::check_before_launch_timed(&install);
+                        if let Some(log) = &log {
+                            launch_log::append_launcher_lines(log, &launch_timing::check_lines("FFXI check (W20)", &timing));
+                        }
+                        report = Some(match &check {
+                            patch::LaunchCheck::Start(r) | patch::LaunchCheck::Update(r) | patch::LaunchCheck::Unverified(r) => r.clone(),
+                        });
+                        patch::gate(check)
                     });
                     let _ = sender.send(WorkerEvent::StartGame(worker_key.clone(), report, result).for_launch(&worker_key, generation));
                 });
@@ -1637,8 +2464,33 @@ impl App {
             }
             // the account's own launcher, boot config and profile,
             // over the Launch tools defaults. All retail routes use the same session worker.
-            let mut via = self.settings.launch_plan(&account);
-            if let Some(plan) = &mut via { plan.social_only = social_only; }
+            let mut via = self.launch_tools.launch_plan(&self.settings, &account);
+            let trigger = trigger.unwrap_or(if social_only { LaunchTrigger::Connect } else { LaunchTrigger::Play });
+            // Named before a parked host renames it (ParkedConnect).
+            let presign_login = social_only && trigger.is_presign();
+            // Re-read the host's dependencies at Play: an edit can precede the next periodic
+            // retirement. A mismatch closes off-thread and this Play signs in cold.
+            let parked = via.as_ref().and_then(|plan| {
+                let key = pol_less::park::ParkKey::for_plan(&account, plan);
+                match self.parks.take_for_play(&row.key, &key, || pol_less::park::fingerprint(&config, plan)) {
+                    Ok(worker) => worker,
+                    Err(worker) => { close_parks_later(vec![worker]); None }
+                }
+            });
+            let deliveries = self.parks.deliveries.clone();
+            // A sign-in-only launch here is a pre-sign-in (startup or the explicit sign-in): its
+            // Viewer pauses cost nothing at Play, so the loader restores them (07c §4, §5.4).
+            if let Some(plan) = &mut via { plan.social_only = social_only; plan.viewer_gaps = social_only; plan.trigger = trigger; }
+            // Cold if the parked host turns out to be gone: named as the click (07d §1.6).
+            let cold = via.clone();
+            let trigger = match (&parked, social_only) {
+                (Some(_), false) => LaunchTrigger::ParkedPlay,
+                (Some(_), true) => LaunchTrigger::ParkedConnect,
+                (None, _) => trigger,
+            };
+            if let Some(plan) = &mut via { plan.trigger = trigger; }
+            row.launch_trigger = Some(trigger);
+            row.network_wait = None;
             let tool = via.as_ref().map_or(t("the native client"), |plan| plan.tool.name());
             all_native &= via.is_none();
             if !tools.contains(&tool) {
@@ -1646,6 +2498,8 @@ impl App {
             }
             let viewer_generation = self.viewer_generation;
             let otp = std::mem::take(&mut row.otp);
+            row.otp_spent = !otp.is_empty();
+            (row.otp_unknown, row.presign_login) = (false, presign_login);
             row.busy = true;
             row.preparing_session = social_only;
             row.problem = false;
@@ -1660,9 +2514,12 @@ impl App {
             let result = std::thread::Builder::new()
                 .name("xi-account-login".into())
                 .spawn(move || {
-                    let viewer = viewer::status(false);
-                    let _ = sender.send(WorkerEvent::Viewer(viewer_generation, viewer.clone()));
+                    // Local readiness only; the sign-in's own W2U runs at Connect (07c §3).
+                    // Only a blocking local state replaces the Viewer row: a passing one has
+                    // no server verdict and would erase the updater's.
+                    let viewer = viewer::local_status();
                     if let Err(error) = viewer::gate(&viewer) {
+                        let _ = sender.send(WorkerEvent::Viewer(viewer_generation, viewer));
                         let _ = sender.send(WorkerEvent::Complete(worker_key.clone(), Err(error)).for_launch(&worker_key, generation));
                         return;
                     }
@@ -1680,10 +2537,22 @@ impl App {
                     }
                     let progress_sender = sender.clone();
                     let progress_key = worker_key.clone();
-                    let result = session_worker::launch(&config, account, otp, via, clicked, move |s| {
+                    let mut progress = move |s: &str| {
                         let _ = progress_sender
                             .send(WorkerEvent::Progress(progress_key.clone(), s.to_owned()).for_launch(&progress_key, generation));
-                    });
+                    };
+                    let result = match (parked, via) {
+                        (Some(worker), Some(plan)) => {
+                            // Parked deliveries from this window go ≥ 1.5 s (+ jitter) apart (07a
+                            // parity condition 3): N member logins never start within milliseconds.
+                            // The slot is taken once the host has parked, where the credentials leave.
+                            match worker.play(&config, account.clone(), otp, plan, clicked, &deliveries, &mut progress) {
+                                Ok(result) => result,
+                                Err(otp) => session_worker::launch(&config, account, otp, cold, clicked, &mut progress),
+                            }
+                        }
+                        (_, via) => session_worker::launch(&config, account, otp, via, clicked, &mut progress),
+                    };
                     let _ = sender.send(WorkerEvent::Complete(worker_key.clone(), result).for_launch(&worker_key, generation));
                 });
             if result.is_err() {
@@ -1710,9 +2579,11 @@ impl App {
 
     /// A capable worker can check the version during the rest of sign-in. Older
     /// loaders keep the signed-in path, with the same version and native idle gates.
+    /// Each queued Play is released here, by this window, so availability is checked again at
+    /// its release: one that a maintenance or outage begun since its click finds leaves its
+    /// sign-in and waits for FFXI instead (`wait_for_service`), never left queued on it.
     fn start_queued_plays(&mut self) {
-        if self.preview || !self.vault_ready || self.vault_saving || self.launch_blocked()
-            || matches!(self.service_availability(), services::Availability::Maintenance | services::Availability::Outage) { return; }
+        if self.preview || !self.vault_ready || self.vault_saving || self.launch_blocked() { return; }
         let preparing: Vec<_> = self.accounts.iter().filter_map(|row| {
             if !row.queued_signin_play() || row.account.mode != AccountMode::Retail
                 || self.settings.launch_plan(&row.account).is_none() { return None; }
@@ -1721,7 +2592,15 @@ impl App {
             if !session.supports_batch_start() { return None; }
             Some((row.key.clone(), row.queued_play?, session))
         }).collect();
-        for (key, clicked, session) in preparing { self.start_together(vec![(key, Some(session))], clicked); }
+        if self.service_down() {
+            let keys: Vec<String> = preparing.into_iter().map(|(key, _, _)| key)
+                .chain(self.accounts.iter().filter(|row| row.queued_play.is_some() && !row.busy && row.pid.is_some() && !row.is_playing())
+                    .map(|row| row.key.clone()))
+                .collect();
+            if !keys.is_empty() { self.wait_for_service(&keys); }
+            return;
+        }
+        for (key, clicked, session) in preparing { self.start_together(vec![(key, Some(session))], clicked, launch_timing::LaunchTrigger::QueuedPlay); }
         let queued: Vec<_> = self.accounts.iter_mut().filter_map(|row| {
             if row.busy || row.pid.is_none() || row.is_playing() { return None; }
             row.queued_play.take().map(|clicked| (row.key.clone(), clicked))
@@ -1729,15 +2608,380 @@ impl App {
         for (key, clicked) in queued { self.start_mode_at(vec![key], false, clicked); }
     }
 
-    /// Consume the startup action once. Account refreshes and client exits never retry it.
+    /// Consume the startup action once the vault and the installation are ready. Account
+    /// refreshes and client exits never retry it. A row still busy with a previous session
+    /// (its host closing, as at 18:59:55 in 08 §1 row 9) keeps its key pending until that
+    /// session ends (`take_waiting_startups`); one already signed in and idle needs nothing.
     fn take_startup_signins(&mut self) -> Vec<String> {
         if !self.startup_signin_pending || !self.vault_ready || self.installation_loading { return Vec::new(); }
         self.startup_signin_pending = false;
+        // The parks start PARK_START_DELAY after this, startup sign-ins or not (07d §5.7).
+        let now = Instant::now();
+        self.startup_issued = Some(now);
         if self.preview || self.vault_saving || self.launch_blocked() { return Vec::new(); }
-        self.accounts.iter().filter(|row|
-            row.account.mode == AccountMode::Retail && row.pid.is_none() && !row.busy && row.can_play()
-            && self.settings.account_startup_signin.contains(&row.key)
-        ).map(|row| row.key.clone()).collect()
+        let keys: Vec<String> = self.accounts.iter().filter(|row| self.presigned_row(row)
+            && !(row.pid.is_some() && !row.busy && !row.is_playing())).map(|row| row.key.clone()).collect();
+        let mut start = Vec::new();
+        for key in keys {
+            if self.startup_row_free(&key) { start.push(key); continue; }
+            if let Some(row) = self.accounts.iter_mut().find(|row| row.key == key) {
+                row.status = t("Startup sign-in waits for the previous session to end.").into();
+            }
+            self.startup_waiting.push((key, now));
+        }
+        start
+    }
+
+    /// One `launch-history.log` line per window start, at the first account load (07d §4.4),
+    /// so measurements can tell launcher restarts apart.
+    fn log_launcher_start(&mut self) {
+        if self.launcher_start_logged || self.preview { return; }
+        self.launcher_start_logged = true;
+        let startup = self.accounts.iter().filter(|row| self.presigned_row(row)).count();
+        let parks = self.park_keys().len();
+        let exe = std::env::current_exe().ok().and_then(|path| path.file_name().map(|name| name.to_string_lossy().into_owned())).unwrap_or_default();
+        launch_log::append_history(&self.config.history_path(), "Crystal", &format!("launcher start: pid {}, {exe}, v{}, startup sign-in {startup}, parks {parks}",
+            std::process::id(), env!("CARGO_PKG_VERSION")), None);
+    }
+
+    /// The accounts a parked warm host would serve (07d §1.5 "Who"): retail with a tool plan,
+    /// no session of any kind, and no pre-sign-in coming (`presign_coming`). That is OTP
+    /// accounts, ones not yet seen signing in, every account while the sign-in switch is off,
+    /// and a pre-signed one Crystal will not sign in by itself now (a sign-in after its game
+    /// refused during a maintenance, a sign-out, a startup sign-in that failed or was skipped):
+    /// its next Play starts warm instead of cold. A pre-sign-in that comes later takes the park.
+    fn park_keys(&self) -> Vec<(String, pol_less::park::ParkKey, pol_less::Plan)> {
+        self.accounts.iter()
+            .filter(|row| row.account.mode == AccountMode::Retail && !self.presign_coming(row)
+                && row.pid.is_none() && !row.busy && row.can_play())
+            .filter_map(|row| {
+                let plan = self.launch_tools.launch_plan(&self.settings, &row.account)?;
+                Some((row.key.clone(), pol_less::park::ParkKey::for_plan(&row.account, &plan), plan))
+            })
+            .collect()
+    }
+
+    /// Crystal will sign this pre-signed row in by itself: the startup sign-ins are still to be
+    /// taken, or one waits for a closing session, a sign-in after its game is pending, or either
+    /// waits for the network to retry.
+    fn presign_coming(&self, row: &AccountRow) -> bool {
+        self.presigned_row(row) && (self.startup_signin_pending || row.resign.is_some()
+            || self.startup_waiting.iter().any(|(key, _)| *key == row.key)
+            || matches!(row.network_wait, Some(NetworkWait::StartupRetry | NetworkWait::AfterGame | NetworkWait::AfterGameRetry)))
+    }
+
+    /// The row has no session of any kind: no host, no worker, nothing queued or batched.
+    fn startup_row_free(&self, key: &str) -> bool {
+        self.accounts.iter().any(|row| row.key == key && row.pid.is_none() && !row.busy && row.can_play()
+            && (self.preview || session_worker::find(&self.settings.config_for(&self.config, &row.account), &row.account).is_none()))
+    }
+
+    /// Pending startup sign-ins whose previous session has ended (07d §5.5 step 2); one still
+    /// waiting after STARTUP_WAIT_LIMIT is dropped with a row status.
+    fn take_waiting_startups(&mut self, now: Instant) -> Vec<String> {
+        if self.startup_waiting.is_empty() || self.preview || !self.vault_ready || self.vault_saving || self.launch_blocked() { return Vec::new(); }
+        let mut start = Vec::new();
+        for (key, since) in std::mem::take(&mut self.startup_waiting) {
+            // The switch turned off, or the account learned to need a code, meanwhile.
+            if !self.presigned(&key) { continue; }
+            // A row that was reconnecting to its previous session is now signed in and idle:
+            // that session is what the startup sign-in would give; nothing to do or say.
+            if self.accounts.iter().any(|row| row.key == key && row.pid.is_some() && !row.busy && !row.is_playing()) { continue; }
+            if self.startup_row_free(&key) {
+                start.push(key);
+            } else if now.saturating_duration_since(since) >= STARTUP_WAIT_LIMIT {
+                // A game still running keeps its own status ("continue in game").
+                if let Some(row) = self.accounts.iter_mut().find(|row| row.key == key && !(row.pid.is_some() && !row.busy)) {
+                    row.status = t("Startup sign-in skipped: a session is still running.").into();
+                }
+            } else {
+                self.startup_waiting.push((key, since));
+            }
+        }
+        start
+    }
+
+    /// Start startup sign-ins (or their one network retry) as pre-sign-ins.
+    fn start_startup(&mut self, keys: Vec<String>, trigger: launch_timing::LaunchTrigger) {
+        if !keys.is_empty() { self.start_launch(keys, true, Instant::now(), Some(trigger)); }
+    }
+
+    /// Whether Crystal may sign `key` in by itself now (owner decision 2026-10-13): a retail
+    /// account it knows signs in without a one-time code, with the switch on (`Settings::presigns`),
+    /// whose row's last sign-in took no code and that has none typed. A code typed on the row is
+    /// the user's, for their own Play: Crystal never signs in with a stored or stale one.
+    fn presigned(&self, key: &str) -> bool {
+        self.accounts.iter().any(|row| row.key == key && self.presigned_row(row))
+    }
+
+    fn presigned_row(&self, row: &AccountRow) -> bool {
+        row.account.mode == AccountMode::Retail && self.settings.presigns(&row.key) && !row.otp_spent && row.otp.is_empty()
+    }
+
+    /// Whether `key` may sign back in after its game by itself (see `Resign`): a pre-signed
+    /// account (`presigned`). An OTP account's code is spent; a login without one would be
+    /// refused. Never during a known maintenance or outage: the end was the service's, and a
+    /// login then is one no user makes (the pre-sign-in path skips start_launch's downtime gate).
+    fn resign_allowed(&self, key: &str) -> bool {
+        self.resign_eligible(key) && !self.service_down()
+    }
+
+    /// `resign_allowed` but for the service's state.
+    fn resign_eligible(&self, key: &str) -> bool {
+        self.presigned(key)
+    }
+
+    /// The row of a sign-in after a game that the maintenance or outage refused says so.
+    fn note_resign_refused(&mut self, key: &str) {
+        let note = tf("No sign-in after the game while the worlds are down. {note}", &[("note", &self.service_note())]);
+        if let Some(row) = self.accounts.iter_mut().find(|row| row.key == key) {
+            let shown = format!("{} · {note}", row.status_text());
+            row.status = shown;
+        }
+    }
+
+    /// A session whose game ran has ended. A pre-signed account signs back in once that
+    /// session has fully ended (`take_resigns`). A normal quit or FFXI's usual -14 waits only for
+    /// RESIGN_DELAY; a crash or error first has the connectivity probe check the network, so a
+    /// connection loss waits for it to return (07d §5.5). A worker that vanished without a report
+    /// is left alone: its host may still be running. `host` is the ended session's loader PID.
+    fn note_game_end(&mut self, key: &str, kind: Option<launch_log::ExitKind>, host: Option<u32>) {
+        use launch_log::ExitKind;
+        if self.preview || kind == Some(ExitKind::WorkerEnded) { return; }
+        if !self.resign_allowed(key) {
+            if self.resign_eligible(key) {
+                // A startup sign-in waiting for this session would otherwise run on the next
+                // Tick: the very sign-in after the game this refuses.
+                self.startup_waiting.retain(|(waiting, _)| waiting != key);
+                self.note_resign_refused(key);
+            }
+            return;
+        }
+        let clean = matches!(kind, Some(ExitKind::Normal | ExitKind::Code { code: -14 }));
+        // A startup sign-in still waiting for this session (Crystal opened during the game)
+        // becomes this delayed sign-in after the game, not an immediate startup sign-in.
+        self.startup_waiting.retain(|(waiting, _)| waiting != key);
+        let Some(row) = self.accounts.iter_mut().find(|row| row.key == key) else { return };
+        row.resign = Some(Resign { generation: row.launch_generation, ended: Instant::now(), free_since: None, network: !clean, host });
+        let shown = format!("{}{}", row.status_text(), resign_note());
+        row.status = shown;
+        if !clean {
+            row.network_wait = Some(NetworkWait::AfterGame);
+            let generation = row.launch_generation;
+            self.spawn_network_probe(key.to_owned(), generation);
+        }
+    }
+
+    /// Sign-ins after a game that start now: each once its row has been free (no host, no
+    /// worker, nothing queued) for RESIGN_DELAY, reusing the startup sign-in's wait for a
+    /// closing session (07d §5.5). One the user overtook (a launch since, a sign-out, an edit),
+    /// no longer pre-signed (the switch turned off, or the account learned to need a code), or
+    /// whose row stayed busy for STARTUP_WAIT_LIMIT is dropped.
+    fn take_resigns(&mut self, now: Instant) -> Vec<String> {
+        let keys: Vec<String> = self.accounts.iter().filter(|row| row.resign.is_some()).map(|row| row.key.clone()).collect();
+        // Only while Crystal stays open: not while it asks to close.
+        let held = self.preview || !self.vault_ready || self.vault_saving || self.launch_blocked() || self.confirm_close;
+        let mut start = Vec::new();
+        let mut refused = Vec::new();
+        for key in keys {
+            let allowed = self.resign_allowed(&key);
+            let down = !allowed && self.resign_eligible(&key);
+            let free = !held && self.startup_row_free(&key);
+            let Some(row) = self.accounts.iter_mut().find(|row| row.key == key) else { continue };
+            let Some(mut resign) = row.resign else { continue };
+            let waited = now.saturating_duration_since(resign.ended);
+            if down && row.launch_generation == resign.generation {
+                row.drop_resign();
+                refused.push(key);
+                continue;
+            }
+            // A connection loss waits for the probe (up to NETWORK_PROBE_LIMIT), whose
+            // NetworkBack ends that wait either way and restarts `ended`; the slack only covers
+            // a probe that never reports.
+            if !allowed || row.launch_generation != resign.generation
+                || resign.network && waited >= session_worker::NETWORK_PROBE_LIMIT + STARTUP_WAIT_LIMIT
+                || !resign.network && resign.free_since.is_none() && waited >= STARTUP_WAIT_LIMIT {
+                row.drop_resign();
+                continue;
+            }
+            if resign.network { continue; }
+            // Fully ended: the host process exited too, not only its worker record.
+            let free = free && !resign.host.is_some_and(host_running);
+            resign.free_since = free.then(|| resign.free_since.unwrap_or(now));
+            row.resign = Some(resign);
+            if resign.free_since.is_some_and(|since| now.saturating_duration_since(since) >= RESIGN_DELAY) {
+                row.resign = None;
+                start.push(key);
+            }
+        }
+        for key in refused { self.note_resign_refused(&key); }
+        start
+    }
+
+    /// Start sign-ins after a game (or their one network retry) as pre-sign-ins, together and
+    /// so staggered like the startup sign-ins. A Play meanwhile queues behind them (07d §5.4).
+    fn start_resigns(&mut self, keys: Vec<String>, trigger: launch_timing::LaunchTrigger) {
+        if keys.is_empty() { return; }
+        self.start_startup(keys.clone(), trigger);
+        for row in self.accounts.iter_mut().filter(|row| row.busy && keys.contains(&row.key)) {
+            row.status.push_str(&resign_note());
+        }
+    }
+
+    /// The parked warm hosts (07d §1.5, §5.7), on each Tick: their reports, then closing
+    /// what is no longer wanted or changed, then at most one new park.
+    fn tend_parks(&mut self, now: Instant) {
+        use pol_less::park::{self, Note};
+        if self.preview { return; }
+        for (_, row, note) in self.parks.poll() {
+            match note {
+                Note::Parked(_) => {}
+                // An older loader: expected, and not parked again until something changes.
+                Note::Failed(why) if why == park::UNSUPPORTED => {}
+                Note::Failed(why) => self.park_note(&row, &why),
+                Note::Ended => self.park_note(&row, t("The parked game host ended.")),
+            }
+        }
+        // polcore.dll is loaded in a parked pol.exe: no parks while files change (07d §1.5).
+        // A read-only installation scan (opening Downloads, Crystal start) only holds new parks
+        // back below; closing for it sent a Play right after it down the cold path (live
+        // 2026-10-12 23:17:55).
+        if self.files_changing() {
+            let closing = self.parks.drain(None);
+            if !closing.is_empty() {
+                launch_log::append_history(&self.config.history_path(), "Crystal", "warm hosts closed: game or Crystal files are changing", None);
+            }
+            close_parks_later(closing);
+            return;
+        }
+        // The profile editor needs the profile guard the Windower parks hold.
+        if self.windower_editor_open { self.close_parks_in_background(Some(pol_less::Tool::Windower.name())); }
+        if self.park_tended.is_some_and(|at| now.saturating_duration_since(at) < Duration::from_secs(1)) { return; }
+        self.park_tended = Some(now);
+        // Nor while an interrupted update is being finished: no new host may join it.
+        if !self.vault_ready || self.installation_loading || self.startup_signin_pending || self.recovering.is_some() { return; }
+        // The startup sign-ins take the Windower turn first (§5.7).
+        let Some(issued) = self.startup_issued else { return };
+        if now.saturating_duration_since(issued) < park::PARK_START_DELAY { return; }
+        let refresh = self.park_checked.is_none_or(|at| now.saturating_duration_since(at) >= park::FINGERPRINT_EVERY);
+        if refresh { self.park_checked = Some(now); }
+        let candidates: Vec<_> = self.park_keys().into_iter()
+            .filter(|(_, _, plan)| !(self.windower_editor_open && plan.tool == pol_less::Tool::Windower))
+            .filter_map(|(row, key, plan)| {
+                let account = self.accounts.iter().find(|r| r.key == row)?.account.clone();
+                let config = self.settings.config_for(&self.config, &account);
+                session_worker::find(&config, &account).is_none().then_some((row, key, plan, account, config))
+            })
+            .collect();
+        let mut wanted = Vec::new();
+        for (row, key, plan, account, config) in candidates {
+            if refresh || !self.park_prints.contains_key(&key) {
+                self.park_prints.insert(key.clone(), park::fingerprint(&config, &plan));
+            }
+            let fingerprint = self.park_prints[&key].clone();
+            wanted.push(park::Wanted { key, row, fingerprint, payload: (config, account, plan) });
+        }
+        self.park_prints.retain(|key, _| wanted.iter().any(|want| want.key == *key));
+        let retired = self.parks.retire(&wanted);
+        let mut closing = Vec::new();
+        for (key, names, worker) in retired {
+            let label = self.accounts.iter().find(|row| row.account.mode == AccountMode::Retail && account_key(&row.account) == key.account)
+                .map_or_else(String::new, |row| row.account.label.clone());
+            let note = if names.is_empty() { "warm host closed: account no longer idle or eligible".to_owned() } else { format!("re-park: {} changed", names.join(", ")) };
+            launch_log::append_history(&self.config.history_path(), &label, &note, None);
+            closing.push(worker);
+        }
+        close_parks_later(closing);
+        if let Some(next) = self.parks.next(&wanted, now) {
+            let (config, account, plan) = &next.payload;
+            let (key, row, fingerprint) = (next.key.clone(), next.row.clone(), next.fingerprint.clone());
+            match session_worker::spawn_park(config, account, plan) {
+                Ok(worker) => self.parks.insert(key, row, fingerprint, worker),
+                Err(error) => self.park_note(&row, &error),
+            }
+        }
+    }
+
+    /// A non-blocking row note for a park that failed; Play still works, cold.
+    fn park_note(&mut self, row: &str, why: &str) {
+        if let Some(row) = self.accounts.iter_mut().find(|r| r.key == row && !r.busy && r.pid.is_none()) {
+            row.status = tf("Warm start unavailable: {error}", &[("error", &why)]);
+        }
+    }
+
+    /// Close parked hosts (`tool`: only that tool's) off the UI thread.
+    fn close_parks_in_background(&mut self, tool: Option<&'static str>) {
+        close_parks_later(self.parks.drain(tool));
+    }
+
+    fn controller_settings_targets(&self) -> Vec<(Config, Account)> {
+        self.accounts.iter().filter(|row| row.account.mode == AccountMode::Retail && row.is_playing()
+            && row.alive.as_ref().is_none_or(|alive| alive.load(Ordering::Acquire)))
+            .map(|row| {
+                let config = self.settings.config_for(&self.config, &row.account);
+                let mut account = row.account.clone();
+                account.pol_password.zeroize();
+                account.se_password.zeroize();
+                (config, account)
+            }).collect()
+    }
+
+    fn apply_controller_settings(&self, revision: u64, values: std::collections::BTreeMap<String, String>) -> Task<Message> {
+        let targets: Vec<_> = self.controller_settings_targets().into_iter().map(|(config, account)|
+            session_worker::find(&config, &account).ok_or_else(||
+                t("The game session ended before controller settings could be sent.").to_owned())).collect();
+        if targets.is_empty() {
+            return Task::done(Message::Gamepad(gamepad::Msg::LiveResult(revision,
+                Ok(t("Saved. Changes apply when you launch FFXI.").into()))));
+        }
+        Task::perform(async move {
+            tokio::task::spawn_blocking(move || {
+                let count = targets.len();
+                let results: Vec<_> = std::thread::scope(|scope| {
+                    targets.into_iter().map(|session| {
+                        let values = &values;
+                        scope.spawn(move || session.and_then(|session|
+                            session_worker::request_controller_settings_for_session(&session, values.clone())))
+                    }).collect::<Vec<_>>().into_iter().map(|thread| thread.join()
+                        .unwrap_or_else(|_| Err(t("Could not apply controller settings.").into()))).collect()
+                });
+                if let Some(error) = results.iter().find_map(|result| result.as_ref().err()) {
+                    let applied = results.iter().filter(|result| result.is_ok()).count();
+                    Err(tf("Saved. Applied to {applied} of {count} running games. {error}",
+                        &[("applied", &applied), ("count", &count), ("error", error)]))
+                } else {
+                    Ok(tf("Saved. Applied to running games ({count}).", &[("count", &count)]))
+                }
+            }).await.unwrap_or_else(|_| Err(t("Saved. Could not confirm changes in running games.").into()))
+        }, move |result| Message::Gamepad(gamepad::Msg::LiveResult(revision, result)))
+    }
+
+    /// Close every parked host now (exit, file changes): each worker ends Windower first,
+    /// then its host; past CLOSE_WAIT it is terminated (07d §1.5 "Kill").
+    fn close_parks(&mut self) {
+        pol_less::park::close_workers(self.parks.drain(None));
+    }
+
+    /// Close parked hosts for `keys` off the UI thread (a batch signs them in cold).
+    fn close_parks_for(&mut self, keys: &[String]) {
+        let mut closing = Vec::new();
+        for row in self.accounts.iter().filter(|row| keys.contains(&row.key)) {
+            if let Some(plan) = self.settings.launch_plan(&row.account) {
+                closing.extend(self.parks.take(&row.key, &pol_less::park::ParkKey::for_plan(&row.account, &plan)));
+            }
+        }
+        close_parks_later(closing);
+    }
+
+    /// One connectivity probe for a row whose sign-in failed on the network (07d §5.5):
+    /// DNS only, off the UI thread. Unit tests deliver `NetworkBack` themselves.
+    fn spawn_network_probe(&self, key: String, generation: u64) {
+        if self.preview || cfg!(test) { return; }
+        let sender = self.sender.clone();
+        let _ = std::thread::Builder::new().name("network-probe".into()).spawn(move || {
+            let back = session_worker::wait_for_network(Instant::now() + session_worker::NETWORK_PROBE_LIMIT);
+            let _ = sender.send(WorkerEvent::NetworkBack(key.clone(), back).for_launch(&key, generation));
+        });
     }
 
     /// What `account` launches with (its own choice, else the default).
@@ -1889,6 +3133,7 @@ impl App {
     fn worker_event(&mut self, event: WorkerEvent) {
         match event {
             WorkerEvent::Viewer(generation, report) => self.set_viewer_status(generation, report),
+            WorkerEvent::InterruptedUpdate(done) => self.interrupted_update_finished(*done),
             WorkerEvent::Launch(key, generation, event) => {
                 if self.accounts.iter().any(|row| row.key == key && row.launch_generation == generation) {
                     self.worker_event(*event);
@@ -1920,16 +3165,24 @@ impl App {
             // A language switch can supersede a read even after switching back.
             WorkerEvent::Services(generation, lang, update) => {
                 if generation == self.news_generation && lang == i18n::current() {
-                    services::apply(&mut self.services, update)
+                    let status = matches!(update, services::Update::Status(_));
+                    services::apply(&mut self.services, update);
+                    if status { self.note_status_read(); }
                 }
             }
             WorkerEvent::StartGame(key, report, result) => {
-                self.patch_generation += 1;
-                self.patch_loading = false;
-                self.patch = Some(report);
+                // The W20 refused this Play for an update: the Update it asks for starts it again.
+                if result.is_err() && report.as_ref().is_some_and(|report| report.state == patch::PatchState::Required) {
+                    let clicked = self.accounts.iter().find(|r| r.key == key)
+                        .and_then(|row| row.play_timing.as_ref().map(launch_timing::Timeline::started)).unwrap_or_else(Instant::now);
+                    self.note_refused_play(&key, clicked);
+                }
+                // No report: the session never reached its idle main menu, so W20 never ran.
+                if let Some(report) = report { self.set_patch_from_row(&key, report); }
                 if let Some(row) = self.accounts.iter_mut().find(|r| r.key == key) {
                     match result {
                         Ok(note) => {
+                            if let Some(timing) = &mut row.play_timing { timing.mark(launch_timing::Milestone::GameChecked); }
                             row.status = t("Starting FFXI from the signed-in PlayOnline session…").into();
                             self.status = tf("{account}: {message}", &[("account", &row.account.label), ("message", &note)]);
                         }
@@ -1951,29 +3204,90 @@ impl App {
                 if let Some(row) = self.accounts.iter_mut().find(|r| r.key == key) {
                     row.status = if row.queued_play.is_some() {
                         format!("{status} · {}", t("FFXI will start when sign-in finishes."))
+                    } else if matches!(row.launch_trigger, Some(launch_timing::LaunchTrigger::SignInAfterGame | launch_timing::LaunchTrigger::SignInAfterGameRetry)) {
+                        format!("{status}{}", resign_note())
                     } else { status };
                 }
             }
+            WorkerEvent::NetworkBack(key, back) => {
+                let Some(row) = self.accounts.iter_mut().find(|r| r.key == key) else { return };
+                let Some(wait) = row.network_wait.take() else { return };
+                // An unclean game end: the sign-in after it now waits for its delay (Tick), or is
+                // dropped when the network did not come back.
+                if wait == NetworkWait::AfterGame {
+                    if let Some(resign) = row.resign.as_mut().filter(|_| back) {
+                        resign.network = false;
+                        resign.ended = Instant::now();
+                        return;
+                    }
+                    row.drop_resign();
+                    if !back && !row.busy && row.pid.is_none() {
+                        let shown = format!("{} · {}", row.status_text(), t("The network did not come back. Sign in again once it is."));
+                        row.status = shown;
+                    }
+                    return;
+                }
+                // No retry is coming after all: the row stops promising one.
+                let promise = format!(" · {}", t("Crystal will try again when the network is back."));
+                if let Some(message) = row.status.strip_suffix(&promise).map(str::to_owned) {
+                    if !back || row.busy || row.pid.is_some() || !row.can_play() {
+                        row.status = if back { message } else { format!("{message} · {}", t("The network did not come back. Sign in again once it is.")) };
+                    }
+                }
+                // The user may have started something else meanwhile; that wins.
+                if !back || row.busy || row.pid.is_some() || !row.can_play() { return; }
+                match wait {
+                    NetworkWait::Reissue(clicked) => self.start_launch(vec![key], false, clicked, Some(launch_timing::LaunchTrigger::ReissuedPlay)),
+                    // Unless the switch turned off (or the account learned to need a code) meanwhile.
+                    NetworkWait::StartupRetry if self.presigned(&key) => self.start_startup(vec![key], launch_timing::LaunchTrigger::StartupRetry),
+                    NetworkWait::StartupRetry => {}
+                    NetworkWait::AfterGameRetry if self.resign_allowed(&key) => self.start_resigns(vec![key], launch_timing::LaunchTrigger::SignInAfterGameRetry),
+                    NetworkWait::AfterGameRetry if self.resign_eligible(&key) => self.note_resign_refused(&key),
+                    NetworkWait::AfterGameRetry | NetworkWait::AfterGame => {}
+                }
+            }
             WorkerEvent::Complete(key, result) => {
+                let mut follow_up = None;
+                let mut viewer_outdated = None;
+                // A W20 verdict for this row's folder, and a Play an Update should start again.
+                let mut game_report = None;
+                let mut refused_play = None;
+                // Whether the account's sign-in took a one-time code, learned from a session.
+                let mut uses_otp = None;
+                // A sign-in that reached a verdict on the account (no network or host failure that
+                // is retried): a Play waiting on it waits no longer.
+                let mut verdict = false;
                 if let Some(row) = self.accounts.iter_mut().find(|r| r.key == key) {
+                    let batch = row.batch_requested;
                     row.busy = false;
                     row.preparing_session = false;
                     row.batch_requested = false;
                     row.batch_pending = session_worker::batch_pending(&self.config, &row.account);
+                    let trigger = row.launch_trigger.take();
                     match result {
                         Ok(result) => {
+                            // A reconnect (no trigger) to an older worker's session reads "no code"
+                            // from a record that never said: only a sign-in this window started
+                            // teaches that an account needs none. Neither does a Play that reused
+                            // such a session (a batch, or a Play queued on it): it signed nothing in.
+                            uses_otp = (row.otp_spent || trigger.is_some() && !row.otp_unknown).then_some(row.otp_spent);
                             // The signed-in session stays up; the stock check refused the game start.
                             let refused = patch::parse_update_required(&result.detail);
                             row.pid = Some(result.pid);
                             row.alive = Some(result.alive);
                             row.game_running = Some(result.game_running);
+                            // A batch reports each prepared account Ready, then Failed for all
+                            // when the batch failed (session_batch::coordinate), such as for an
+                            // update its W20 asked for: what started it classifies that failure
+                            // too. A game that started needs nothing more.
+                            if batch && !row.is_playing() { row.launch_trigger = trigger; }
                             row.log = Some(result.log);
                             row.outcome = Some(result.outcome);
                             row.problem = refused.is_some();
                             row.status = if let Some(report) = refused {
-                                self.patch_generation += 1;
-                                self.patch_loading = false;
-                                self.patch = Some(report);
+                                // Only a Play runs the W20.
+                                refused_play = Some(row.play_timing.as_ref().map_or_else(Instant::now, launch_timing::Timeline::started));
+                                game_report = Some(report);
                                 result.detail.clone()
                             } else if !row.is_playing() {
                                 t("Signed in to PlayOnline · FFXI is closed").into()
@@ -1986,22 +3300,94 @@ impl App {
                             self.status = tf("{account}: {message}", &[("account", &row.account.label), ("message", &result.detail)]);
                         }
                         Err(error) => {
-                            row.queued_play = None;
+                            // No session came of it, so nothing for a sign-out or edit to decline.
+                            row.resign_declined = false;
+                            let queued = row.queued_play.take();
                             // The row shows the reason; the log path stays behind View log.
                             let (message, log) = launch_log::split_log(&error);
-                            if let Some(report) = patch::parse_update_required(message) {
-                                self.patch_generation += 1;
-                                self.patch_loading = false;
-                                self.patch = Some(report);
+                            let update = patch::parse_update_required(message);
+                            // 07d §5.4-5.5: a sign-in that never reached a verdict on the account
+                            // (no network, or its host went away before authentication) starts
+                            // once more: a queued Play as a cold Play, a startup sign-in after the
+                            // network is back. A refused password, OTP or update never costs a
+                            // second login, and neither does a spent one-time code: that second
+                            // login would go without one and be refused.
+                            let network = update.is_none() && launch_log::network_failure(message);
+                            let transient = update.is_none() && launch_log::transient_failure(message)
+                                && !session_worker::reached_authentication(&self.settings.config_for(&self.config, &row.account), &row.account);
+                            verdict = !network && !transient;
+                            let otp_spent = row.otp_spent && row.otp.is_empty();
+                            let wanted = match (queued, trigger) {
+                                (Some(clicked), _) if network => Some((NetworkWait::Reissue(clicked), true)),
+                                (Some(clicked), _) if transient => Some((NetworkWait::Reissue(clicked), false)),
+                                (None, Some(launch_timing::LaunchTrigger::StartupSignIn)) if network => Some((NetworkWait::StartupRetry, true)),
+                                // One retry per game end; the retry's own failure ends it.
+                                (None, Some(launch_timing::LaunchTrigger::SignInAfterGame)) if network => Some((NetworkWait::AfterGameRetry, true)),
+                                _ => None,
+                            };
+                            match wanted {
+                                Some(_) if otp_spent => {}
+                                Some((wait, true)) => row.network_wait = Some(wait),
+                                Some((wait, false)) => follow_up = Some((wait, false)),
+                                None => {}
                             }
-                            row.status = message.to_owned();
+                            // The sign-in's W2U said PlayOnline is out of date: so does the
+                            // window's PlayOnline status, and the main button becomes Update.
+                            viewer_outdated = viewer::outdated_versions(message);
+                            let play = queued.is_some() || matches!(trigger, Some(launch_timing::LaunchTrigger::Play
+                                | launch_timing::LaunchTrigger::ParkedPlay | launch_timing::LaunchTrigger::PreSignedPlay
+                                | launch_timing::LaunchTrigger::QueuedPlay | launch_timing::LaunchTrigger::BatchPlay
+                                | launch_timing::LaunchTrigger::ReissuedPlay));
+                            if play && (update.is_some() || viewer_outdated.is_some()) {
+                                refused_play = Some(queued.unwrap_or_else(Instant::now));
+                            }
+                            game_report = update;
+                            // Owner decision 2026-10-13: a sign-in Crystal started by itself without
+                            // a code that the member login refused may be an account that now uses
+                            // one. It counts as one from now on: Crystal no longer signs it in by
+                            // itself, and nothing above retries it. Its next sign-in that works
+                            // without a code undoes this. Only the row's own refusal counts: a
+                            // batch reports another account's failure to every account in it, and
+                            // one that got its session (Ready) was not refused.
+                            let refused = row.presign_login && !row.otp_spent && row.pid.is_none()
+                                && launch_log::sign_in_refused(message);
+                            let stops_presigning = refused && self.settings.presigns(&key);
+                            if refused { uses_otp = Some(true); }
+                            row.status = if row.network_wait.is_some() {
+                                format!("{message} · {}", t("Crystal will try again when the network is back."))
+                            } else if wanted.is_some() && otp_spent {
+                                format!("{message} · {}", t("That one-time code was used. Enter a new one, then press Play."))
+                            } else if stops_presigning {
+                                format!("{message} · {}", t("This account may need a one-time password now: Crystal signs it in only when you press Play."))
+                            } else { message.to_owned() };
                             row.problem = true;
                             if log.is_some() {
                                 row.log = log;
                             }
+                            if let Some(wait) = row.network_wait { follow_up = Some((wait, true)); }
                             self.status = tf("{account}: {message}", &[("account", &row.account.label), ("message", &error)]);
                         }
                     }
+                }
+                if let Some(report) = game_report { self.set_patch_from_row(&key, report); }
+                if let Some(clicked) = refused_play { self.note_refused_play(&key, clicked); }
+                if let Some(uses) = uses_otp { self.note_otp_account(&key, uses); }
+                // A waiting Play whose sign-in (startup, Connect) was refused keeps the refusal on
+                // its row instead of waiting to sign in again into the same verdict: a refused
+                // password, account or PlayOnline version never costs a second login.
+                if verdict && self.is_waiting(&key) { self.unwait(std::slice::from_ref(&key)); }
+                if let Some((local, remote)) = viewer_outdated {
+                    self.viewer_generation += 1;
+                    self.viewer_loading = false;
+                    self.viewer = Some(viewer::outdated(self.viewer.take(), local, remote));
+                }
+                match follow_up {
+                    Some((_, true)) => {
+                        let generation = self.accounts.iter().find(|r| r.key == key).map_or(0, |row| row.launch_generation);
+                        self.spawn_network_probe(key, generation);
+                    }
+                    Some((NetworkWait::Reissue(clicked), false)) => self.start_launch(vec![key], false, clicked, Some(launch_timing::LaunchTrigger::ReissuedPlay)),
+                    _ => {}
                 }
                 self.start_queued_plays();
             }
@@ -2012,6 +3398,10 @@ impl App {
         self.maintenance.is_none() && self.active_operation.is_none() && !self.prereqs.busy()
             && !self.dgvoodoo.busy() && !self.reshade.busy && self.friends.pending.is_none()
             && self.vault_ready && !self.startup_signin_pending && !self.vault_saving
+            && self.held_plays.is_empty()
+            // A waiting Play, one released from its wait and still starting, or the update it
+            // asked for, is pending launch work (waits are not saved across a restart).
+            && self.waiting_plays.is_empty() && self.released.is_empty() && self.wait_update.is_none()
             && !self.accounts.iter().any(|a| a.busy || a.batch_pending)
     }
 
@@ -2043,17 +3433,30 @@ impl App {
                 if !self.preview { if let Err(error) = save_settings(&self.config, &self.settings) { self.status = error; } }
                 if on && !self.preview { return Task::done(Message::SelfUpdate(self_update::Msg::Check)); }
             }
-            Message::SelfUpdate(self_update::Msg::Applied(Ok(()))) => return iced::exit(),
+            Message::SelfUpdate(self_update::Msg::Applied(Ok(()))) => { self.close_parks(); return iced::exit(); }
             Message::SelfUpdate(msg) => {
                 if !self.preview {
                     let can_restart = self.can_restart_launcher();
-                    return self_update::update(&mut self.self_update, msg, &self.config, can_restart).map(Message::SelfUpdate);
+                    let task = self_update::update(&mut self.self_update, msg, &self.config, can_restart).map(Message::SelfUpdate);
+                    // The update replaces this exe: no parked host may outlive it (07d §1.5).
+                    if matches!(self.self_update, self_update::State::Applying) { self.close_parks(); }
+                    return task;
                 }
             }
             Message::ControllerTick => self.poll_controller(false),
             Message::ControllerNavigation(on) => {
                 self.settings.controller_navigation = on;
                 self.controller_nav.clear();
+                if !self.preview { if let Err(error) = save_settings(&self.config, &self.settings) { self.status = error; } }
+            }
+            // Like the per-account choice it replaces: sessions already signed in stay, and a
+            // sign-in in flight finishes; a startup sign-in still waiting for a closing session,
+            // a sign-in after a game not yet started and a startup network retry are dropped at
+            // their next check. Turned on, it signs nothing in now: from the next game's end, or
+            // the next start. Parked warm hosts follow it (`park_keys`).
+            Message::AutoSignIn(on) => {
+                self.settings.auto_sign_in = on;
+                self.park_checked = None;
                 if !self.preview { if let Err(error) = save_settings(&self.config, &self.settings) { self.status = error; } }
             }
             Message::ControllerPlay => {
@@ -2139,6 +3542,8 @@ impl App {
                 if let Some(key) = self.friends.account.clone() { self.start(vec![key]); }
             }
             Message::FriendsSignOut => {
+                // An explicit sign-out is never undone by a sign-in after a game.
+                if let Some(row) = self.accounts.iter_mut().find(|a| self.friends.account.as_ref() == Some(&a.key)) { row.decline_resign(); }
                 if !self.preview {
                     if let Some(row) = self.accounts.iter().find(|a| self.friends.account.as_ref() == Some(&a.key)) {
                         let config = self.settings.config_for(&self.config, &row.account);
@@ -2195,11 +3600,19 @@ impl App {
             Message::Reshade(m) => return reshade::update(self, m),
             Message::Gamepad(m) => {
                 let captured = self.gamepad.capturing();
-                let task = gamepad::update(&mut self.gamepad, m).map(Message::Gamepad);
+                let task = gamepad::update(&mut self.gamepad, m, &self.config).map(Message::Gamepad);
                 self.poll_controller(captured);
+                if self.gamepad.take_persisted_change() {
+                    self.park_checked = None;
+                    self.close_parks_in_background(None);
+                }
+                if let Some((revision, values)) = self.gamepad.take_live_update() {
+                    return Task::batch([task, self.apply_controller_settings(revision, values)]);
+                }
                 return task;
             },
             Message::LaunchTools(m) => {
+                self.park_checked = None;
                 if launch_tools::apply(&mut self.settings, m) && !self.preview {
                     if let Err(error) = save_settings(&self.config, &self.settings) {
                         self.status = error;
@@ -2210,6 +3623,8 @@ impl App {
             Message::EditWindowerProfiles => {
                 if self.preview || self.windower_editor_open { return Task::none(); }
                 self.windower_editor_open = true;
+                // The editor needs the profile guard the parked Windower hosts hold (07d §1.5).
+                self.close_parks_in_background(Some(pol_less::Tool::Windower.name()));
                 self.status = t("Edit profiles in Windower. Saved changes apply on the next fresh game launch.").into();
                 let preferred = self.settings.windower_path.clone();
                 let sender = self.sender.clone();
@@ -2225,15 +3640,22 @@ impl App {
             }
             Message::WindowerProfilesClosed(result) => {
                 self.windower_editor_open = false;
+                self.park_checked = None;
                 if let Err(error) = result { self.status = error; }
                 self.launch_tools.refresh(&self.settings);
             }
             Message::Tick => {
                 self.launch_tools.poll();
+                // A long gap since the last Tick is a resume from sleep: a waiting Play checks again.
+                self.flag_schedule.tick(chrono::Utc::now());
+                // No periodic patch-host lookups: stock looks pc001W2U.pol.com up only right
+                // before a W20 (the W20's own lookup, or xi-start-game's warm-up at Play).
                 if self.startup_signin_pending && self.vault_ready && !self.installation_loading {
                     let keys = self.take_startup_signins();
-                    if !keys.is_empty() { self.start_mode(keys, true); }
+                    self.start_startup(keys, launch_timing::LaunchTrigger::StartupSignIn);
                 }
+                let keys = self.take_waiting_startups(Instant::now());
+                self.start_startup(keys, launch_timing::LaunchTrigger::StartupSignIn);
                 if self.friends.pending.as_ref().is_some_and(|(_, started)| started.elapsed() >= Duration::from_secs(45)) {
                     self.friends.pending = None;
                     self.friends.mail.stalled = true;
@@ -2253,11 +3675,16 @@ impl App {
                 while let Ok(event) = self.receiver.try_recv() {
                     self.worker_event(event);
                 }
+                self.release_held_plays(Instant::now());
+                let mut game_ends = Vec::new();
                 for row in &mut self.accounts {
                     if !row.batch_requested {
                         row.batch_pending = session_worker::batch_pending(&self.config, &row.account);
                     }
                     if row.pid.is_some() && row.alive.as_ref().is_some_and(|a| a.load(Ordering::Acquire)) {
+                        // A sign-out or edit before this game (a pre-signed Play since) declines
+                        // nothing about it.
+                        if row.is_playing() && !std::mem::replace(&mut row.game_seen, true) { row.resign_declined = false; }
                         if row.is_playing() && !row.batch_pending {
                             if let Some(mut timing) = row.play_timing.take() {
                                 timing.stage("game start observed by launcher");
@@ -2276,7 +3703,7 @@ impl App {
                         .as_ref()
                         .is_some_and(|a| !a.load(Ordering::Acquire))
                     {
-                        row.pid = None;
+                        let host = row.pid.take();
                         row.alive = None;
                         row.game_running = None;
                         row.busy = row.batch_requested;
@@ -2288,6 +3715,10 @@ impl App {
                             .outcome
                             .take()
                             .and_then(|slot| slot.lock().ok().and_then(|mut r| r.take()));
+                        if std::mem::take(&mut row.game_seen) && !std::mem::take(&mut row.resign_declined) {
+                            game_ends.push((row.key.clone(), report.as_ref().map(|r| r.kind.clone()), host));
+                        }
+                        row.resign_declined = false;
                         match report {
                             Some(report) => row.set_exit(report),
                             None => {
@@ -2297,11 +3728,31 @@ impl App {
                         }
                     }
                 }
+                for (key, kind, host) in game_ends { self.note_game_end(&key, kind, host); }
+                let keys = self.take_resigns(Instant::now());
+                self.start_resigns(keys, launch_timing::LaunchTrigger::SignInAfterGame);
                 self.start_queued_plays();
+                // A released Play that started its game, or ended without asking for an update,
+                // is done; one whose interrupted update is being finished is still on its way.
+                let recovering = self.recovering.is_some();
+                let accounts = &self.accounts;
+                self.released.retain(|key| recovering
+                    || accounts.iter().any(|row| row.key == *key && row.game_start_pending() && !row.is_playing()));
+                // A deleted account no longer waits.
+                let deleted: Vec<String> = self.waiting_plays.iter().flat_map(|wait| &wait.keys)
+                    .filter(|key| !accounts.iter().any(|row| row.key == **key)).cloned().collect();
+                self.unwait(&deleted);
+                self.expire_wait_codes();
+                self.release_waiting_plays(false);
+                let waited_update = self.start_waited_update();
+                let flag = self.read_play_flag();
+                self.tend_parks(Instant::now());
                 if self.preview
                     && !self.preview_capture_sent
                     && !self.news_loading
-                    && self.refreshed.elapsed() > Duration::from_secs(2)
+                    && self.refreshed.elapsed() > Duration::from_secs(
+                        std::env::var("XI_PREVIEW_DELAY_SECS").ok()
+                            .and_then(|value| value.parse::<u64>().ok()).unwrap_or(2).clamp(2, 30))
                 {
                     self.preview_capture_sent = true;
                     return window::oldest().then(|id| {
@@ -2310,8 +3761,14 @@ impl App {
                         })
                     });
                 }
-                return self.poll_service_status();
+                return Task::batch([waited_update, flag, self.poll_service_status()]);
             }
+            Message::PlayFlagLoaded(reading) => {
+                self.flag_schedule.finish();
+                self.play_flag.note(reading);
+                self.release_waiting_plays(true);
+            }
+            Message::CancelWait(keys) => self.cancel_wait(&keys),
             Message::AccountDragStart(key) => {
                 if self.page == Page::Accounts && self.vault_ready && !self.vault_saving
                     && self.editor.is_none() && !self.account_import.open && !self.confirm_close && self.pending_delete.is_none()
@@ -2427,7 +3884,6 @@ impl App {
                         account: blank_account(),
                         game_install: String::new(),
                         dat_overlays: Vec::new(),
-                        startup_signin: false,
                         auto_login: pol_less::AutoLogin::default(),
                     });
                 }
@@ -2444,7 +3900,6 @@ impl App {
                     self.editor = Some(Editor {
                         game_install: self.settings.account_installs.get(&key).cloned().unwrap_or_default(),
                         dat_overlays: self.settings.account_overlays.get(&key).cloned().unwrap_or_default(),
-                        startup_signin: self.settings.account_startup_signin.contains(&key),
                         auto_login: self.settings.account_auto_login.get(&key).copied().unwrap_or_default().normalized(),
                         key: Some(key),
                         account: row.account.clone(),
@@ -2603,7 +4058,9 @@ impl App {
                     // fetch fresh ones.
                     self.news_error.clear();
                     if !self.preview {
-                        self.services = services::cached(&news_cache_path(&self.config, lang), lang);
+                        // The status (page reading, windows, read time) is the same in every
+                        // language: keep it, or Play is ungated until the new read lands.
+                        self.services = services::keep_status(self.services.as_ref(), services::cached(&news_cache_path(&self.config, lang), lang));
                         return self.start_news();
                     }
                 }
@@ -2645,11 +4102,6 @@ impl App {
                     }
                 }
             }
-            Message::EditorStartupSignin(enabled) => {
-                if !self.vault_saving {
-                    if let Some(editor) = &mut self.editor { editor.startup_signin = enabled; }
-                }
-            }
             Message::EditorBootIni(choice) => {
                 if !self.vault_saving {
                     if let Some(editor) = &mut self.editor {
@@ -2689,10 +4141,11 @@ impl App {
                     self.settings.install_path = value;
                     self.settings.install_selected = false;
                     self.patch = None;
+                    self.patch_folder = None;
                     self.patch_generation += 1;
                     self.patch_loading = false;
                     self.maintenance_result =
-                        t("Installation path changed. Select this folder, then Check files.").into();
+                        t("Installation path changed. Save settings to select this folder.").into();
                     self.maintenance_tone = ResultTone::Unverified;
                 }
             }
@@ -2700,6 +4153,7 @@ impl App {
             Message::FindInstallation => return self.find_installation(false),
             Message::InstallationFound(generation, automatic, folder) => {
                 if generation != self.installation_generation { return Task::none(); }
+                self.park_checked = None;
                 self.installation_loading = false;
                 if self.preview || self.maintenance.is_some() { return Task::none(); }
                 let Some(folder) = folder else {
@@ -2761,6 +4215,7 @@ impl App {
                 }
             }
             Message::StartMaintenance(kind) => return self.start_maintenance(kind),
+            Message::ToggleTroubleshooting => self.troubleshooting_open = !self.troubleshooting_open,
             Message::CancelMaintenance => {
                 if self.maintenance.is_some_and(MaintenanceKind::cancellable) {
                     if let Some(op) = &self.active_operation {
@@ -2784,18 +4239,52 @@ impl App {
                     self.maintenance_tone = if result.is_err() { ResultTone::Stopped }
                         else if shown.as_ref().is_some_and(|report| report.files_verified == Some(false) || report.files_verified.is_none() && report.state != patch::PatchState::Current) { ResultTone::Unverified }
                         else { ResultTone::Done };
+                    // An Update started from refused Plays starts them again once it succeeded
+                    // (the update signed their sessions out: each is a new sign-in).
+                    let reissue = if kind == MaintenanceKind::Update { std::mem::take(&mut self.reissue_after_update) } else { Vec::new() };
+                    let (waited, waited_folder) = match self.wait_update.take() {
+                        Some(update) if kind == MaintenanceKind::Update && update.started => (update.keys, update.folder),
+                        other => { self.wait_update = other; (Vec::new(), None) }
+                    };
+                    let updated = result.is_ok();
+                    let failure = result.as_ref().err().cloned();
                     self.maintenance_result =
                         result.unwrap_or_else(|error| tf("Operation stopped: {error}", &[("error", &error)]));
                     self.status = self.maintenance_result.clone();
+                    let refresh = shown.is_none() && matches!(kind, MaintenanceKind::Update | MaintenanceKind::Repair);
                     if let Some(report) = shown {
                         self.patch_generation += 1;
                         self.patch_loading = false;
+                        // An Update reports the folder it updated (an account's own one when
+                        // its W20 asked); Check and Repair the Settings folder.
+                        if kind != MaintenanceKind::Update { self.patch_folder = None; }
                         self.patch = Some(report);
-                    } else if matches!(kind, MaintenanceKind::Update | MaintenanceKind::Repair) {
-                        return self.refresh();
                     }
+                    for (key, clicked) in reissue.into_iter().filter(|_| updated) {
+                        // Every restarted Play signs in again after the updater signed out its
+                        // session. An OTP account needs a replacement code; one entered during
+                        // the update stays on the row until the normal launch consumes it.
+                        let otp_account = self.settings.account_otp.contains(&key);
+                        if let Some(row) = self.accounts.iter_mut().find(|row| row.key == key
+                            && (row.otp_spent || otp_account) && row.otp.is_empty() && !row.busy && row.pid.is_none()) {
+                            row.status = if waited.contains(&key) { t("FFXI is back — enter your one-time password to start") }
+                                else { t("That one-time code was used. Enter a new one, then press Play.") }.into();
+                            row.problem = true;
+                            continue;
+                        }
+                        if self.accounts.iter().any(|row| row.key == key && row.can_play() && !row.busy && row.pid.is_none()) {
+                            // A waited Play in another game folder than the one just updated may
+                            // ask for that folder's Update, which then starts by itself too; one
+                            // in this folder may not (no loop).
+                            let again = waited.contains(&key) && self.account_game_folder(&key) != waited_folder;
+                            self.start_launch(vec![key.clone()], false, clicked, Some(launch_timing::LaunchTrigger::ReissuedPlay));
+                            if again && !self.is_waiting(&key) && !self.released.contains(&key) { self.released.push(key); }
+                        }
+                    }
+                    if let Some(error) = failure { self.waited_update_failed(&waited, &error); }
+                    if refresh { return self.refresh(); }
                     if setup_finished {
-                        return Task::batch([self.find_installation(false), self.start_viewer_check(true)]);
+                        return Task::batch([self.find_installation(false), self.start_viewer_check()]);
                     }
                 }
             }
@@ -2803,8 +4292,16 @@ impl App {
                 if self.preview {
                     return Task::none();
                 }
+                // Settings holds the only game-folder field: saving a typed folder selects it.
+                // A folder that is not a game installation keeps the dialog open with the reason.
+                if !self.settings.install_selected && !self.settings.install_path.trim().is_empty()
+                    && self.maintenance.is_none() && !self.reshade.busy {
+                    self.select_path(false);
+                    if !self.settings.install_selected { return Task::none(); }
+                }
                 match save_settings(&self.config, &self.settings) {
                     Ok(()) => {
+                        self.park_checked = None;
                         self.show_settings = false;
                         self.status = t("Settings saved. Checking the installed version…").into();
                         return self.refresh();
@@ -2824,7 +4321,8 @@ impl App {
                         self.vault_ready = true;
                         self.status = t("Ready. Select accounts or use Launch all. Games continue when you close Crystal.").into();
                         let keys = self.take_startup_signins();
-                        if !keys.is_empty() { self.start_mode(keys, true); }
+                        self.log_launcher_start();
+                        self.start_startup(keys, launch_timing::LaunchTrigger::StartupSignIn);
                     }
                     Err(error) => {
                         self.vault_ready = false;
@@ -2864,7 +4362,9 @@ impl App {
                         settings.account_overlays.retain(|key, _| saved.contains(key));
                         settings.account_auto_away.retain(|key, _| saved.contains(key));
                         settings.account_auto_login.retain(|key, _| saved.contains(key));
-                        settings.account_startup_signin.retain(|key| saved.contains(key));
+                        // Learned from sign-ins of that login: a changed login learns it again.
+                        settings.account_otp.retain(|key| saved.contains(key));
+                        settings.account_no_otp.retain(|key| saved.contains(key));
                         settings.account_order.retain(|key| saved.contains(key));
                         if let Some(selected) = &mut settings.selected_accounts { selected.retain(|key| saved.contains(key)); }
                         if let Some(editor) = &self.editor {
@@ -2876,16 +4376,17 @@ impl App {
                                 if editor.dat_overlays.is_empty() { settings.account_overlays.remove(&key); }
                                 else { settings.account_overlays.insert(key.clone(), editor.dat_overlays.iter().map(|p| plain_text_path(p)).collect()); }
                                 if editor.auto_login != pol_less::AutoLogin::default() {
-                                    settings.account_auto_login.insert(key.clone(), editor.auto_login.normalized());
+                                    settings.account_auto_login.insert(key, editor.auto_login.normalized());
                                 } else { settings.account_auto_login.remove(&key); }
-                                if editor.startup_signin && editor.account.mode == AccountMode::Retail { settings.account_startup_signin.insert(key); }
-                                else { settings.account_startup_signin.remove(&key); }
                             }
                         }
+                        // An edited account signs nothing back in by itself (a removed one has no row).
+                        let edited: Vec<String> = self.editor.iter().flat_map(|editor| [Some(account_key(&editor.account)), editor.key.clone()]).flatten().collect();
                         if (self.editor.is_some() || settings.account_installs != self.settings.account_installs || settings.account_overlays != self.settings.account_overlays
                             || settings.account_auto_away != self.settings.account_auto_away || settings.account_auto_login != self.settings.account_auto_login || settings.selected_accounts != self.settings.selected_accounts
                             || settings.account_order != self.settings.account_order
-                            || settings.account_startup_signin != self.settings.account_startup_signin) && !self.preview {
+                            || settings.account_otp != self.settings.account_otp
+                            || settings.account_no_otp != self.settings.account_no_otp) && !self.preview {
                             if let Err(error) = save_settings(&self.config, &settings) {
                                 if let Some(editor) = &mut self.editor {
                                     let key = account_key(&editor.account);
@@ -2901,13 +4402,17 @@ impl App {
                                 // settings save; account storage is already committed.
                                 self.settings = settings;
                                 self.replace_accounts(values);
+                                // The vault saved the edit: it declines a sign-in after the game too.
+                                for row in self.accounts.iter_mut().filter(|row| edited.contains(&row.key)) { row.decline_resign(); }
                                 self.status = tf("Accounts saved, but launcher settings were not saved: {error}", &[("error", &error)]);
                                 return Task::none();
                             }
                         }
                         self.settings = settings;
                         self.replace_accounts(values);
+                        for row in self.accounts.iter_mut().filter(|row| edited.contains(&row.key)) { row.decline_resign(); }
                         self.editor = None;
+                        self.park_checked = None;
                         if self.account_import.batch.is_some() { self.account_import.open = true; }
                         self.status = t("Accounts saved.").into();
                     }
@@ -2934,6 +4439,7 @@ impl App {
                     }
                     Err(error) => self.news_error = error,
                 }
+                self.note_status_read();
             }
             Message::ViewerLoaded(generation, report) => self.set_viewer_status(generation, report),
             Message::ServiceStatusLoaded(_, _, result) => {
@@ -2941,6 +4447,7 @@ impl App {
                 match result {
                     Ok(snapshot) => services::apply(&mut self.services, services::Update::Status(snapshot)),
                     Err(error) => {
+                        // The page is unread; an official window still covering now stays maintenance.
                         if let Some(snapshot) = &mut self.services {
                             snapshot.availability = services::Availability::Unknown;
                             snapshot.availability_note = tf("{note} Official world status unavailable: {error}.",
@@ -2948,13 +4455,15 @@ impl App {
                         }
                     }
                 }
+                self.note_status_read();
             }
             Message::PatchLoaded(generation, mut result) => {
                 if generation == self.patch_generation {
                     self.patch_loading = false;
                     // A version-record read contains no new server or file-check evidence.
-                    // Keep the last check while that record is unchanged and readable.
-                    let keep_checked = result.state == patch::PatchState::Unknown && result.remote_version == t("Not checked") && self.patch.as_ref().is_some_and(|previous| {
+                    // Keep the last check while that record is unchanged and readable, and
+                    // an account's own folder's verdict (this read is the Settings folder's).
+                    let keep_checked = self.patch_folder.is_some() || result.state == patch::PatchState::Unknown && result.remote_version == t("Not checked") && self.patch.as_ref().is_some_and(|previous| {
                         previous.local_version == result.local_version &&
                             (previous.state != patch::PatchState::Unknown || previous.files_verified.is_some())
                     });
@@ -3005,11 +4514,13 @@ impl App {
                 if self.vault_saving {
                     self.confirm_close = true;
                 } else {
+                    self.close_parks();
                     return iced::exit();
                 }
             }
             Message::ConfirmClose => {
                 if self.maintenance.is_none() && !self.prereqs.busy() && !self.reshade.busy {
+                    self.close_parks();
                     return iced::exit();
                 }
                 self.confirm_close = false;
@@ -3339,6 +4850,9 @@ impl App {
             news_note: t("Preview content. Live feeds load when the launcher starts normally.").into(),
             availability: services::Availability::Unknown,
             availability_note: t("Not checked in design preview").into(),
+            windows: Vec::new(),
+            windows_complete: false,
+            ended_early: Vec::new(),
             checked_at: t("Preview").into(),
         });
         if i18n::current() == i18n::Lang::Ja {
@@ -3432,6 +4946,31 @@ fn plain_text_path(raw: &str) -> String {
 }
 
 impl Settings {
+    /// Owner decision 2026-10-13: Crystal signs `key` in by itself (when it opens, and again
+    /// after its game closes) only while the switch is on and it knows the account signs in
+    /// without a one-time code: its last successful sign-in took none. An OTP account, and one
+    /// not yet seen signing in (its first Play teaches it), signs in only when Play is pressed.
+    pub(crate) fn presigns(&self, key: &str) -> bool {
+        self.auto_sign_in && self.account_no_otp.contains(key) && !self.account_otp.contains(key)
+    }
+
+    /// What `key`'s latest sign-in taught: it took a one-time code (`uses`), or it went without
+    /// one. Only this yes or no is kept, never a code. Whether anything changed.
+    fn note_sign_in(&mut self, key: &str, uses: bool) -> bool {
+        let (add, remove) = if uses { (&mut self.account_otp, &mut self.account_no_otp) } else { (&mut self.account_no_otp, &mut self.account_otp) };
+        let removed = remove.remove(key);
+        add.insert(key.to_owned()) || removed
+    }
+
+    /// Files before 2026-10-13 kept "Sign in when Crystal opens" per account. An account that had
+    /// it was already signing in at startup without a code, so it is known to sign in without one,
+    /// unless its latest sign-in since took a code (`account_otp` is newer evidence).
+    fn migrate_startup_signin(&mut self) {
+        for key in std::mem::take(&mut self.legacy_startup_signin) {
+            if !self.account_otp.contains(&key) { self.account_no_otp.insert(key); }
+        }
+    }
+
     fn config_for(&self, base: &Config, account: &Account) -> Config {
         let mut config = base.clone();
         if self.install_selected { config.game_install = Some(PathBuf::from(&self.install_path)); }
@@ -3566,10 +5105,14 @@ fn join_and(names: &[&str]) -> String {
 /// (each is a `t("…")` key where it is set).
 const RESULT_TEXTS: [&str; 3] = [
     "Files have not been checked. Version availability alone does not verify file integrity.",
-    "Selected installation has not been checked. Use Check files to verify it.",
-    "Installation path changed. Select this folder, then Check files.",
+    "Game folder selected. Play checks its version before FINAL FANTASY XI starts.",
+    "Installation path changed. Save settings to select this folder.",
 ];
-const STATUS_TEXTS: [&str; 9] = [
+const STATUS_TEXTS: [&str; 13] = [
+    "Checking whether FINAL FANTASY XI is up…",
+    "FFXI is down for maintenance. Starting as soon as it's back…",
+    "FFXI's worlds are down. Starting as soon as they're back…",
+    "FFXI is back — enter your one-time password to start",
     "Loading saved accounts…",
     "Ready. Select accounts or use Launch all. Games continue when you close Crystal.",
     "Accounts saved.",
@@ -3580,7 +5123,11 @@ const STATUS_TEXTS: [&str; 9] = [
     "Finding FINAL FANTASY XI…",
     "No installed FFXI folder was found. Run official setup or use Browse.",
 ];
-const ROW_TEXTS: [&str; 9] = [
+const ROW_TEXTS: [&str; 13] = [
+    "Checking whether FINAL FANTASY XI is up…",
+    "FFXI is down for maintenance. Starting as soon as it's back…",
+    "FFXI's worlds are down. Starting as soon as they're back…",
+    "FFXI is back — enter your one-time password to start",
     "Ready to launch",
     "Private-server client temporarily unavailable",
     "Private-server client temporarily unavailable; saved account kept.",
@@ -3620,6 +5167,7 @@ fn load_settings(config: &Config) -> Result<Settings, String> {
     let mut settings: Settings =
         serde_json::from_slice(&bytes).map_err(|_| t("Settings could not be read."))?;
     settings.plain_paths();
+    settings.migrate_startup_signin();
     settings.launch_with = settings.launch_with.retail();
     Ok(settings)
 }
@@ -3780,6 +5328,13 @@ fn claim_instance() -> Result<Option<InstanceGuard>, String> {
     Ok(Some(InstanceGuard(handle)))
 }
 
+/// Close park workers on their own thread, so a re-park or a suspension never holds the UI.
+/// If the thread cannot start, dropping them closes their stdin: they clean up themselves.
+fn close_parks_later(workers: Vec<session_worker::ParkWorker>) {
+    if workers.is_empty() { return; }
+    let _ = std::thread::Builder::new().name("park-close".into()).spawn(move || pol_less::park::close_workers(workers));
+}
+
 fn main() -> iced::Result {
     if let Some(result) = self_update::cli(&std::env::args().collect::<Vec<_>>()) {
         if let Err(error) = result { eprintln!("{error}"); std::process::exit(1); }
@@ -3799,7 +5354,8 @@ fn main() -> iced::Result {
         // The worker writes progress and error text that the window shows, so it
         // speaks the window's language: the same saved setting, read the same way.
         let _ = load_settings_and_language(&Config::default());
-        let code = session_worker::run();
+        // A park worker (pol-spec 07d §1.4) parks a host first and reads its Play later.
+        let code = if std::env::args().any(|a| a == pol_less::park::PARK_ARG) { session_worker::run_park() } else { session_worker::run() };
         pol_less::profile_access::finish_pending_launchers();
         std::process::exit(code);
     }
@@ -3867,15 +5423,21 @@ fn main() -> iced::Result {
                 patch.source_url.as_deref().unwrap_or("Unavailable")
             );
             match services {
-                Ok(s) => println!(
-                    "News items: {}; decoded article images: {}; maintenance notices: {}; availability {:?}: {}; feed note: {}",
-                    s.news.len(),
-                    s.news.iter().filter(|item| item.image.is_some()).count(),
-                    s.notices.len(),
-                    s.availability,
-                    s.availability_note,
-                    s.news_note
-                ),
+                Ok(s) => {
+                    // The Play gate's verdict (window first), then the status page's own reading.
+                    let (verdict, note) = s.recent_status(chrono::Utc::now());
+                    println!(
+                        "News items: {}; decoded article images: {}; maintenance notices: {}; Play gate {:?}: {}; status page {:?}: {}; feed note: {}",
+                        s.news.len(),
+                        s.news.iter().filter(|item| item.image.is_some()).count(),
+                        s.notices.len(),
+                        verdict,
+                        note,
+                        s.availability,
+                        s.availability_note,
+                        s.news_note
+                    )
+                }
                 Err(e) => println!("Services: {e}"),
             }
         });
@@ -3908,11 +5470,12 @@ fn main() -> iced::Result {
             }
         }
     };
-    // wgpu on Direct3D 12 only. Probing every backend (Vulkan and
-    // GL too) costs ~150 ms of startup here; if D3D12 is unavailable iced falls
-    // back to its tiny-skia software renderer. The low-power preference keeps
-    // a hybrid laptop on its integrated GPU for a launcher. Either can still be
-    // overridden from the environment.
+    // wgpu on Direct3D 12 only. Probing every backend (Vulkan and GL too)
+    // costs ~150 ms of startup here; if D3D12 is unavailable iced falls back to
+    // its tiny-skia software renderer. The low-power preference keeps a hybrid
+    // laptop on its integrated GPU. Software rendering by default saved ~200 MB
+    // but repainted the whole window on the CPU for every hover and tick, which
+    // made the launcher sluggish; ICED_BACKEND=tiny-skia still selects it.
     #[cfg(windows)]
     for (key, value) in [("WGPU_BACKEND", "dx12"), ("WGPU_POWER_PREF", "low")] {
         if std::env::var_os(key).is_none() {
@@ -3979,6 +5542,22 @@ mod tests {
             status: String::new(),
             vault_ready: true,
             startup_signin_pending: false,
+            startup_waiting: Vec::new(),
+            startup_issued: None,
+            launcher_start_logged: false,
+            status_read_done: true,
+            status_hold_spent: false,
+            held_plays: Vec::new(),
+            waiting_plays: Vec::new(),
+            play_flag: play_flag::Known::default(),
+            flag_schedule: play_flag::Schedule::default(),
+            released: Vec::new(),
+            wait_update: None,
+            launches: None,
+            parks: Default::default(),
+            park_prints: Default::default(),
+            park_checked: None,
+            park_tended: None,
             confirm_close: false,
             pending_delete: None,
             wiki_query: String::new(),
@@ -3992,6 +5571,12 @@ mod tests {
             installer_error: None,
             maintenance_tone: ResultTone::default(),
             maintenance_cancelled: false,
+            update_scope: (true, true),
+            troubleshooting_open: false,
+            recovering: None,
+            patch_folder: None,
+            refused_plays: Vec::new(),
+            reissue_after_update: Vec::new(),
             active_operation: None,
             config: Config::default(),
             sender,
@@ -4033,6 +5618,223 @@ mod tests {
         assert_eq!(app.start_maintenance(MaintenanceKind::Update).units(), 0);
         let _ = dgvoodoo::update(&mut app, dgvoodoo::Msg::Toggle(false));
         assert!(app.settings.dgvoodoo);
+    }
+
+    /// Proposal 09 phase 1: an interrupted update no longer refuses Play; it is finished
+    /// first and the launch goes on, or the rows say why it could not be.
+    #[test]
+    fn an_interrupted_update_is_finished_before_the_launch_goes_on() {
+        let mut app = app();
+        app.preview = false;
+        let key = app.accounts[0].key.clone();
+        let root = std::env::temp_dir().join(format!("crystal-interrupted-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(root.join(".xi-updater")).unwrap();
+        let journal = root.join(".xi-updater").join("transaction.json");
+        std::fs::write(&journal, b"{}").unwrap();
+        app.settings.install_path = root.to_string_lossy().into_owned();
+        app.settings.install_selected = true;
+        app.viewer = None;
+        // The window's report is no update: Play stays the main button and finishes it.
+        app.patch = Some(patch::local_report(&root));
+        assert_eq!(app.patch.as_ref().unwrap().state, patch::PatchState::Interrupted);
+        assert_eq!(app.main_action(), MainAction::Play);
+        assert_eq!(app.interrupted_updates(std::slice::from_ref(&key), false), vec![root.clone()]);
+        // A sign-in only (startup, Connect) never touches a game folder.
+        assert!(app.interrupted_updates(std::slice::from_ref(&key), true).is_empty());
+        let clicked = Instant::now();
+        let held = HeldLaunch { keys: vec![key.clone()], social_only: false, clicked, trigger: None };
+        let recovered = |result: Result<(), String>, game: Option<patch::PatchReport>| WorkerEvent::InterruptedUpdate(Box::new(Recovered {
+            held: held.clone(), folders: vec![root.clone()], parks_closed: false, result, game, viewer: None }));
+        app.recovering = Some(false);
+        assert!(app.launch_blocked(), "nothing starts while files are being restored");
+        assert!(!app.files_changing(), "a game folder alone leaves other accounts' parked hosts alone");
+        app.recovering = Some(true);
+        assert!(app.files_changing(), "PlayOnline's folder closes them");
+        // No parked host to blame: the refusal is final.
+        app.worker_event(recovered(Err("fixture refusal".into()), None));
+        assert!(app.recovering.is_none() && app.accounts[0].problem);
+        assert!(app.accounts[0].status.contains("fixture refusal"), "{}", app.accounts[0].status);
+        // Finished, but another journal appeared meanwhile: reported, never a loop.
+        app.launches = Some(Vec::new());
+        app.worker_event(recovered(Ok(()), None));
+        assert!(app.launches.as_ref().unwrap().is_empty());
+        std::fs::remove_file(&journal).unwrap();
+        // Finished: the launch goes on, and the "interrupted" report is read again.
+        app.worker_event(recovered(Ok(()), Some(patch::local_report(&root))));
+        assert_eq!(app.launches.as_ref().unwrap().as_slice(), &[(vec![key.clone()], false, clicked, None)]);
+        assert_ne!(app.patch.as_ref().unwrap().state, patch::PatchState::Interrupted);
+        assert!(app.interrupted_updates(&[key], false).is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn refused_report() -> patch::PatchReport {
+        patch::PatchReport { state: patch::PatchState::Required, local_version: "30260904_1".into(),
+            remote_version: "30261006_0".into(), detail: String::new(), files_verified: None, source_url: None }
+    }
+
+    /// Proposal 09 phase 1: an Update started from a refused Play starts that Play again
+    /// when it succeeds; a failed one, or a Play pressed meanwhile, does not.
+    #[test]
+    fn an_update_started_from_a_refused_play_starts_that_play_again() {
+        let mut app = app();
+        app.preview = false;
+        app.launches = Some(Vec::new());
+        app.settings.install_selected = true;
+        let key = app.accounts[0].key.clone();
+        // The W20 refused a pre-signed Play.
+        let clicked = Instant::now() - Duration::from_secs(3);
+        app.accounts[0].busy = true;
+        app.accounts[0].play_timing = Some(launch_timing::Timeline::begin_at(clicked));
+        let message = patch::gate(patch::LaunchCheck::Update(refused_report())).unwrap_err();
+        app.worker_event(WorkerEvent::StartGame(key.clone(), Some(refused_report()), Err(message)));
+        assert_eq!(app.main_action(), MainAction::Update);
+        assert_eq!(app.refused_plays, vec![(key.clone(), clicked)]);
+        // The Update takes it along (its sessions sign out); success starts it again, cold.
+        let _ = app.start_maintenance(MaintenanceKind::Update);
+        assert!(app.maintenance == Some(MaintenanceKind::Update));
+        assert!(app.refused_plays.is_empty() && app.reissue_after_update.len() == 1);
+        let mut current = refused_report();
+        current.state = patch::PatchState::Current;
+        let _ = app.update(Message::MaintenanceFinished(MaintenanceKind::Update, Ok("Updated".into()), Some(current.clone())));
+        assert_eq!(app.launches.as_ref().unwrap().as_slice(),
+            &[(vec![key.clone()], false, clicked, Some(launch_timing::LaunchTrigger::ReissuedPlay))]);
+        // A failed Update starts nothing.
+        app.launches = Some(Vec::new());
+        app.note_refused_play(&key, clicked);
+        let _ = app.start_maintenance(MaintenanceKind::Update);
+        let _ = app.update(Message::MaintenanceFinished(MaintenanceKind::Update, Err("Cancelled".into()), None));
+        assert!(app.launches.as_ref().unwrap().is_empty() && app.reissue_after_update.is_empty());
+        // A Play pressed after the refusal replaces it.
+        app.note_refused_play(&key, clicked);
+        app.start_launch(vec![key.clone()], false, Instant::now(), None);
+        assert!(app.refused_plays.is_empty());
+        // A sign-in only (Connect) refused by an outdated PlayOnline is no Play to start again.
+        app.accounts[0].busy = true;
+        app.accounts[0].launch_trigger = Some(launch_timing::LaunchTrigger::Connect);
+        let outdated = viewer::ConnectVerdict::Outdated { local: "20110829_E".into(), remote: "20261001_0".into() }.message();
+        app.worker_event(WorkerEvent::Complete(key.clone(), Err(outdated.clone())));
+        assert!(app.refused_plays.is_empty());
+        // The same refusal of a cold Play is.
+        app.accounts[0].busy = true;
+        app.accounts[0].launch_trigger = Some(launch_timing::LaunchTrigger::Play);
+        app.worker_event(WorkerEvent::Complete(key.clone(), Err(outdated)));
+        assert_eq!(app.refused_plays.iter().map(|(known, _)| known.as_str()).collect::<Vec<_>>(), [key.as_str()]);
+    }
+
+    #[test]
+    fn ordinary_plays_require_a_replacement_otp_after_update() {
+        let root = std::env::temp_dir().join(format!("crystal-update-otp-{}", backend::unique_id().unwrap()));
+        for (used_code, replacement) in [(true, ""), (true, "654321"), (false, "")] {
+            let mut app = app();
+            app.preview = false;
+            app.config = Config { experiment: root.join(format!("{used_code}-{replacement}")), repository: root.join("runtime"), game_install: None, dat_overlays: Vec::new() };
+            app.accounts.truncate(1);
+            app.launches = Some(Vec::new());
+            app.settings.install_selected = true;
+            let key = app.accounts[0].key.clone();
+            let clicked = Instant::now();
+            let row = &mut app.accounts[0];
+            row.busy = true;
+            row.otp_spent = used_code;
+            row.launch_trigger = Some(launch_timing::LaunchTrigger::Play);
+            row.play_timing = Some(launch_timing::Timeline::begin_at(clicked));
+            // Authentication consumed the original code, then W20 refused this ordinary
+            // Play for an update. Its session remains signed in until the update signs out.
+            let message = patch::gate(patch::LaunchCheck::Update(refused_report())).unwrap_err();
+            app.worker_event(WorkerEvent::Complete(key.clone(), Ok(LaunchResult {
+                pid: 77, detail: message, alive: Arc::new(AtomicBool::new(true)),
+                game_running: Arc::new(AtomicBool::new(false)), log: app.config.experiment.join("launch.log"),
+                outcome: Arc::new(std::sync::Mutex::new(None)), timing: String::new(),
+            })));
+            assert_eq!(app.settings.account_otp.contains(&key), used_code);
+            assert_eq!(app.refused_plays, vec![(key.clone(), clicked)]);
+            assert!(app.wait_update.is_none(), "this Play did not come from a maintenance wait");
+            // Simulate the original native session ending; the updater task is never polled,
+            // so this fixture touches no network, registry settings or game process.
+            let row = &mut app.accounts[0];
+            (row.pid, row.alive, row.game_running) = (None, None, None);
+            let _ = app.start_maintenance(MaintenanceKind::Update);
+            assert!(app.maintenance == Some(MaintenanceKind::Update));
+            let _ = app.update(Message::OtpChanged(key.clone(), replacement.into()));
+            let mut current = refused_report();
+            current.state = patch::PatchState::Current;
+            let _ = app.update(Message::MaintenanceFinished(MaintenanceKind::Update, Ok("Updated".into()), Some(current)));
+            if used_code && replacement.is_empty() {
+                assert!(app.launches.as_ref().unwrap().is_empty());
+                assert_eq!(app.accounts[0].status, t("That one-time code was used. Enter a new one, then press Play."));
+                assert!(app.accounts[0].problem && !app.accounts[0].busy && app.accounts[0].pid.is_none() && app.accounts[0].can_play());
+            } else {
+                assert_eq!(app.launches.as_ref().unwrap().as_slice(),
+                    &[(vec![key], false, clicked, Some(launch_timing::LaunchTrigger::ReissuedPlay))]);
+            }
+            // The recorder stops at the normal launch boundary: a replacement is still there
+            // for that launch to consume, rather than discarded by MaintenanceFinished.
+            assert_eq!(app.accounts[0].otp, replacement);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// An account with its own game folder: its W20's Update updates that folder, and a
+    /// Settings-folder read does not drop the verdict that asked for it.
+    #[test]
+    fn an_accounts_own_game_folder_is_the_one_its_refused_play_updates() {
+        let mut app = app();
+        app.preview = false;
+        app.launches = Some(Vec::new());
+        app.settings.install_path = r"C:\Games\SquareEnix\FINAL FANTASY XI".into();
+        app.settings.install_selected = true;
+        let key = app.accounts[0].key.clone();
+        let own = PathBuf::from(r"D:\Second\FINAL FANTASY XI");
+        app.settings.account_installs.insert(account_key(&app.accounts[0].account), own.to_string_lossy().into_owned());
+        app.accounts[0].busy = true;
+        let message = patch::gate(patch::LaunchCheck::Update(refused_report())).unwrap_err();
+        app.worker_event(WorkerEvent::StartGame(key.clone(), Some(refused_report()), Err(message)));
+        assert_eq!(app.main_action(), MainAction::Update);
+        assert_eq!(app.update_account_folder(MaintenanceKind::Update), Some(own.clone()));
+        assert_eq!(app.update_account_folder(MaintenanceKind::Repair), None, "Repair is the Settings folder's");
+        // A read of the Settings folder's record keeps the other folder's verdict.
+        app.patch_generation += 1;
+        let local = patch::PatchReport { state: patch::PatchState::Unknown, local_version: "30261006_0".into(),
+            remote_version: t("Not checked").into(), detail: String::new(), files_verified: None, source_url: None };
+        let _ = app.update(Message::PatchLoaded(app.patch_generation, local));
+        assert_eq!(app.patch.as_ref().unwrap().state, patch::PatchState::Required);
+        assert_eq!(app.update_account_folder(MaintenanceKind::Update), Some(own.clone()));
+        // A Settings-folder account's verdict, or another Settings folder, targets Settings again.
+        app.settings.account_installs.clear();
+        app.accounts[0].busy = true;
+        let message = patch::gate(patch::LaunchCheck::Update(refused_report())).unwrap_err();
+        app.worker_event(WorkerEvent::StartGame(key, Some(refused_report()), Err(message)));
+        assert_eq!(app.update_account_folder(MaintenanceKind::Update), None);
+    }
+
+    /// A sign-in refused because PlayOnline is out of date updates the PlayOnline status,
+    /// so the main button becomes Update, and that Update covers PlayOnline only.
+    #[test]
+    fn an_outdated_playonline_sign_in_turns_play_into_a_playonline_update() {
+        let mut app = app();
+        app.preview = false;
+        app.launches = Some(Vec::new());
+        app.patch = None;
+        let key = app.accounts[0].key.clone();
+        app.accounts[0].busy = true;
+        let message = viewer::ConnectVerdict::Outdated { local: "20110829_E".into(), remote: "20261001_0".into() }.message();
+        app.worker_event(WorkerEvent::Complete(key, Err(message)));
+        let shown = app.viewer.as_ref().unwrap();
+        assert!(shown.requires_update());
+        assert_eq!((shown.version.local_version.as_str(), shown.version.remote_version.as_str()), ("20110829_E", "20261001_0"));
+        assert_eq!(app.main_action(), MainAction::Update);
+        assert_eq!(app.update_scope(), (true, false));
+        // The game's own W20 verdict adds FFXI; without PlayOnline's it is FFXI alone.
+        app.patch = patch::parse_update_required(&patch::gate(patch::LaunchCheck::Update(patch::PatchReport {
+            state: patch::PatchState::Required, local_version: "30260904_1".into(), remote_version: "30261006_0".into(),
+            detail: String::new(), files_verified: None, source_url: None })).unwrap_err());
+        assert_eq!(app.update_scope(), (true, true));
+        app.viewer = None;
+        assert_eq!(app.update_scope(), (false, true));
+        app.update_scope = app.update_scope();
+        app.maintenance = Some(MaintenanceKind::Update);
+        assert_eq!(app.maintenance_label(), t("Updating FINAL FANTASY XI"));
     }
 
     #[test]
@@ -4087,7 +5889,7 @@ mod tests {
 
     /// Privacy mode on: no synthetic name, ID, character, subject or message
     /// is readable anywhere the screens put text, and the names are there as
-    /// blurred text (one `▒` per character), on every page that shows them.
+    /// fixed-width placeholders, on every page that shows them.
     #[test]
     fn privacy_mode_blurs_every_identity_on_every_page() {
         i18n::set(i18n::Lang::En);
@@ -4126,6 +5928,31 @@ mod tests {
         app.load_friends_preview(false, false, false, false);
         let texts = privacy::testing::texts(ui::view(&app), size);
         assert!(texts.iter().any(|t| t == "Alyria") && texts.iter().any(|t| t.contains("Rhapsodies")), "{texts:?}");
+    }
+
+    #[test]
+    fn controller_changes_target_running_retail_games_without_selection_or_passwords() {
+        let mut app = app();
+        for (index, row) in app.accounts.iter_mut().enumerate() {
+            row.account.mode = if index == 2 { AccountMode::Private } else { AccountMode::Retail };
+            row.pid = Some(100 + index as u32);
+            row.alive = Some(Arc::new(AtomicBool::new(true)));
+            row.game_running = Some(Arc::new(AtomicBool::new(index != 1)));
+            row.selected = false;
+        }
+        let key = app.accounts[0].key.clone();
+        app.accounts[0].account.pol_password = "kept locally".into();
+        app.accounts[0].account.se_password = "kept locally too".into();
+        app.settings.account_installs.insert(key, r"C:\test\FFXI".into());
+        let targets = app.controller_settings_targets();
+        assert_eq!(targets.len(), 1, "idle POL sessions and private clients are excluded");
+        assert_eq!(account_key(&targets[0].1), account_key(&app.accounts[0].account));
+        assert!(targets[0].1.pol_password.is_empty() && targets[0].1.se_password.is_empty());
+        assert_eq!(targets[0].0.game_install, Some(PathBuf::from(r"C:\test\FFXI")));
+        assert_eq!(app.accounts[0].account.pol_password, "kept locally");
+        assert_eq!(app.accounts[0].account.se_password, "kept locally too");
+        app.accounts[0].alive.as_ref().unwrap().store(false, Ordering::Release);
+        assert!(app.controller_settings_targets().is_empty(), "a client already closed receives no changes");
     }
 
     #[test]
@@ -4267,7 +6094,7 @@ mod tests {
         let headline = |app: &App| app.services.as_ref().map(|s| s.news[0].title.clone());
         let late = |title: &str| {
             let item = services::NewsItem { title: title.into(), url: "https://www.playonline.com/news/late.html".into(), ..Default::default() };
-            services::ServiceSnapshot { news: vec![item], notices: Vec::new(), news_note: String::new(), availability: services::Availability::Unknown, availability_note: String::new(), checked_at: String::new() }
+            services::ServiceSnapshot { news: vec![item], notices: Vec::new(), news_note: String::new(), availability: services::Availability::Unknown, availability_note: String::new(), windows: Vec::new(), windows_complete: false, ended_early: Vec::new(), checked_at: String::new() }
         };
 
         i18n::set(i18n::Lang::En);
@@ -4394,7 +6221,7 @@ mod tests {
         app.maintenance_tone = ResultTone::Done;
         let _ = app.update(Message::InstallPathChanged(r"C:\Elsewhere".into()));
         assert_eq!(app.maintenance_tone, ResultTone::Unverified);
-        assert_eq!(app.maintenance_result, t("Installation path changed. Select this folder, then Check files."));
+        assert_eq!(app.maintenance_result, t("Installation path changed. Save settings to select this folder."));
     }
 
     #[test]
@@ -4824,8 +6651,9 @@ mod tests {
         assert_eq!(app.main_action(), MainAction::Update);
     }
 
+    /// Every world down: a Play waits for them ("Wait and play"), and nothing signs in meanwhile.
     #[test]
-    fn confirmed_downtime_stops_new_game_starts_without_touching_sessions() {
+    fn confirmed_downtime_sets_new_game_starts_waiting_without_touching_sessions() {
         let mut app = app();
         app.preview = false;
         let snapshot = app.services.as_mut().unwrap();
@@ -4833,9 +6661,11 @@ mod tests {
         snapshot.checked_at = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC").to_string();
         let keys = app.launch_keys(true);
         assert!(!keys.is_empty());
-        app.start_mode_at(keys, false, Instant::now());
-        assert!(app.show_details);
+        app.start_mode_at(keys.clone(), false, Instant::now());
+        assert!(keys.iter().all(|key| app.is_waiting(key)));
         assert!(app.accounts.iter().all(|row| !row.busy && row.pid.is_none() && row.queued_play.is_none()));
+        assert_eq!(app.status, "FFXI's worlds are down. Starting as soon as they're back…");
+        assert!(app.receiver.try_recv().is_err(), "no sign-in worker");
     }
 
     #[test]
@@ -5445,22 +7275,705 @@ mod tests {
         assert!(app.receiver.try_recv().is_err(), "queued Play reuses the existing worker");
     }
 
+    /// pol-spec 07d §5.4: a refused sign-in (password, OTP, any verdict on the account) drops
+    /// the queued Play as before; nothing signs in a second time.
     #[test]
     fn failed_background_signin_clears_queued_play_without_retrying() {
         let mut app = app();
         app.preview = false;
-        let row = &mut app.accounts[0];
-        row.busy = true;
-        row.preparing_session = true;
-        row.queued_play = Some(Instant::now());
-        let key = row.key.clone();
-        app.worker_event(WorkerEvent::Complete(key, Err("Sign-in failed".into())));
-        let row = &app.accounts[0];
-        assert!(!row.busy && !row.preparing_session);
-        assert!(row.queued_play.is_none() && row.pid.is_none());
-        assert!(row.problem && row.can_play());
-        assert_eq!(row.status, "Sign-in failed");
+        app.launches = Some(Vec::new());
+        for failure in ["Sign-in failed",
+            "Game loader error during startup: Native PlayOnline member login failed (state -1036, POL result -1036). (Windower via crystal-loader).",
+            &format!("{} installed 30260904_1, official server 30260905_0. Open Downloads.", patch::UPDATE_REQUIRED)] {
+            let row = &mut app.accounts[0];
+            row.busy = true;
+            row.preparing_session = true;
+            row.queued_play = Some(Instant::now());
+            row.launch_trigger = Some(launch_timing::LaunchTrigger::StartupSignIn);
+            let key = row.key.clone();
+            app.worker_event(WorkerEvent::Complete(key, Err(failure.to_owned())));
+            let row = &app.accounts[0];
+            assert!(!row.busy && !row.preparing_session);
+            assert!(row.queued_play.is_none() && row.pid.is_none() && row.network_wait.is_none());
+            assert!(row.problem && row.can_play());
+            assert_eq!(row.status, failure);
+        }
+        assert!(app.launches.as_ref().unwrap().is_empty(), "never a second login");
         assert!(app.receiver.try_recv().is_err());
+    }
+
+    /// 07d §5.4: a pre-sign-in whose host went away re-issues its queued Play at once, cold,
+    /// with the original click; one that failed on the network waits for the probe first.
+    /// Neither happens twice.
+    #[test]
+    fn failed_background_signin_reissues_its_queued_play_once_for_network_or_transient_failures() {
+        let mut app = app();
+        app.preview = false;
+        app.launches = Some(Vec::new());
+        let key = app.accounts[0].key.clone();
+        let clicked = Instant::now() - Duration::from_secs(3);
+        let queue = |app: &mut App| {
+            let row = &mut app.accounts[0];
+            row.busy = true;
+            row.preparing_session = true;
+            row.queued_play = Some(clicked);
+            row.launch_trigger = Some(launch_timing::LaunchTrigger::StartupSignIn);
+        };
+        queue(&mut app);
+        app.worker_event(WorkerEvent::Complete(key.clone(), Err("The background session worker ended before starting the game.".into())));
+        assert_eq!(app.launches.as_ref().unwrap().as_slice(), &[(vec![key.clone()], false, clicked, Some(launch_timing::LaunchTrigger::ReissuedPlay))]);
+        app.launches = Some(Vec::new());
+        queue(&mut app);
+        app.worker_event(WorkerEvent::Complete(key.clone(), Err("Game loader error during startup: Native PlayOnline login failed (state 39, POL result -19). (Windower via crystal-loader).".into())));
+        let row = &app.accounts[0];
+        assert_eq!(row.network_wait, Some(NetworkWait::Reissue(clicked)));
+        assert!(row.status.ends_with("Crystal will try again when the network is back."), "{}", row.status);
+        assert!(app.launches.as_ref().unwrap().is_empty(), "not before the network is back");
+        let generation = row.launch_generation;
+        app.worker_event(WorkerEvent::NetworkBack(key.clone(), true).for_launch(&key, generation));
+        assert_eq!(app.launches.as_ref().unwrap().as_slice(), &[(vec![key.clone()], false, clicked, Some(launch_timing::LaunchTrigger::ReissuedPlay))]);
+        assert!(app.accounts[0].network_wait.is_none());
+        app.worker_event(WorkerEvent::NetworkBack(key.clone(), true).for_launch(&key, generation));
+        assert_eq!(app.launches.as_ref().unwrap().len(), 1, "at most once");
+        // The re-issued Play is an ordinary Play: its own failure queues nothing more.
+        app.accounts[0].busy = true;
+        app.accounts[0].launch_trigger = Some(launch_timing::LaunchTrigger::ReissuedPlay);
+        app.worker_event(WorkerEvent::Complete(key.clone(), Err("The background session worker ended.".into())));
+        assert_eq!(app.launches.as_ref().unwrap().len(), 1);
+        assert!(app.accounts[0].network_wait.is_none());
+    }
+
+    /// Finding: a pre-sign-in that took the row's one-time code never re-issues its queued
+    /// Play (or retries a startup sign-in) by itself: the code is spent, and a second login
+    /// without one is refused at Square Enix. The row asks for a new code instead; a code typed
+    /// since makes the re-issue safe again.
+    #[test]
+    fn a_failed_signin_that_spent_its_one_time_code_is_never_reissued() {
+        let mut app = app();
+        app.preview = false;
+        app.launches = Some(Vec::new());
+        let key = app.accounts[0].key.clone();
+        let clicked = Instant::now();
+        let network = "Game loader error during startup: Native PlayOnline login failed (state 39, POL result -19). (Windower via crystal-loader).";
+        for (failure, trigger) in [(network, launch_timing::LaunchTrigger::Connect), ("The background session worker ended before starting the game.", launch_timing::LaunchTrigger::Connect),
+            (network, launch_timing::LaunchTrigger::StartupSignIn)] {
+            let row = &mut app.accounts[0];
+            row.busy = true;
+            row.preparing_session = true;
+            row.queued_play = (trigger != launch_timing::LaunchTrigger::StartupSignIn).then_some(clicked);
+            row.launch_trigger = Some(trigger);
+            row.otp_spent = true;
+            app.worker_event(WorkerEvent::Complete(key.clone(), Err(failure.to_owned())));
+            let row = &app.accounts[0];
+            assert!(row.network_wait.is_none() && row.queued_play.is_none(), "{failure}");
+            assert!(row.status.ends_with("That one-time code was used. Enter a new one, then press Play."), "{}", row.status);
+        }
+        assert!(app.launches.as_ref().unwrap().is_empty(), "no automatic login without a code");
+        // A new code typed since: the re-issue may use it.
+        let row = &mut app.accounts[0];
+        (row.busy, row.preparing_session, row.queued_play, row.otp) = (true, true, Some(clicked), "123456".into());
+        app.worker_event(WorkerEvent::Complete(key.clone(), Err("The background session worker ended before starting the game.".into())));
+        assert_eq!(app.launches.as_ref().unwrap().len(), 1);
+    }
+
+    /// Finding: a host lost after the pre-sign-in reached authentication had its login taken;
+    /// its queued Play is not re-issued as a second login by itself.
+    #[test]
+    fn a_transient_failure_after_authentication_is_not_reissued() {
+        let mut app = app();
+        app.preview = false;
+        app.launches = Some(Vec::new());
+        let root = std::env::temp_dir().join(format!("crystal-reissue-auth-{}", crate::backend::unique_id().unwrap()));
+        app.config = crate::backend::Config { experiment: root.clone(), repository: root.clone(), game_install: None, dat_overlays: Vec::new() };
+        let key = app.accounts[0].key.clone();
+        let row = &mut app.accounts[0];
+        (row.busy, row.preparing_session, row.queued_play) = (true, true, Some(Instant::now()));
+        let config = app.settings.config_for(&app.config, &app.accounts[0].account);
+        session_worker::save_authenticated_record_for_test(&config, &app.accounts[0].account);
+        app.worker_event(WorkerEvent::Complete(key, Err("Game exited during startup (Windower via crystal-loader).".into())));
+        assert!(app.launches.as_ref().unwrap().is_empty(), "the login was already taken");
+        assert!(app.accounts[0].queued_play.is_none() && app.accounts[0].network_wait.is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Finding: once the probe gives up, the row stops promising a retry.
+    #[test]
+    fn a_probe_that_gives_up_takes_back_the_retry_promise() {
+        let mut app = app();
+        app.preview = false;
+        app.launches = Some(Vec::new());
+        let key = app.accounts[0].key.clone();
+        let network = "Game loader error during startup: Native PlayOnline login failed (state 39, POL result -19). (Windower via crystal-loader).";
+        let row = &mut app.accounts[0];
+        (row.busy, row.preparing_session, row.launch_trigger) = (true, true, Some(launch_timing::LaunchTrigger::StartupSignIn));
+        app.worker_event(WorkerEvent::Complete(key.clone(), Err(network.into())));
+        assert!(app.accounts[0].status.ends_with("Crystal will try again when the network is back."));
+        let generation = app.accounts[0].launch_generation;
+        app.worker_event(WorkerEvent::NetworkBack(key.clone(), false).for_launch(&key, generation));
+        let status = &app.accounts[0].status;
+        assert!(!status.contains("Crystal will try again") && status.starts_with(network)
+            && status.ends_with("The network did not come back. Sign in again once it is."), "{status}");
+    }
+
+    /// 07d §5.5 step 3: a startup sign-in that failed on the network starts once more, as a
+    /// startup retry, when the probe sees the network; a non-network failure never does, and
+    /// neither does a probe that gave up or a row the user started meanwhile.
+    #[test]
+    fn a_startup_signin_that_failed_on_the_network_retries_once_when_it_returns() {
+        let mut app = app();
+        app.preview = false;
+        app.launches = Some(Vec::new());
+        let key = app.accounts[0].key.clone();
+        app.settings.account_no_otp.insert(key.clone());
+        let fail = |app: &mut App, trigger, error: &str| {
+            app.accounts[0].busy = true;
+            app.accounts[0].preparing_session = true;
+            app.accounts[0].launch_trigger = Some(trigger);
+            app.worker_event(WorkerEvent::Complete(app.accounts[0].key.clone(), Err(error.to_owned())));
+        };
+        let network = "Game loader error during startup: Native PlayOnline login failed (state 39, POL result -19). (Windower via crystal-loader).";
+        fail(&mut app, launch_timing::LaunchTrigger::StartupSignIn, "Sign-in failed");
+        assert!(app.accounts[0].network_wait.is_none());
+        fail(&mut app, launch_timing::LaunchTrigger::Connect, network);
+        assert!(app.accounts[0].network_wait.is_none(), "only the startup sign-in retries by itself");
+        fail(&mut app, launch_timing::LaunchTrigger::StartupSignIn, network);
+        assert_eq!(app.accounts[0].network_wait, Some(NetworkWait::StartupRetry));
+        let generation = app.accounts[0].launch_generation;
+        app.worker_event(WorkerEvent::NetworkBack(key.clone(), false).for_launch(&key, generation));
+        assert!(app.launches.as_ref().unwrap().is_empty() && app.accounts[0].network_wait.is_none(), "the probe gave up");
+        fail(&mut app, launch_timing::LaunchTrigger::StartupSignIn, network);
+        app.worker_event(WorkerEvent::NetworkBack(key.clone(), true).for_launch(&key, generation));
+        let launches = app.launches.as_ref().unwrap();
+        assert_eq!(launches.len(), 1);
+        assert_eq!((&launches[0].0, launches[0].1, launches[0].3), (&vec![key.clone()], true, Some(launch_timing::LaunchTrigger::StartupRetry)));
+        // The retry failing on the network again is not retried.
+        fail(&mut app, launch_timing::LaunchTrigger::StartupRetry, network);
+        assert!(app.accounts[0].network_wait.is_none());
+        // A row the user started meanwhile keeps its own launch.
+        fail(&mut app, launch_timing::LaunchTrigger::StartupSignIn, network);
+        app.accounts[0].busy = true;
+        app.worker_event(WorkerEvent::NetworkBack(key.clone(), true).for_launch(&key, generation));
+        assert_eq!(app.launches.as_ref().unwrap().len(), 1);
+    }
+
+    /// 07d §1.5 "Who": retail accounts with a tool plan and no session of any kind; pre-signed
+    /// accounts not while they are to sign in (here: when Crystal opens), OTP accounts and
+    /// unknown ones too.
+    #[test]
+    fn park_eligibility_excludes_startup_and_busy_accounts_but_not_otp_ones() {
+        let mut app = app();
+        app.settings.account_no_otp.insert(app.accounts[1].key.clone());
+        app.startup_signin_pending = true;
+        app.accounts[2].otp = "123456".into();
+        assert_eq!(app.park_keys().len(), 2);
+        app.accounts[0].busy = true;
+        let keys: Vec<String> = app.park_keys().into_iter().map(|(row, ..)| row).collect();
+        assert_eq!(keys, vec![app.accounts[2].key.clone()]);
+        let (_, key, plan) = app.park_keys().remove(0);
+        assert_eq!((key.tool, key.profile.as_str(), plan.tool), ("Windower 4", "", pol_less::Tool::Windower));
+        app.accounts[2].pid = Some(77);
+        assert!(app.park_keys().is_empty(), "a running session is never parked beside");
+        app.accounts[2].pid = None;
+        app.accounts[2].account.mode = AccountMode::Private;
+        assert!(app.park_keys().is_empty());
+    }
+
+    /// 07d §1.5 "Kill": parked hosts close while files change (polcore.dll is loaded in a parked
+    /// pol.exe), before the profile editor and on exit; none park before the startup sign-ins.
+    #[test]
+    fn parks_close_while_files_change_and_on_exit() {
+        let mut app = app();
+        app.preview = false;
+        app.config.experiment = std::env::temp_dir().join(format!("crystal-park-close-{}", backend::unique_id().unwrap()));
+        let park = |app: &mut App| {
+            let (account, row) = (app.accounts[0].account.clone(), app.accounts[0].key.clone());
+            let plan = app.settings.launch_plan(&account).unwrap();
+            // A stand-in worker that exits once its stdin closes.
+            let worker = session_worker::spawn_test_park(std::process::Command::new("sort"), &app.config, &account, &plan).unwrap();
+            app.parks.insert(pol_less::park::ParkKey::for_plan(&account, &plan), row, Default::default(), worker);
+            assert!(!app.parks.is_empty());
+        };
+        park(&mut app);
+        // A read-only installation scan keeps the parked host (a Play right after it stays warm).
+        app.installation_loading = true;
+        app.tend_parks(Instant::now());
+        assert!(!app.parks.is_empty(), "an installation scan changes no files");
+        app.installation_loading = false;
+        // Files really changing close it.
+        app.reshade.busy = true;
+        app.park_tended = None;
+        app.tend_parks(Instant::now());
+        assert!(app.parks.is_empty(), "closed while files change");
+        app.reshade.busy = false;
+        park(&mut app);
+        let _ = app.update(Message::EditWindowerProfiles);
+        assert!(app.parks.is_empty(), "the profile editor needs the profile guard");
+        app.windower_editor_open = false;
+        park(&mut app);
+        let _ = app.update(Message::CloseRequested);
+        assert!(app.parks.is_empty(), "closed on exit");
+        // Nothing parks before the startup sign-ins were issued, nor in previews.
+        app.startup_issued = None;
+        app.tend_parks(Instant::now() + Duration::from_secs(60));
+        assert!(app.parks.is_empty());
+    }
+
+    /// 07d §5.5 steps 1-2 (08 §1 row 9): a startup key whose row is still busy with the
+    /// previous session stays pending with a status, starts once the row is free, and is
+    /// skipped with a status after STARTUP_WAIT_LIMIT. An idle signed-in session needs nothing.
+    #[test]
+    fn startup_signin_waits_for_a_closing_session_then_starts_or_is_skipped() {
+        let mut app = app();
+        app.preview = false;
+        app.config.experiment = std::env::temp_dir().join(format!("crystal-startup-wait-{}", backend::unique_id().unwrap()));
+        app.startup_signin_pending = true;
+        let keys: Vec<String> = app.accounts.iter().map(|row| row.key.clone()).collect();
+        app.settings.account_no_otp = keys.iter().cloned().collect();
+        app.accounts[0].busy = true; // the previous game's host is still closing
+        app.accounts[1].pid = Some(77);
+        app.accounts[1].game_running = Some(Arc::new(AtomicBool::new(false))); // signed in and idle
+        app.accounts[2].account.mode = AccountMode::Private;
+        assert!(app.take_startup_signins().is_empty());
+        assert!(app.startup_issued.is_some());
+        assert_eq!(app.startup_waiting.iter().map(|(key, _)| key.clone()).collect::<Vec<_>>(), vec![keys[0].clone()]);
+        assert_eq!(app.accounts[0].status, "Startup sign-in waits for the previous session to end.");
+        let now = Instant::now();
+        assert!(app.take_waiting_startups(now).is_empty(), "still busy");
+        app.accounts[0].busy = false;
+        assert_eq!(app.take_waiting_startups(now), vec![keys[0].clone()]);
+        assert!(app.startup_waiting.is_empty());
+        // Skipped after the limit.
+        app.accounts[0].busy = true;
+        app.startup_waiting = vec![(keys[0].clone(), now)];
+        assert!(app.take_waiting_startups(now + STARTUP_WAIT_LIMIT - Duration::from_secs(1)).is_empty());
+        assert_eq!(app.startup_waiting.len(), 1);
+        assert!(app.take_waiting_startups(now + STARTUP_WAIT_LIMIT).is_empty());
+        assert!(app.startup_waiting.is_empty());
+        assert_eq!(app.accounts[0].status, "Startup sign-in skipped: a session is still running.");
+    }
+
+    /// Owner decision 2026-10-12: a test app whose first account signs in when Crystal opens
+    /// (2026-10-13: it is known to sign in without a one-time code; the switch is on by default).
+    fn resign_app(name: &str) -> (App, String) {
+        let mut app = app();
+        app.preview = false;
+        app.launches = Some(Vec::new());
+        app.config.experiment = std::env::temp_dir().join(format!("crystal-{name}-{}", backend::unique_id().unwrap()));
+        let key = app.accounts[0].key.clone();
+        assert!(app.settings.auto_sign_in);
+        app.settings.account_no_otp.insert(key.clone());
+        (app, key)
+    }
+
+    /// Row `index` runs its game (seen on a Tick), then the session ends with `report`.
+    fn game_ends(app: &mut App, index: usize, report: launch_log::ExitReport) {
+        let alive = Arc::new(AtomicBool::new(true));
+        let row = &mut app.accounts[index];
+        row.pid = Some(77);
+        row.alive = Some(alive.clone());
+        row.game_running = Some(Arc::new(AtomicBool::new(true)));
+        row.outcome = Some(Arc::new(std::sync::Mutex::new(Some(report))));
+        let _ = app.update(Message::Tick);
+        assert!(app.accounts[index].game_seen);
+        alive.store(false, Ordering::Release);
+        let _ = app.update(Message::Tick);
+        assert!(app.accounts[index].pid.is_none());
+    }
+
+    fn signed_out() -> launch_log::ExitReport { launch_log::classify_loader_end(&launch_log::LoaderEnd::SignedOut, Duration::from_secs(900)) }
+
+    /// After a normal quit (or FFXI's usual -14) the account signs back in, as a pre-sign-in
+    /// named "sign-in after game", only once its row has been free for RESIGN_DELAY (≥ 3 s).
+    /// The row says so, and a Play during that sign-in queues behind it (07d §5.4).
+    #[test]
+    fn a_startup_account_signs_back_in_after_its_game_closes_after_the_delay() {
+        assert!(RESIGN_DELAY >= Duration::from_secs(3), "human-plausible: no instant sign-in after a sign-out");
+        for end in [launch_log::LoaderEnd::SignedOut, launch_log::LoaderEnd::Exit(-14)] {
+            let (mut app, key) = resign_app("resign");
+            game_ends(&mut app, 0, launch_log::classify_loader_end(&end, Duration::from_secs(900)));
+            let resign = app.accounts[0].resign.expect("pending");
+            assert!(!resign.network && resign.free_since.is_some(), "{end:?}");
+            assert!(app.accounts[0].status.ends_with("Signing back in after the game closed."), "{}", app.accounts[0].status);
+            assert!(app.launches.as_ref().unwrap().is_empty(), "not at once");
+            let free = resign.free_since.unwrap();
+            assert!(app.take_resigns(free + RESIGN_DELAY - Duration::from_millis(1)).is_empty());
+            let keys = app.take_resigns(free + RESIGN_DELAY);
+            assert_eq!(keys, vec![key.clone()]);
+            assert!(app.accounts[0].resign.is_none());
+            app.start_resigns(keys, launch_timing::LaunchTrigger::SignInAfterGame);
+            let launches = app.launches.as_ref().unwrap();
+            assert_eq!((&launches[0].0, launches[0].1, launches[0].3), (&vec![key.clone()], true, Some(launch_timing::LaunchTrigger::SignInAfterGame)));
+            assert!(app.take_resigns(free + RESIGN_DELAY * 2).is_empty(), "once");
+        }
+        // The sign-in in flight: its progress says so, and a Play queues on it.
+        let (mut app, key) = resign_app("resign-play");
+        let row = &mut app.accounts[0];
+        (row.busy, row.preparing_session, row.launch_trigger) = (true, true, Some(launch_timing::LaunchTrigger::SignInAfterGame));
+        app.worker_event(WorkerEvent::Progress(key.clone(), "Signing in to PlayOnline…".into()));
+        assert_eq!(app.accounts[0].status, "Signing in to PlayOnline… · Signing back in after the game closed.");
+        app.launches = None;
+        let clicked = Instant::now();
+        app.start_mode_at(vec![key.clone()], false, clicked);
+        assert_eq!(app.accounts[0].queued_play, Some(clicked), "a queued Play, not a second sign-in");
+        app.worker_event(WorkerEvent::Progress(key, "Signing in to PlayOnline…".into()));
+        assert!(app.accounts[0].status.ends_with("FFXI will start when sign-in finishes."));
+        assert_eq!(launch_timing::LaunchTrigger::SignInAfterGame.line(), "launch trigger: sign-in after game");
+        // Two accounts start together, as the startup sign-ins do (their tool turns stagger them).
+        let (mut app, first) = resign_app("resign-two");
+        let second = app.accounts[1].key.clone();
+        app.settings.account_no_otp.insert(second.clone());
+        game_ends(&mut app, 0, signed_out());
+        game_ends(&mut app, 1, signed_out());
+        let keys = app.take_resigns(Instant::now() + RESIGN_DELAY);
+        app.start_resigns(keys, launch_timing::LaunchTrigger::SignInAfterGame);
+        assert_eq!(app.launches.as_ref().unwrap()[0].0, vec![first, second]);
+    }
+
+    /// No sign-in after a game for an OTP account (its code is spent), with the setting off or
+    /// turned off meanwhile, after an explicit sign-out or an account edit, after a worker that
+    /// vanished (its host may live on), or once the user started something during the delay.
+    #[test]
+    fn no_sign_in_after_game_for_otp_setting_off_sign_out_edit_or_a_users_launch() {
+        let (mut app, key) = resign_app("resign-none");
+        let pending = |app: &App| app.accounts[0].resign.is_some();
+        app.accounts[0].otp_spent = true;
+        game_ends(&mut app, 0, signed_out());
+        assert!(!pending(&app));
+        app.accounts[0].otp_spent = false;
+        app.accounts[0].otp = "123456".into();
+        game_ends(&mut app, 0, signed_out());
+        assert!(!pending(&app), "a typed code is for the user's Play");
+        app.accounts[0].otp.clear();
+        game_ends(&mut app, 0, launch_log::ExitReport::worker_ended());
+        assert!(!pending(&app));
+        let _ = app.update(Message::AutoSignIn(false));
+        game_ends(&mut app, 0, signed_out());
+        assert!(!pending(&app), "setting off");
+        let _ = app.update(Message::AutoSignIn(true));
+        // Turned off during the delay.
+        game_ends(&mut app, 0, signed_out());
+        assert!(pending(&app));
+        let _ = app.update(Message::AutoSignIn(false));
+        assert!(app.take_resigns(Instant::now() + RESIGN_DELAY).is_empty());
+        assert!(!pending(&app) && !app.accounts[0].status.contains("Signing back in"), "{}", app.accounts[0].status);
+        let _ = app.update(Message::AutoSignIn(true));
+        // The account learned to need a code during the delay.
+        game_ends(&mut app, 0, signed_out());
+        assert!(pending(&app));
+        app.settings.note_sign_in(&key, true);
+        assert!(app.take_resigns(Instant::now() + RESIGN_DELAY).is_empty() && !pending(&app));
+        app.settings.note_sign_in(&key, false);
+        // The user's own Play during the delay wins.
+        game_ends(&mut app, 0, signed_out());
+        app.accounts[0].launch_generation += 1;
+        assert!(app.take_resigns(Instant::now() + RESIGN_DELAY).is_empty() && !pending(&app));
+        // An explicit sign-out while the session runs.
+        app.friends.account = Some(key.clone());
+        let alive = Arc::new(AtomicBool::new(true));
+        let row = &mut app.accounts[0];
+        (row.pid, row.alive, row.game_running) = (Some(77), Some(alive.clone()), Some(Arc::new(AtomicBool::new(true))));
+        let _ = app.update(Message::Tick);
+        let _ = app.update(Message::FriendsSignOut);
+        alive.store(false, Ordering::Release);
+        let _ = app.update(Message::Tick);
+        assert!(!pending(&app) && !app.accounts[0].resign_declined);
+        // An edit while pending.
+        game_ends(&mut app, 0, signed_out());
+        assert!(pending(&app));
+        app.accounts[0].decline_resign();
+        assert!(!pending(&app) && !app.accounts[0].resign_declined, "no session to decline");
+        // An edit saved while the game runs.
+        let alive = Arc::new(AtomicBool::new(true));
+        let row = &mut app.accounts[0];
+        (row.pid, row.alive, row.game_running) = (Some(77), Some(alive.clone()), Some(Arc::new(AtomicBool::new(true))));
+        let _ = app.update(Message::Tick);
+        let _ = app.update(Message::EditAccount(key.clone()));
+        let saved = app.accounts.iter().map(|r| r.account.clone()).collect();
+        let _ = app.update(Message::AccountsSaved(Ok(saved)));
+        assert!(app.accounts[0].resign_declined && app.settings.presigns(&key), "an edit of the same login keeps what was learned");
+        alive.store(false, Ordering::Release);
+        let _ = app.update(Message::Tick);
+        assert!(!pending(&app));
+        assert!(app.launches.as_ref().unwrap().is_empty());
+        // A session that never ran its game (an idle sign-out) is no game end.
+        let row = &mut app.accounts[0];
+        let alive = Arc::new(AtomicBool::new(true));
+        (row.pid, row.alive, row.game_running) = (Some(77), Some(alive.clone()), Some(Arc::new(AtomicBool::new(false))));
+        let _ = app.update(Message::Tick);
+        alive.store(false, Ordering::Release);
+        let _ = app.update(Message::Tick);
+        assert!(!pending(&app));
+        let _ = std::fs::remove_dir_all(&app.config.experiment);
+    }
+
+    /// A crash or error first has the probe check the network (a connection loss waits for it
+    /// to return); a sign-in after a game that fails on the network retries once when it is
+    /// back, and never again; any other failure is not retried; a probe that gives up drops it.
+    #[test]
+    fn an_unclean_game_end_waits_for_the_network_and_a_failed_sign_in_after_game_never_loops() {
+        let (mut app, key) = resign_app("resign-network");
+        let network = "Game loader error during startup: Native PlayOnline login failed (state 39, POL result -19). (Windower via crystal-loader).";
+        let error = launch_log::classify_loader_end(&launch_log::LoaderEnd::Error("PlayOnline session ended (POL result -1025). Sign in again to reconnect.".into()), Duration::from_secs(900));
+        game_ends(&mut app, 0, error.clone());
+        assert_eq!(app.accounts[0].network_wait, Some(NetworkWait::AfterGame));
+        assert!(app.accounts[0].resign.unwrap().network);
+        assert!(app.take_resigns(Instant::now() + RESIGN_DELAY * 2).is_empty(), "not before the network");
+        let generation = app.accounts[0].launch_generation;
+        app.worker_event(WorkerEvent::NetworkBack(key.clone(), true).for_launch(&key, generation));
+        assert!(!app.accounts[0].resign.unwrap().network);
+        assert!(app.launches.as_ref().unwrap().is_empty());
+        assert!(app.take_resigns(Instant::now()).is_empty(), "the delay still applies");
+        let keys = app.take_resigns(Instant::now() + RESIGN_DELAY);
+        app.start_resigns(keys, launch_timing::LaunchTrigger::SignInAfterGame);
+        assert_eq!(app.launches.as_ref().unwrap().len(), 1);
+        let fail = |app: &mut App, trigger, error: &str| {
+            let row = &mut app.accounts[0];
+            (row.busy, row.preparing_session, row.launch_trigger) = (true, true, Some(trigger));
+            app.worker_event(WorkerEvent::Complete(app.accounts[0].key.clone(), Err(error.to_owned())));
+        };
+        fail(&mut app, launch_timing::LaunchTrigger::SignInAfterGame, "Sign-in failed");
+        assert!(app.accounts[0].network_wait.is_none(), "not a network failure");
+        fail(&mut app, launch_timing::LaunchTrigger::SignInAfterGame, network);
+        assert_eq!(app.accounts[0].network_wait, Some(NetworkWait::AfterGameRetry));
+        app.worker_event(WorkerEvent::NetworkBack(key.clone(), true).for_launch(&key, generation));
+        let launches = app.launches.as_ref().unwrap();
+        assert_eq!((launches.len(), launches[1].1, launches[1].3), (2, true, Some(launch_timing::LaunchTrigger::SignInAfterGameRetry)));
+        fail(&mut app, launch_timing::LaunchTrigger::SignInAfterGameRetry, network);
+        assert!(app.accounts[0].network_wait.is_none() && app.accounts[0].resign.is_none(), "no loop");
+        assert_eq!(app.launches.as_ref().unwrap().len(), 2);
+        // The network never came back.
+        game_ends(&mut app, 0, error);
+        app.worker_event(WorkerEvent::NetworkBack(key.clone(), false).for_launch(&key, generation));
+        assert!(app.accounts[0].resign.is_none() && app.accounts[0].network_wait.is_none());
+        assert!(app.accounts[0].status.ends_with("The network did not come back. Sign in again once it is."), "{}", app.accounts[0].status);
+        assert!(app.take_resigns(Instant::now() + RESIGN_DELAY).is_empty());
+        assert_eq!(app.launches.as_ref().unwrap().len(), 2);
+    }
+
+    /// Accounts that are not pre-signed (not yet known to sign in without a code, or OTP ones)
+    /// keep round 2: nothing signs in after their game, and their key is parked again once the
+    /// session has ended (07d §1.5 "Re-park"). A pre-signed account is not parked while its
+    /// sign-in after the game is coming.
+    #[test]
+    fn accounts_without_the_setting_still_re_park_after_their_game() {
+        let (mut app, presigned) = resign_app("resign-park");
+        let parked = app.accounts[1].key.clone();
+        game_ends(&mut app, 1, signed_out());
+        assert!(app.accounts[1].resign.is_none() && app.accounts[1].status == "Game closed normally");
+        assert!(app.park_keys().iter().any(|(row, ..)| *row == parked));
+        game_ends(&mut app, 0, signed_out());
+        assert!(app.accounts[0].resign.is_some());
+        assert!(!app.park_keys().iter().any(|(row, ..)| *row == presigned), "its sign-in after the game is coming");
+        assert!(app.launches.as_ref().unwrap().is_empty());
+    }
+
+    /// Review finding (2026-10-13): a known code-less account that Crystal will not sign in by
+    /// itself now parks like any other, so its next Play starts warm: after a sign-in after its
+    /// game that a maintenance refused, a sign-out (`decline_resign`), or a startup sign-in that
+    /// failed. While a pre-sign-in is coming (startup sign-ins still to be taken, one waiting for
+    /// a closing session, a sign-in after its game, either's network retry) it does not.
+    #[test]
+    fn a_pre_signed_account_with_no_sign_in_coming_parks() {
+        let (mut app, key) = resign_app("presign-park");
+        let parks = |app: &App| app.park_keys().iter().any(|(row, ..)| *row == key);
+        assert!(app.presigned(&key) && parks(&app), "idle, signed out, nothing coming");
+        app.startup_signin_pending = true;
+        assert!(!parks(&app), "before the startup sign-ins are taken");
+        app.startup_signin_pending = false;
+        app.startup_waiting.push((key.clone(), Instant::now()));
+        assert!(!parks(&app), "a startup sign-in waits for a closing session");
+        app.startup_waiting.clear();
+        for wait in [NetworkWait::StartupRetry, NetworkWait::AfterGame, NetworkWait::AfterGameRetry] {
+            app.accounts[0].network_wait = Some(wait);
+            assert!(!parks(&app), "{wait:?}");
+        }
+        app.accounts[0].network_wait = None;
+        // A sign-in after its game is pending, then dropped: a maintenance refused it.
+        game_ends(&mut app, 0, signed_out());
+        assert!(app.accounts[0].resign.is_some() && !parks(&app));
+        app.accounts[0].drop_resign();
+        assert!(parks(&app), "nothing is coming now: its next Play starts warm");
+        // A code on the row (the user's, for their own Play): Crystal does not sign it in either.
+        app.accounts[0].otp = "123456".into();
+        app.startup_signin_pending = true;
+        assert!(parks(&app));
+        let _ = std::fs::remove_dir_all(&app.config.experiment);
+    }
+
+    fn session_lost() -> launch_log::ExitReport {
+        launch_log::classify_loader_end(&launch_log::LoaderEnd::Error("PlayOnline session ended (POL result -1025). Sign in again to reconnect.".into()), Duration::from_secs(900))
+    }
+
+    /// Review finding: a connection loss longer than STARTUP_WAIT_LIMIT still signs back in when
+    /// the network returns (the probe waits up to NETWORK_PROBE_LIMIT); only a probe that never
+    /// reports is given up, after that limit.
+    #[test]
+    fn a_long_connection_loss_still_signs_back_in_when_the_network_returns() {
+        let (mut app, key) = resign_app("resign-long-outage");
+        game_ends(&mut app, 0, session_lost());
+        let ended = app.accounts[0].resign.unwrap().ended;
+        assert!(app.take_resigns(ended + STARTUP_WAIT_LIMIT + Duration::from_secs(1)).is_empty());
+        assert!(app.accounts[0].resign.is_some() && app.accounts[0].network_wait == Some(NetworkWait::AfterGame), "still waiting for the probe");
+        let generation = app.accounts[0].launch_generation;
+        app.worker_event(WorkerEvent::NetworkBack(key.clone(), true).for_launch(&key, generation));
+        let now = Instant::now();
+        assert!(app.take_resigns(now).is_empty(), "the delay still applies");
+        assert_eq!(app.take_resigns(now + RESIGN_DELAY), vec![key.clone()]);
+        // A probe that never reports.
+        game_ends(&mut app, 0, session_lost());
+        let ended = app.accounts[0].resign.unwrap().ended;
+        assert!(app.take_resigns(ended + session_worker::NETWORK_PROBE_LIMIT).is_empty());
+        assert!(app.accounts[0].resign.is_some());
+        assert!(app.take_resigns(ended + session_worker::NETWORK_PROBE_LIMIT + STARTUP_WAIT_LIMIT).is_empty());
+        assert!(app.accounts[0].resign.is_none() && app.accounts[0].network_wait.is_none());
+    }
+
+    /// Review finding: Crystal opened during the game queues its startup sign-in for the end of
+    /// that session; the game's close makes it the delayed "sign-in after game", never a startup
+    /// sign-in one Tick after the sign-out.
+    #[test]
+    fn a_startup_sign_in_waiting_on_the_game_becomes_the_delayed_sign_in_after_it() {
+        let (mut app, key) = resign_app("resign-waiting");
+        app.startup_waiting.push((key.clone(), Instant::now()));
+        game_ends(&mut app, 0, signed_out());
+        assert!(app.startup_waiting.is_empty() && app.accounts[0].resign.is_some());
+        let _ = app.update(Message::Tick);
+        assert!(app.launches.as_ref().unwrap().is_empty(), "no sign-in right after the sign-out");
+        let keys = app.take_resigns(Instant::now() + RESIGN_DELAY);
+        app.start_resigns(keys, launch_timing::LaunchTrigger::SignInAfterGame);
+        let launches = app.launches.as_ref().unwrap();
+        assert_eq!((&launches[0].0, launches[0].3), (&vec![key], Some(launch_timing::LaunchTrigger::SignInAfterGame)));
+    }
+
+    /// Review finding: during a known maintenance or outage nothing signs back in by itself:
+    /// not after the game, not pending, not as the network retry.
+    #[test]
+    fn no_sign_in_after_game_during_maintenance_or_an_outage() {
+        let outage = |app: &mut App, on: bool| {
+            let snapshot = app.services.as_mut().unwrap();
+            snapshot.availability = if on { services::Availability::Outage } else { services::Availability::Unknown };
+            snapshot.checked_at = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC").to_string();
+            snapshot.notices.clear();
+        };
+        let (mut app, key) = resign_app("resign-outage");
+        outage(&mut app, true);
+        game_ends(&mut app, 0, signed_out());
+        assert!(app.accounts[0].resign.is_none());
+        outage(&mut app, false);
+        game_ends(&mut app, 0, signed_out());
+        assert!(app.accounts[0].resign.is_some());
+        outage(&mut app, true);
+        assert!(app.take_resigns(Instant::now() + RESIGN_DELAY).is_empty() && app.accounts[0].resign.is_none());
+        app.accounts[0].network_wait = Some(NetworkWait::AfterGameRetry);
+        let generation = app.accounts[0].launch_generation;
+        app.worker_event(WorkerEvent::NetworkBack(key.clone(), true).for_launch(&key, generation));
+        assert!(app.launches.as_ref().unwrap().is_empty());
+    }
+
+    /// 2026-10-13 05:08:17 UTC: the sign-in after the game ran during All Worlds Maintenance
+    /// because the status page still showed the worlds up. The window refuses it now, and the
+    /// row says why; an early end (all up 15+ minutes into the window) allows it again.
+    #[test]
+    fn no_sign_in_after_game_during_an_official_maintenance_window() {
+        let (mut app, key) = resign_app("resign-window");
+        status_read(&mut app, services::Availability::Operational, Some(Duration::from_secs(8 * 60)));
+        assert!(!app.resign_allowed(&key));
+        game_ends(&mut app, 0, signed_out());
+        let row = &app.accounts[0];
+        assert!(row.resign.is_none());
+        assert!(row.status.contains("No sign-in after the game while the worlds are down.") && row.status.contains("All Worlds Maintenance (Oct. 12)"), "{}", row.status);
+        // Pending when the window starts: dropped with the note.
+        status_read(&mut app, services::Availability::Operational, None);
+        game_ends(&mut app, 0, signed_out());
+        assert!(app.accounts[0].resign.is_some());
+        status_read(&mut app, services::Availability::Operational, Some(Duration::from_secs(60)));
+        assert!(app.take_resigns(Instant::now() + RESIGN_DELAY).is_empty() && app.accounts[0].resign.is_none());
+        assert!(app.accounts[0].status.contains("No sign-in after the game while the worlds are down."), "{}", app.accounts[0].status);
+        assert!(!app.accounts[0].status.contains("Signing back in"), "{}", app.accounts[0].status);
+        // The network retry is refused the same way.
+        app.accounts[0].network_wait = Some(NetworkWait::AfterGameRetry);
+        let generation = app.accounts[0].launch_generation;
+        app.worker_event(WorkerEvent::NetworkBack(key.clone(), true).for_launch(&key, generation));
+        // Ended early: the page shows every world up 20 minutes in.
+        status_read(&mut app, services::Availability::Operational, Some(Duration::from_secs(20 * 60)));
+        assert!(app.resign_allowed(&key));
+        // The maintenance icon past the window's end still refuses.
+        status_read(&mut app, services::Availability::Maintenance, None);
+        assert!(!app.resign_allowed(&key));
+        assert!(app.launches.as_ref().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&app.config.experiment);
+    }
+
+    /// Review finding: an account edit also cancels the pending network retry of a failed
+    /// sign-in after the game, and an edit whose settings save failed still declines.
+    #[test]
+    fn an_edit_cancels_a_network_retry_and_a_failed_settings_save_still_declines() {
+        let network = "Game loader error during startup: Native PlayOnline login failed (state 39, POL result -19). (Windower via crystal-loader).";
+        let (mut app, key) = resign_app("resign-retry-edit");
+        let row = &mut app.accounts[0];
+        (row.busy, row.preparing_session, row.launch_trigger) = (true, true, Some(launch_timing::LaunchTrigger::SignInAfterGame));
+        app.worker_event(WorkerEvent::Complete(key.clone(), Err(network.into())));
+        assert_eq!(app.accounts[0].network_wait, Some(NetworkWait::AfterGameRetry));
+        let _ = app.update(Message::EditAccount(key.clone()));
+        let saved: Vec<Account> = app.accounts.iter().map(|r| r.account.clone()).collect();
+        let _ = app.update(Message::AccountsSaved(Ok(saved.clone())));
+        assert!(app.accounts[0].network_wait.is_none());
+        assert!(!app.accounts[0].status.contains("Crystal will try again"), "{}", app.accounts[0].status);
+        let generation = app.accounts[0].launch_generation;
+        app.worker_event(WorkerEvent::NetworkBack(key.clone(), true).for_launch(&key, generation));
+        assert!(app.launches.as_ref().unwrap().is_empty());
+        // The settings save fails (a file where its folder belongs).
+        game_ends(&mut app, 0, signed_out());
+        assert!(app.accounts[0].resign.is_some());
+        std::fs::create_dir_all(&app.config.experiment).unwrap();
+        let _ = std::fs::remove_dir_all(app.config.experiment.join("iced-launcher"));
+        std::fs::write(app.config.experiment.join("iced-launcher"), b"").unwrap();
+        let _ = app.update(Message::EditAccount(key.clone()));
+        let _ = app.update(Message::AccountsSaved(Ok(saved)));
+        assert!(app.status.starts_with("Accounts saved, but launcher settings were not saved"), "{}", app.status);
+        assert!(app.accounts[0].resign.is_none());
+        assert!(app.take_resigns(Instant::now() + RESIGN_DELAY).is_empty());
+        assert!(app.launches.as_ref().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&app.config.experiment);
+    }
+
+    /// Review finding: an edit while pre-signed and idle declines nothing about a game started
+    /// from that session afterwards (a pre-signed Play): its end still signs back in.
+    #[test]
+    fn an_edit_before_the_game_still_signs_back_in_after_it() {
+        let (mut app, key) = resign_app("resign-edit-idle");
+        let (alive, game) = (Arc::new(AtomicBool::new(true)), Arc::new(AtomicBool::new(false)));
+        let row = &mut app.accounts[0];
+        (row.pid, row.alive, row.game_running) = (Some(77), Some(alive.clone()), Some(game.clone()));
+        let _ = app.update(Message::Tick);
+        let _ = app.update(Message::EditAccount(key.clone()));
+        let saved = app.accounts.iter().map(|r| r.account.clone()).collect();
+        let _ = app.update(Message::AccountsSaved(Ok(saved)));
+        assert!(app.accounts[0].resign_declined);
+        game.store(true, Ordering::Release);
+        let _ = app.update(Message::Tick);
+        assert!(app.accounts[0].game_seen && !app.accounts[0].resign_declined);
+        alive.store(false, Ordering::Release);
+        let _ = app.update(Message::Tick);
+        assert!(app.accounts[0].resign.is_some());
+        let _ = std::fs::remove_dir_all(&app.config.experiment);
+    }
+
+    /// Review finding: "fully ended" includes the host process. A session whose worker closed
+    /// while its loader still runs (a pipe failure) waits for the loader to exit.
+    #[test]
+    fn a_sign_in_after_game_waits_for_the_old_host_process_to_exit() {
+        let (mut app, key) = resign_app("resign-host");
+        RUNNING_HOSTS.with(|hosts| hosts.borrow_mut().push(77));
+        game_ends(&mut app, 0, signed_out());
+        let resign = app.accounts[0].resign.unwrap();
+        assert_eq!(resign.host, Some(77));
+        assert!(resign.free_since.is_none(), "host still running");
+        assert!(app.take_resigns(Instant::now() + RESIGN_DELAY * 2).is_empty());
+        RUNNING_HOSTS.with(|hosts| hosts.borrow_mut().clear());
+        let now = Instant::now();
+        assert!(app.take_resigns(now).is_empty());
+        assert_eq!(app.take_resigns(now + RESIGN_DELAY), vec![key]);
     }
 
     #[test]
@@ -5505,37 +8018,1190 @@ mod tests {
         assert!(app.receiver.try_recv().is_err(), "never start a second sign-in worker");
     }
 
+    /// A Play queued behind a pre-sign-in is re-checked when this window releases it: an outage
+    /// or maintenance begun since the click makes it wait for FFXI ("Wait and play") instead of
+    /// staying queued on the sign-in.
     #[test]
-    fn queued_play_remains_pending_during_confirmed_outage() {
+    fn a_queued_play_waits_at_release_when_downtime_began_since_its_click() {
+        for (page, window) in [(services::Availability::Outage, None), (services::Availability::Operational, Some(Duration::from_secs(60)))] {
+            let mut app = app();
+            app.preview = false;
+            let clicked = Instant::now() - Duration::from_secs(2);
+            let row = &mut app.accounts[0];
+            row.pid = Some(123);
+            row.alive = Some(Arc::new(AtomicBool::new(true)));
+            row.game_running = Some(Arc::new(AtomicBool::new(false)));
+            row.queued_play = Some(clicked);
+            status_read(&mut app, page, window);
+            assert_eq!(app.service_availability(), if window.is_some() { services::Availability::Maintenance } else { page });
+            app.start_queued_plays();
+            let row = &app.accounts[0];
+            assert!(row.queued_play.is_none(), "{page:?}");
+            assert!(!row.busy && !row.batch_pending && row.pid == Some(123));
+            assert_eq!(row.status, app.wait_headline());
+            assert!(app.is_waiting(&row.key) && app.status == row.status);
+            assert!(app.receiver.try_recv().is_err());
+            app.start_queued_plays();
+            assert!(app.accounts[0].queued_play.is_none(), "not re-queued");
+            assert_eq!(app.waiting_plays.len(), 1);
+        }
+    }
+
+    /// A fresh status read whose page shows `page`; with `window`, an official all-worlds
+    /// maintenance window that began that long ago covers now.
+    fn status_read(app: &mut App, page: services::Availability, window: Option<Duration>) {
+        let now = chrono::Utc::now();
+        let snapshot = app.services.as_mut().unwrap();
+        snapshot.availability = page;
+        snapshot.availability_note = "Official status page reports all 16 production worlds up.".into();
+        snapshot.notices.clear();
+        snapshot.windows = window.into_iter().map(|since| services::MaintenanceWindow {
+            title: "All Worlds Maintenance (Oct. 12)".into(),
+            start: now - chrono::Duration::from_std(since).unwrap(),
+            end: now + chrono::Duration::minutes(60),
+        }).collect();
+        snapshot.checked_at = now.format("%Y-%m-%d %H:%M:%S UTC").to_string();
+    }
+
+    /// 2026-10-13 05:07 UTC: Play clicked seconds after Crystal opened, during All Worlds
+    /// Maintenance, while the status page still showed the worlds up. The Play is held for the
+    /// first status read, which finds maintenance: it then waits for FFXI ("Wait and play"); a
+    /// sign-in only is never held.
+    #[test]
+    fn a_play_before_the_first_status_read_is_held_then_waits_during_maintenance() {
         let mut app = app();
         app.preview = false;
-        let clicked = Instant::now() - Duration::from_secs(2);
+        app.status_read_done = false;
+        let key = app.accounts[0].key.clone();
+        app.start_mode_at(vec![key.clone()], false, Instant::now());
+        assert_eq!(app.held_plays.len(), 1);
+        assert_eq!(app.accounts[0].status, "Checking whether FINAL FANTASY XI is up…");
+        assert_eq!(app.status, "Checking whether FINAL FANTASY XI is up…");
+        assert!(!app.accounts[0].busy && app.receiver.try_recv().is_err(), "nothing started");
+        app.start_mode_at(vec![key.clone()], false, Instant::now());
+        assert_eq!(app.held_plays.len(), 1, "a second click is the same held Play");
+        app.launches = Some(Vec::new());
+        let other = app.accounts[1].key.clone();
+        app.start_mode_at(vec![other.clone()], true, Instant::now());
+        assert_eq!(app.launches.as_ref().unwrap().len(), 1, "a sign-in only is not held");
+        app.launches = None;
+        // The read lands: the page still shows every world up, but the window covers now.
+        status_read(&mut app, services::Availability::Operational, Some(Duration::from_secs(7 * 60)));
+        let snapshot = app.services.clone().unwrap();
+        app.worker_event(WorkerEvent::Services(app.news_generation, i18n::current(), services::Update::Status(snapshot)));
+        assert!(app.status_read_done && app.held_plays.is_empty());
+        assert_eq!(app.service_availability(), services::Availability::Maintenance);
+        assert!(app.service_note().contains("All Worlds Maintenance (Oct. 12)") && app.service_note().contains("still shows the worlds up"));
+        let row = &app.accounts[0];
+        assert!(!row.busy && row.pid.is_none() && row.queued_play.is_none());
+        assert_eq!(row.status, "FFXI is down for maintenance. Starting as soon as it's back…");
+        assert!(app.is_waiting(&key) && app.status == row.status);
+        assert!(app.receiver.try_recv().is_err(), "no sign-in worker");
+    }
+
+    /// The held Play starts once the read finds the worlds up, on every path: a cold Play and
+    /// a Play queued behind a pre-sign-in in flight.
+    #[test]
+    fn a_held_play_starts_after_the_first_status_read_finds_the_worlds_up() {
+        let mut app = app();
+        app.preview = false;
+        app.status_read_done = false;
+        app.launches = Some(Vec::new());
+        let key = app.accounts[0].key.clone();
+        let clicked = Instant::now();
+        app.start_mode_at(vec![key.clone()], false, clicked);
+        assert!(app.launches.as_ref().unwrap().is_empty());
+        status_read(&mut app, services::Availability::Operational, None);
+        let snapshot = app.services.clone().unwrap();
+        let _ = app.update(Message::ServiceStatusLoaded(app.news_generation, i18n::current(), Ok(snapshot)));
+        assert_eq!(app.launches.as_ref().unwrap(), &vec![(vec![key.clone()], false, clicked, None)]);
+        assert_ne!(app.accounts[0].status, "Checking whether FINAL FANTASY XI is up…");
+        // Queued during a pre-sign-in: held, then queued on it with the original click.
+        let mut app = self::app();
+        app.preview = false;
+        app.status_read_done = false;
         let row = &mut app.accounts[0];
-        row.pid = Some(123);
+        (row.busy, row.preparing_session) = (true, true);
+        let clicked = Instant::now();
+        app.start_mode_at(vec![key.clone()], false, clicked);
+        assert!(app.accounts[0].queued_play.is_none() && app.held_plays.len() == 1);
+        status_read(&mut app, services::Availability::Operational, Some(Duration::from_secs(20 * 60)));
+        let snapshot = app.services.clone().unwrap();
+        let _ = app.update(Message::ServiceStatusLoaded(app.news_generation, i18n::current(), Ok(snapshot)));
+        assert_eq!(app.service_availability(), services::Availability::Operational, "ended early");
+        assert_eq!(app.accounts[0].queued_play, Some(clicked));
+    }
+
+    /// A read that fails or is slow never blocks: the held Play proceeds after STATUS_HOLD_LIMIT,
+    /// and later Plays are not held again.
+    #[test]
+    fn a_held_play_proceeds_when_the_first_status_read_times_out() {
+        let mut app = app();
+        app.preview = false;
+        app.status_read_done = false;
+        app.launches = Some(Vec::new());
+        let key = app.accounts[0].key.clone();
+        let clicked = Instant::now();
+        app.start_mode_at(vec![key.clone()], false, clicked);
+        let since = app.held_plays[0].since;
+        app.release_held_plays(since + STATUS_HOLD_LIMIT - Duration::from_millis(1));
+        assert!(app.launches.as_ref().unwrap().is_empty() && app.held_plays.len() == 1);
+        app.held_plays[0].since = Instant::now() - STATUS_HOLD_LIMIT;
+        let _ = app.update(Message::Tick);
+        assert!(app.held_plays.is_empty() && app.status_hold_spent && !app.status_read_done);
+        assert_eq!(app.launches.as_ref().unwrap()[0], (vec![key.clone()], false, clicked, None));
+        let second = app.accounts[1].key.clone();
+        app.start_mode_at(vec![second.clone()], false, clicked);
+        assert_eq!(app.launches.as_ref().unwrap()[1].0, vec![second], "not held again");
+        // A failed read releases at once.
+        let mut app = self::app();
+        app.preview = false;
+        app.status_read_done = false;
+        app.launches = Some(Vec::new());
+        app.start_mode_at(vec![key.clone()], false, clicked);
+        let _ = app.update(Message::ServiceStatusLoaded(app.news_generation, i18n::current(), Err("timed out".into())));
+        assert_eq!(app.launches.as_ref().unwrap().len(), 1);
+    }
+
+    /// Review findings: a held Play released into an account save, a deleted account, or a
+    /// paused launch was lost or left a blank row; a held Play let a launcher update restart.
+    #[test]
+    fn a_held_play_survives_saves_and_deletes_and_blocks_a_launcher_restart() {
+        let mut app = app();
+        app.preview = false;
+        app.status_read_done = false;
+        let (key, other) = (app.accounts[0].key.clone(), app.accounts[1].key.clone());
+        let before = app.accounts[0].status.clone();
+        app.status = "Ready.".into();
+        assert!(app.can_restart_launcher());
+        app.start_mode_at(vec![key.clone(), other.clone()], false, Instant::now());
+        assert!(!app.can_restart_launcher(), "a held Play is pending launch work");
+        // The second account is deleted and a save runs while the read lands: still held.
+        app.accounts.retain(|row| row.key != other);
+        app.vault_saving = true;
+        status_read(&mut app, services::Availability::Operational, None);
+        app.note_status_read();
+        assert_eq!(app.held_plays.len(), 1, "held through the save");
+        app.vault_saving = false;
+        app.launches = Some(Vec::new());
+        let _ = app.update(Message::Tick);
+        assert!(app.held_plays.is_empty());
+        assert_eq!(app.launches.as_ref().unwrap()[0].0, vec![key.clone()], "the deleted account is left out");
+        assert_eq!(app.accounts[0].status, before, "the row says what it said before the hold");
+        assert_eq!(app.status, "Ready.");
+        // The hold text follows a language switch, and the release still recognises it.
+        let mut app = self::app();
+        app.preview = false;
+        app.status_read_done = false;
+        app.start_mode_at(vec![key.clone()], false, Instant::now());
+        let english = app.accounts[0].status.clone();
+        i18n::set(i18n::Lang::Ja);
+        app.retranslate(i18n::Lang::En);
+        assert_ne!(app.accounts[0].status, english);
+        assert_eq!(app.accounts[0].status, t("Checking whether FINAL FANTASY XI is up…"));
+        assert_eq!(app.status, t("Checking whether FINAL FANTASY XI is up…"));
+        app.launches = Some(Vec::new());
+        app.note_status_read();
+        assert_ne!(app.accounts[0].status, t("Checking whether FINAL FANTASY XI is up…"));
+        i18n::set(i18n::Lang::En);
+    }
+
+    /// A read of the play flag, as `read_play_flag` delivers it, made `ago` before now.
+    fn flag_read(app: &mut App, ago: Duration, result: Result<play_flag::Flag, String>) {
+        let at = chrono::Utc::now() - chrono::Duration::from_std(ago).unwrap();
+        let _ = app.update(Message::PlayFlagLoaded(play_flag::Reading { at, result }));
+    }
+
+    const SERVER_STATUS: &str = "The game is unavailable for play during maintenance.";
+
+    /// An app during All Worlds Maintenance (a posted window seven minutes in, the status page
+    /// still showing the worlds up), whose Plays are recorded instead of started.
+    fn maintenance_app() -> App {
+        let mut app = app();
+        app.preview = false;
+        app.launches = Some(Vec::new());
+        status_read(&mut app, services::Availability::Operational, Some(Duration::from_secs(7 * 60)));
+        assert_eq!(app.main_action(), MainAction::Maintenance);
+        app
+    }
+
+    /// Owner decision 2026-10-13, "Wait and play": the main button sets the selected accounts
+    /// waiting, a second click adds nothing, and they start together through the normal start
+    /// path once the play flag says 1, even inside the posted window.
+    #[test]
+    fn wait_and_play_waits_during_maintenance_and_starts_when_the_flag_says_ffxi_is_back() {
+        let mut app = maintenance_app();
+        for row in &mut app.accounts { row.selected = false; }
+        app.accounts[0].selected = true;
+        app.accounts[1].selected = true;
+        let (first, second) = (app.accounts[0].key.clone(), app.accounts[1].key.clone());
+        assert_eq!(app.wait_keys(), vec![first.clone(), second.clone()]);
+        assert_eq!(app.update(Message::MainAction).units(), 0);
+        assert!(app.is_waiting(&first) && app.is_waiting(&second) && app.waiting_plays.len() == 1);
+        assert!(!app.show_details && app.wait_keys().is_empty());
+        assert_eq!(app.accounts[0].status, "FFXI is down for maintenance. Starting as soon as it's back…");
+        assert!(app.launches.as_ref().unwrap().is_empty() && app.receiver.try_recv().is_err(), "nothing signs in while waiting");
+        // A second click (main button or the row's Launch) is the same wait; the button then
+        // explains the downtime.
+        let _ = app.update(Message::MainAction);
+        app.start_mode_at(vec![first.clone()], false, Instant::now());
+        assert_eq!(app.waiting_plays.len(), 1);
+        assert_eq!(app.waiting_plays[0].keys, vec![first.clone(), second.clone()]);
+        assert!(app.show_details);
+        // The first Tick reads the flag at once, then one read at a time.
+        assert_eq!(app.update(Message::Tick).units(), 1, "an immediate read");
+        assert_eq!(app.update(Message::Tick).units(), 0, "one in flight");
+        // 0: still waiting, with the server's line under the headline.
+        flag_read(&mut app, Duration::ZERO, Ok(play_flag::Flag::Down(Some(SERVER_STATUS.into()))));
+        assert!(app.is_waiting(&first) && app.launches.as_ref().unwrap().is_empty());
+        let detail = app.wait_detail();
+        assert!(detail.starts_with("Last checked: ") && detail.ends_with(SERVER_STATUS), "{detail}");
+        assert_eq!(app.update(Message::Tick).units(), 0, "the next read is a minute later");
+        // 1 inside the posted window: FFXI is up, and both start together.
+        flag_read(&mut app, Duration::ZERO, Ok(play_flag::Flag::Up));
+        assert!(app.waiting_plays.is_empty());
+        assert_eq!(app.main_action(), MainAction::Play);
+        let launches = app.launches.as_ref().unwrap();
+        assert_eq!(launches.len(), 1);
+        assert_eq!((&launches[0].0, launches[0].1, launches[0].3), (&vec![first.clone(), second.clone()], false, None));
+        assert_eq!(app.released, vec![first, second]);
+        // Nothing waits: no more reads.
+        assert_eq!(app.update(Message::Tick).units(), 0);
+        assert!(app.released.is_empty(), "these Plays never started a worker (recorded), so they are done");
+    }
+
+    /// The flag wins both ways while fresh; without a fresh read the official status decides, and
+    /// the row says why.
+    #[test]
+    fn a_waiting_play_follows_the_official_status_when_the_flag_is_stale_or_unreadable() {
+        let mut app = maintenance_app();
+        let key = app.accounts[0].key.clone();
+        app.start_mode_at(vec![key.clone()], false, Instant::now());
+        // 0 while the status page shows every world up 20 minutes in (Round 4: ended early).
+        flag_read(&mut app, Duration::from_secs(30), Ok(play_flag::Flag::Down(None)));
+        status_read(&mut app, services::Availability::Operational, Some(Duration::from_secs(20 * 60)));
+        let _ = app.update(Message::Tick);
+        assert!(app.is_waiting(&key), "a fresh 0 keeps it waiting");
+        // A later read fails: the 0 read 30 s ago still decides.
+        flag_read(&mut app, Duration::ZERO, Err("timed out".into()));
+        assert!(app.is_waiting(&key) && app.launches.as_ref().unwrap().is_empty());
+        // Once no read is fresh, the official status decides: maintenance still, and the row says
+        // the flag could not be read.
+        let mut app = maintenance_app();
+        app.start_mode_at(vec![key.clone()], false, Instant::now());
+        flag_read(&mut app, Duration::ZERO, Err("The play flag server answered HTTP 503.".into()));
+        let _ = app.update(Message::Tick);
+        assert!(app.is_waiting(&key));
+        assert!(app.service_note().contains("All Worlds Maintenance (Oct. 12)"));
+        assert!(app.wait_detail().contains("The play flag could not be read (The play flag server answered HTTP 503.), so this follows the official status."),
+            "{}", app.wait_detail());
+        // ... until the official status says up: the next read decides first, and when it fails
+        // too, the official status alone starts the Play.
+        status_read(&mut app, services::Availability::Operational, None);
+        let _ = app.update(Message::Tick);
+        assert!(app.is_waiting(&key), "between reads only a fresh 1 starts it");
+        flag_read(&mut app, Duration::ZERO, Err("timed out".into()));
+        assert!(!app.is_waiting(&key));
+        assert_eq!(app.launches.as_ref().unwrap()[0].0, vec![key.clone()]);
+        // A stale 1 (over two minutes old) proves nothing.
+        let mut app = maintenance_app();
+        app.start_mode_at(vec![key.clone()], false, Instant::now());
+        flag_read(&mut app, Duration::from_secs(150), Ok(play_flag::Flag::Up));
+        let _ = app.update(Message::Tick);
+        assert!(app.is_waiting(&key) && app.launches.as_ref().unwrap().is_empty());
+    }
+
+    /// Review findings: a wait is released only on evidence that FFXI is up (a fresh 1, or the
+    /// official status right after a read), never on Unknown; after the PC wakes the read due
+    /// then decides, not the stale status before it; and a reading that has just gone stale
+    /// waits for the read that follows it instead of the official status deciding between reads.
+    #[test]
+    fn a_wait_is_released_only_on_evidence_that_ffxi_is_up() {
+        let mut app = maintenance_app();
+        let key = app.accounts[0].key.clone();
+        app.start_mode_at(vec![key.clone()], false, Instant::now());
+        assert_eq!(app.update(Message::Tick).units(), 1);
+        flag_read(&mut app, Duration::ZERO, Ok(play_flag::Flag::Down(None)));
+        // The PC slept 40 minutes, past the posted end of a maintenance that was extended: the
+        // status read and the flag reading are stale, and no window covers now.
+        let long_ago = chrono::Utc::now() - chrono::Duration::minutes(40);
+        let snapshot = app.services.as_mut().unwrap();
+        snapshot.windows.clear();
+        snapshot.checked_at = long_ago.format("%Y-%m-%d %H:%M:%S UTC").to_string();
+        app.play_flag = play_flag::Known::default();
+        app.play_flag.note(play_flag::Reading { at: long_ago, result: Ok(play_flag::Flag::Down(None)) });
+        assert_eq!(app.service_availability(), services::Availability::Unknown);
+        app.flag_schedule.tick(long_ago);
+        let _ = app.update(Message::Tick);
+        assert!(app.is_waiting(&key) && app.launches.as_ref().unwrap().is_empty(), "the wake's read decides");
+        // That read fails: still nothing says FFXI is up.
+        flag_read(&mut app, Duration::ZERO, Err("timed out".into()));
+        let _ = app.update(Message::Tick);
+        assert!(app.is_waiting(&key) && app.launches.as_ref().unwrap().is_empty(), "Unknown is not up");
+        // 0 (the extended maintenance), then 1.
+        flag_read(&mut app, Duration::ZERO, Ok(play_flag::Flag::Down(None)));
+        assert!(app.is_waiting(&key));
+        flag_read(&mut app, Duration::ZERO, Ok(play_flag::Flag::Up));
+        assert!(!app.is_waiting(&key));
+        assert_eq!(app.launches.as_ref().unwrap()[0].0, vec![key.clone()]);
+        // The page shows every world up 20 minutes into the window (Round 4: ended early) while
+        // the flag said 0 just over two minutes ago, and the read after it failed: between reads
+        // the official status alone starts nothing; the read that follows decides.
+        let mut app = maintenance_app();
+        status_read(&mut app, services::Availability::Operational, Some(Duration::from_secs(20 * 60)));
+        flag_read(&mut app, Duration::ZERO, Ok(play_flag::Flag::Down(None)));
+        app.start_mode_at(vec![key.clone()], false, Instant::now());
+        assert!(app.is_waiting(&key));
+        let now = chrono::Utc::now();
+        app.play_flag = play_flag::Known::default();
+        app.play_flag.note(play_flag::Reading { at: now - chrono::Duration::seconds(121), result: Ok(play_flag::Flag::Down(None)) });
+        app.play_flag.note(play_flag::Reading { at: now - chrono::Duration::seconds(61), result: Err("timed out".into()) });
+        assert_eq!(app.service_availability(), services::Availability::Operational);
+        let _ = app.update(Message::Tick);
+        assert!(app.is_waiting(&key), "not between reads");
+        // That read fails too: the official status decides, as the fallback does.
+        flag_read(&mut app, Duration::ZERO, Err("timed out".into()));
+        assert!(!app.is_waiting(&key));
+    }
+
+    /// Review finding: the play flag is FFXI's maintenance switch, so a 1 never ends an outage
+    /// (every world down outside maintenance): the wait goes on until the status page shows the
+    /// worlds back, and no sign-in after a game follows meanwhile.
+    #[test]
+    fn an_outage_waits_for_the_worlds_even_when_the_play_flag_is_1() {
+        let mut app = app();
+        app.preview = false;
+        app.launches = Some(Vec::new());
+        status_read(&mut app, services::Availability::Outage, None);
+        let key = app.accounts[0].key.clone();
+        app.start_mode_at(vec![key.clone()], false, Instant::now());
+        assert!(app.is_waiting(&key));
+        assert_eq!(app.accounts[0].status, "FFXI's worlds are down. Starting as soon as they're back…");
+        flag_read(&mut app, Duration::ZERO, Ok(play_flag::Flag::Up));
+        let _ = app.update(Message::Tick);
+        assert!(app.is_waiting(&key) && app.launches.as_ref().unwrap().is_empty());
+        assert_eq!(app.service_availability(), services::Availability::Outage);
+        assert_eq!(app.main_action(), MainAction::Offline);
+        app.settings.account_no_otp.insert(key.clone());
+        assert!(app.resign_eligible(&key) && !app.resign_allowed(&key), "no sign-in after a game while the worlds are down");
+        // The worlds are back.
+        status_read(&mut app, services::Availability::Operational, None);
+        flag_read(&mut app, Duration::ZERO, Ok(play_flag::Flag::Up));
+        assert!(!app.is_waiting(&key));
+        assert_eq!(app.launches.as_ref().unwrap()[0].0, vec![key]);
+    }
+
+    /// Review finding: a waiting Play whose startup sign-in is refused (a verdict on the account)
+    /// stops waiting, and its row shows the refusal: a release would only sign in again into the
+    /// same verdict. A network failure, which retries by itself, keeps the wait.
+    #[test]
+    fn a_waiting_play_whose_sign_in_is_refused_stops_waiting_and_says_why() {
+        for (failure, waits) in [("Sign-in failed", false),
+            ("Game loader error during startup: Native PlayOnline login failed (state 39, POL result -19). (Windower via crystal-loader).", true)] {
+            let mut app = maintenance_app();
+            let key = app.accounts[0].key.clone();
+            let row = &mut app.accounts[0];
+            (row.busy, row.preparing_session, row.launch_trigger) = (true, true, Some(launch_timing::LaunchTrigger::StartupSignIn));
+            app.start_mode_at(vec![key.clone()], false, Instant::now());
+            assert!(app.is_waiting(&key));
+            app.worker_event(WorkerEvent::Complete(key.clone(), Err(failure.to_owned())));
+            assert_eq!(app.is_waiting(&key), waits, "{failure}");
+            if !waits {
+                assert!(app.accounts[0].problem && app.accounts[0].status == failure);
+                flag_read(&mut app, Duration::ZERO, Ok(play_flag::Flag::Up));
+                assert!(app.launches.as_ref().unwrap().is_empty(), "no second login");
+            }
+        }
+    }
+
+    /// Review finding: starting the first released group can pause launches (an interrupted
+    /// update it finishes first); a later group then keeps waiting instead of being dropped.
+    #[test]
+    fn a_later_wait_group_keeps_waiting_when_an_earlier_one_pauses_launches() {
+        let mut app = maintenance_app();
+        // The real start path, which finishes the interrupted update (a temp folder) first.
+        app.launches = None;
+        app.viewer = None;
+        let (first, second) = (app.accounts[0].key.clone(), app.accounts[1].key.clone());
+        app.start_mode_at(vec![first.clone()], false, Instant::now());
+        app.start_mode_at(vec![second.clone()], false, Instant::now());
+        assert_eq!(app.waiting_plays.len(), 2);
+        assert!(app.receiver.try_recv().is_err());
+        let root = std::env::temp_dir().join(format!("crystal-wait-recover-{}", backend::unique_id().unwrap()));
+        std::fs::create_dir_all(root.join(".xi-updater")).unwrap();
+        std::fs::write(root.join(".xi-updater").join("transaction.json"), b"{}").unwrap();
+        app.settings.install_path = root.to_string_lossy().into_owned();
+        app.settings.install_selected = true;
+        flag_read(&mut app, Duration::ZERO, Ok(play_flag::Flag::Up));
+        assert!(app.recovering.is_some(), "the first group finishes the interrupted update first");
+        assert_eq!(app.released, vec![first.clone()]);
+        assert!(app.is_waiting(&second) && !app.released.contains(&second), "the second keeps waiting");
+        // The recovery worker answers (it refuses the fixture journal); nothing signed in.
+        let event = app.receiver.recv_timeout(Duration::from_secs(30)).ok();
+        assert!(matches!(event, Some(WorkerEvent::InterruptedUpdate(_))));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The flag is read only while a Play waits, once at the start, every minute, and again at
+    /// once after the PC wakes from sleep.
+    #[test]
+    fn the_flag_is_read_only_while_waiting_and_again_after_a_resume() {
+        let mut app = maintenance_app();
+        assert_eq!(app.update(Message::Tick).units(), 0, "nothing waits: no read");
+        let key = app.accounts[0].key.clone();
+        app.start_mode_at(vec![key.clone()], false, Instant::now());
+        assert_eq!(app.update(Message::Tick).units(), 1);
+        flag_read(&mut app, Duration::ZERO, Ok(play_flag::Flag::Down(None)));
+        assert_eq!(app.update(Message::Tick).units(), 0);
+        // Review finding: more waits (other rows, Cancel then Play again) send no extra reads.
+        let others: Vec<String> = app.accounts[1..].iter().map(|row| row.key.clone()).collect();
+        for other in &others { app.start_mode_at(vec![other.clone()], false, Instant::now()); }
+        let _ = app.update(Message::CancelWait(vec![others[0].clone()]));
+        app.start_mode_at(vec![others[0].clone()], false, Instant::now());
+        assert_eq!(app.waiting_plays.len(), others.len() + 1);
+        assert_eq!(app.update(Message::Tick).units(), 0);
+        // The last Tick was 40 minutes ago by the wall clock: the PC slept.
+        app.flag_schedule.tick(chrono::Utc::now() - chrono::Duration::minutes(40));
+        assert_eq!(app.update(Message::Tick).units(), 1, "a read at resume");
+        flag_read(&mut app, Duration::ZERO, Ok(play_flag::Flag::Down(None)));
+        // Cancelled: no wait, no read, even at a resume.
+        let _ = app.update(Message::CancelWait([vec![key.clone()], others].concat()));
+        assert!(app.waiting_plays.is_empty());
+        app.flag_schedule.tick(chrono::Utc::now() - chrono::Duration::minutes(40));
+        assert_eq!(app.update(Message::Tick).units(), 0);
+    }
+
+    /// Cancel drops the wait (and its row says what an idle row says); a waiting Play blocks a
+    /// launcher self-update restart, as a held Play does, since waits are not saved.
+    #[test]
+    fn cancel_ends_a_wait_and_a_wait_blocks_a_launcher_restart() {
+        let mut app = maintenance_app();
+        let (first, second) = (app.accounts[0].key.clone(), app.accounts[1].key.clone());
+        assert!(app.can_restart_launcher());
+        app.start_mode_at(vec![first.clone(), second.clone()], false, Instant::now());
+        assert!(!app.can_restart_launcher(), "a waiting Play is pending launch work");
+        let _ = app.update(Message::CancelWait(vec![first.clone()]));
+        assert!(!app.is_waiting(&first) && app.is_waiting(&second));
+        assert_eq!(app.accounts[0].status, "Ready to launch");
+        assert!(!app.can_restart_launcher());
+        assert_eq!(app.status, "FFXI is down for maintenance. Starting as soon as it's back…", "the other still waits");
+        let _ = app.update(Message::CancelWait(vec![second.clone()]));
+        assert!(app.waiting_plays.is_empty() && app.can_restart_launcher());
+        // Review finding: nothing waits, so the status line no longer promises a start; it says
+        // why FFXI is closed.
+        assert_eq!(app.status, app.service_note());
+        assert!(app.status.contains("All Worlds Maintenance (Oct. 12)"), "{}", app.status);
+        // A late Cancel for a row that no longer waits leaves what it says.
+        app.accounts[1].status = "FFXI is back — enter your one-time password to start".into();
+        let _ = app.update(Message::CancelWait(vec![second.clone()]));
+        assert_eq!(app.accounts[1].status, "FFXI is back — enter your one-time password to start");
+        // A deleted account no longer waits (nor reads the flag, nor holds a restart back).
+        app.start_mode_at(vec![second.clone()], false, Instant::now());
+        app.accounts.retain(|row| row.key != second);
+        let _ = app.update(Message::Tick);
+        assert!(app.waiting_plays.is_empty() && app.can_restart_launcher());
+        // Nothing starts when FFXI is back.
+        flag_read(&mut app, Duration::ZERO, Ok(play_flag::Flag::Up));
+        let _ = app.update(Message::Tick);
+        assert!(app.launches.as_ref().unwrap().is_empty());
+        // FFXI is up (the flag read just now): a Play starts at once.
+        app.start_mode_at(vec![first.clone()], false, Instant::now());
+        assert!(app.launches.as_ref().unwrap().len() == 1 && app.waiting_plays.is_empty(), "FFXI is up: no wait");
+        // A Play released from its wait and still starting, or the update it asked for, blocks it too.
+        app.released.push(first.clone());
+        assert!(!app.can_restart_launcher());
+        app.released.clear();
+        app.wait_update = Some(WaitUpdate { keys: vec![first], started: false, folder: None });
+        assert!(!app.can_restart_launcher());
+    }
+
+    /// A Play that goes ahead (FFXI up, the wait's own release held back by paused launches)
+    /// replaces that account's wait, so the wait cannot start it a second time.
+    #[test]
+    fn a_play_that_goes_ahead_replaces_its_accounts_wait() {
+        let mut app = app();
+        app.preview = false;
+        let (key, other) = (app.accounts[0].key.clone(), app.accounts[1].key.clone());
+        // Private-server rows: their Plays stop at the row note, with no worker to start.
+        app.accounts[0].account.mode = AccountMode::Private;
+        app.accounts[1].account.mode = AccountMode::Private;
+        app.waiting_plays.push(WaitingPlay { keys: vec![key.clone(), other.clone()], otp: Vec::new(), armed: Instant::now(), codes: Vec::new() });
+        assert!(!app.service_down());
+        app.start_launch_now(vec![key.clone()], false, Instant::now(), None);
+        assert!(!app.is_waiting(&key) && app.is_waiting(&other));
+        assert!(app.receiver.try_recv().is_err());
+        // A sign-in only replaces nothing.
+        app.start_launch_now(vec![other.clone()], true, Instant::now(), None);
+        assert!(app.is_waiting(&other));
+    }
+
+    /// A wait that began OTP_KEEP or more ago.
+    fn age_waits(app: &mut App) {
+        for wait in &mut app.waiting_plays { wait.armed = Instant::now() - OTP_KEEP - Duration::from_secs(1); }
+    }
+
+    /// Never a sign-in with a stale one-time code: a code typed before the wait goes off the row
+    /// and is dropped once stale, and an account that signs in with one asks for a new code when
+    /// FFXI is back. A signed-in session needs no code and starts.
+    #[test]
+    fn an_otp_account_asks_for_a_new_code_when_ffxi_is_back() {
+        let mut app = maintenance_app();
+        let keys: Vec<String> = app.accounts.iter().map(|row| row.key.clone()).collect();
+        // A code typed for this Play; a code taken by the last sign-in.
+        app.accounts[0].otp = "123456".into();
+        app.accounts[1].otp_spent = true;
+        // Signed in at startup with a code; its session is idle at the main menu.
+        let row = &mut app.accounts[2];
+        (row.pid, row.otp_spent) = (Some(4242), true);
         row.alive = Some(Arc::new(AtomicBool::new(true)));
         row.game_running = Some(Arc::new(AtomicBool::new(false)));
-        row.queued_play = Some(clicked);
-        let snapshot = app.services.as_mut().unwrap();
-        snapshot.availability = services::Availability::Outage;
-        snapshot.checked_at = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC").to_string();
-        snapshot.notices.clear();
-        assert_eq!(app.service_availability(), services::Availability::Outage);
-        app.start_queued_plays();
-        assert_eq!(app.accounts[0].queued_play, Some(clicked));
-        assert!(!app.accounts[0].busy && !app.accounts[0].batch_pending);
-        assert!(app.receiver.try_recv().is_err());
+        app.start_mode_at(keys.clone(), false, Instant::now());
+        assert!(keys.iter().all(|key| app.is_waiting(key)));
+        assert!(app.accounts[0].otp.is_empty(), "the typed code goes with the wait");
+        assert_eq!(app.waiting_plays[0].otp, vec![keys[0].clone()]);
+        assert_eq!(app.waiting_plays[0].codes.len(), 1);
+        // Stale: the Tick drops it.
+        age_waits(&mut app);
+        let _ = app.update(Message::Tick);
+        assert!(app.waiting_plays[0].codes.is_empty());
+        flag_read(&mut app, Duration::ZERO, Ok(play_flag::Flag::Up));
+        let launches = app.launches.as_ref().unwrap();
+        assert_eq!(launches.len(), 1);
+        assert_eq!((&launches[0].0, launches[0].3), (&vec![keys[2].clone()], None), "the signed-in session starts");
+        for row in &app.accounts[..2] {
+            assert_eq!(row.status, "FFXI is back — enter your one-time password to start");
+            assert!(row.problem && row.otp.is_empty() && !app.is_waiting(&row.key));
+        }
+        assert!(app.waiting_plays.is_empty());
+        // A code typed during a long wait is stale by the release too.
+        let mut app = maintenance_app();
+        app.start_mode_at(vec![keys[0].clone()], false, Instant::now());
+        app.accounts[0].otp = "654321".into();
+        age_waits(&mut app);
+        flag_read(&mut app, Duration::ZERO, Ok(play_flag::Flag::Up));
+        assert!(app.launches.as_ref().unwrap().is_empty() && app.accounts[0].otp.is_empty());
+        assert_eq!(app.accounts[0].status, "FFXI is back — enter your one-time password to start");
+        // Review finding: an account known (from an earlier window) to sign in with a code, with
+        // none typed and no sign-in this run, asks for one instead of signing in without it.
+        let mut app = maintenance_app();
+        app.settings.account_otp.insert(keys[1].clone());
+        app.start_mode_at(vec![keys[1].clone()], false, Instant::now());
+        flag_read(&mut app, Duration::ZERO, Ok(play_flag::Flag::Up));
+        assert!(app.launches.as_ref().unwrap().is_empty());
+        assert_eq!(app.accounts[1].status, "FFXI is back — enter your one-time password to start");
+    }
+
+    /// Review finding: the code typed in answer to "FFXI is back" while the official status still
+    /// lags (the flag reading behind the release has gone stale) waits for the immediate read,
+    /// which says 1: that code is seconds old and starts the Play, not a second prompt.
+    #[test]
+    fn a_code_typed_for_a_play_that_waits_is_used_when_ffxi_is_back_at_once() {
+        let mut app = maintenance_app();
+        let key = app.accounts[0].key.clone();
+        app.accounts[0].otp = "123456".into();
+        app.accounts[0].otp_spent = true;
+        app.start_mode_at(vec![key.clone()], false, Instant::now());
+        assert!(app.is_waiting(&key) && app.accounts[0].otp.is_empty());
+        assert_eq!(app.update(Message::Tick).units(), 1, "the immediate read");
+        flag_read(&mut app, Duration::ZERO, Ok(play_flag::Flag::Up));
+        assert_eq!(app.launches.as_ref().unwrap()[0].0, vec![key.clone()]);
+        assert_eq!(app.accounts[0].otp, "123456", "the code goes to the sign-in");
+        assert!(!app.accounts[0].problem && app.waiting_plays.is_empty());
+        // A Cancel drops the kept code with the wait.
+        let mut app = maintenance_app();
+        app.accounts[0].otp = "654321".into();
+        app.start_mode_at(vec![key.clone()], false, Instant::now());
+        let _ = app.update(Message::CancelWait(vec![key.clone()]));
+        assert!(app.waiting_plays.is_empty() && app.accounts[0].otp.is_empty());
+    }
+
+    /// Review finding: whether an account signs in with a one-time code is learned from its
+    /// sessions and kept in Settings (never the code), so a later window knows it.
+    #[test]
+    fn an_account_whose_sign_in_took_a_code_is_remembered_as_one() {
+        let mut app = app();
+        app.preview = false;
+        let root = std::env::temp_dir().join(format!("crystal-otp-account-{}", backend::unique_id().unwrap()));
+        app.config.experiment = root.clone();
+        let key = app.accounts[0].key.clone();
+        // `trigger` None: a reconnect to an earlier window's session.
+        let completed = |app: &mut App, spent: bool, trigger: Option<launch_timing::LaunchTrigger>| {
+            let row = &mut app.accounts[0];
+            (row.busy, row.otp_spent, row.launch_trigger) = (true, spent, trigger);
+            let key = row.key.clone();
+            app.worker_event(WorkerEvent::Complete(key, Ok(LaunchResult {
+                pid: 41, detail: "signed in".into(), alive: Arc::new(AtomicBool::new(true)),
+                game_running: Arc::new(AtomicBool::new(false)), log: PathBuf::new(),
+                outcome: Arc::new(std::sync::Mutex::new(None)), timing: String::new(),
+            })));
+        };
+        let signed_in = |app: &mut App, spent: bool| completed(app, spent, Some(launch_timing::LaunchTrigger::Connect));
+        signed_in(&mut app, true);
+        assert!(app.settings.account_otp.contains(&key) && !app.settings.presigns(&key));
+        assert!(load_settings(&app.config).unwrap().account_otp.contains(&key), "saved");
+        signed_in(&mut app, false);
+        assert!(app.settings.account_otp.is_empty() && load_settings(&app.config).unwrap().account_otp.is_empty());
+        // 2026-10-13: and that it signs in without one, which makes it pre-signed from now on.
+        assert!(app.settings.account_no_otp.contains(&key) && load_settings(&app.config).unwrap().presigns(&key));
+        signed_in(&mut app, true);
+        assert!(app.settings.account_no_otp.is_empty() && !load_settings(&app.config).unwrap().presigns(&key));
+        // A reconnect never teaches "no code" (an older worker's record defaults to none); a code
+        // its record names is still learned.
+        app.settings.account_otp.clear();
+        completed(&mut app, false, None);
+        assert!(!app.settings.account_otp.contains(&key) && !app.settings.account_no_otp.contains(&key));
+        completed(&mut app, true, None);
+        assert!(app.settings.account_otp.contains(&key));
+        // Review finding: nor does a Play that reuses such a session (Launch all over idle
+        // sessions, or a Play queued on one still preparing) without signing in again: its
+        // record (a 1.0.8 worker's) never said whether that sign-in took a code.
+        app.settings.account_otp.clear();
+        for trigger in [launch_timing::LaunchTrigger::BatchPlay, launch_timing::LaunchTrigger::QueuedPlay] {
+            app.accounts[0].otp_unknown = true;
+            completed(&mut app, false, Some(trigger));
+            assert!(!app.settings.account_otp.contains(&key) && !app.settings.account_no_otp.contains(&key), "{trigger:?}");
+        }
+        // A sign-in this window starts is known again (start_launch and start_together clear it).
+        app.accounts[0].otp_unknown = false;
+        completed(&mut app, false, Some(launch_timing::LaunchTrigger::BatchPlay));
+        assert!(app.settings.account_no_otp.contains(&key));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Owner decision 2026-10-13: Crystal signs in by itself exactly the retail accounts it knows
+    /// sign in without a one-time code (their latest successful sign-in took none), while the
+    /// one switch is on. OTP accounts, accounts never seen signing in, and rows with a code
+    /// typed or spent are not; private-server accounts never.
+    #[test]
+    fn presign_eligibility_table() {
+        let mut app = app();
+        let keys: Vec<String> = app.accounts.iter().map(|row| row.key.clone()).collect();
+        let (known, otp, unknown) = (&keys[0], &keys[1], &keys[2]);
+        app.settings.account_no_otp.insert(known.clone());
+        app.settings.account_otp.insert(otp.clone());
+        assert!(app.settings.auto_sign_in, "on by default");
+        assert_eq!(keys.iter().map(|key| app.presigned(key)).collect::<Vec<_>>(), [true, false, false]);
+        // Migrated from a file before 2026-10-13: "Sign in when Crystal opens" was on.
+        let mut migrated: Settings = serde_json::from_str(&format!(r#"{{"install_path":"","account_startup_signin":["{unknown}"]}}"#)).unwrap();
+        migrated.migrate_startup_signin();
+        app.settings.account_no_otp.extend(migrated.account_no_otp);
+        assert!(app.presigned(unknown));
+        // A code typed on the row (for the user's own Play), or spent by its last sign-in.
+        app.accounts[0].otp = "123456".into();
+        assert!(!app.presigned(known), "never a pre-sign-in with a typed code");
+        app.accounts[0].otp.clear();
+        app.accounts[0].otp_spent = true;
+        assert!(!app.presigned(known));
+        app.accounts[0].otp_spent = false;
+        // Private-server accounts never.
+        app.accounts[0].account.mode = AccountMode::Private;
+        assert!(!app.presigned(known));
+        app.accounts[0].account.mode = AccountMode::Retail;
+        // Never both: the latest sign-in wins.
+        assert!(app.settings.note_sign_in(known, true));
+        assert!(!app.presigned(known) && app.settings.account_otp.contains(known) && !app.settings.account_no_otp.contains(known));
+        assert!(!app.settings.note_sign_in(known, true), "nothing changed");
+        assert!(app.settings.note_sign_in(known, false));
+        assert!(app.presigned(known) && !app.settings.account_otp.contains(known));
+        // The switch off: none.
+        app.settings.auto_sign_in = false;
+        assert!(keys.iter().all(|key| !app.presigned(key)));
+    }
+
+    /// Owner decision 2026-10-13: an account's first Play teaches Crystal. One that signed in
+    /// without a code is pre-signed from then on (its game's end signs it back in); one that took
+    /// a code is not, and neither is one whose sign-in failed.
+    #[test]
+    fn a_first_play_teaches_whether_the_account_is_pre_signed() {
+        let mut app = app();
+        app.preview = false;
+        app.launches = Some(Vec::new());
+        app.config.experiment = std::env::temp_dir().join(format!("crystal-first-play-{}", backend::unique_id().unwrap()));
+        let sign_in = |app: &mut App, index: usize, code: bool, result: Result<(), &str>| {
+            let row = &mut app.accounts[index];
+            (row.busy, row.otp_spent, row.launch_trigger) = (true, code, Some(launch_timing::LaunchTrigger::Play));
+            let key = row.key.clone();
+            app.worker_event(WorkerEvent::Complete(key, result.map(|()| LaunchResult {
+                pid: 41, detail: "Client started".into(), alive: Arc::new(AtomicBool::new(true)),
+                game_running: Arc::new(AtomicBool::new(true)), log: PathBuf::new(),
+                outcome: Arc::new(std::sync::Mutex::new(None)), timing: String::new(),
+            }).map_err(str::to_owned)));
+        };
+        let keys: Vec<String> = app.accounts.iter().map(|row| row.key.clone()).collect();
+        assert!(keys.iter().all(|key| !app.presigned(key)), "unknown accounts are not pre-signed");
+        sign_in(&mut app, 0, false, Ok(()));
+        sign_in(&mut app, 1, true, Ok(()));
+        sign_in(&mut app, 2, false, Err("Game exited during startup with code 0 (Windower via crystal-loader)."));
+        // Rows 0 and 1 are playing; their games end.
+        let known = |app: &App| keys.iter().map(|key| app.settings.presigns(key)).collect::<Vec<_>>();
+        assert_eq!(known(&app), [true, false, false]);
+        assert!(app.settings.account_otp.contains(&keys[1]) && !app.settings.account_otp.contains(&keys[2]), "a failure teaches nothing");
+        let _ = app.update(Message::Tick);
+        for row in &mut app.accounts[..2] {
+            row.outcome = Some(Arc::new(std::sync::Mutex::new(Some(signed_out()))));
+            row.alive.as_ref().unwrap().store(false, Ordering::Release);
+        }
+        let _ = app.update(Message::Tick);
+        assert!(app.accounts[0].resign.is_some(), "the account learned as code-less signs back in after its game");
+        assert!(app.accounts[1].resign.is_none(), "an OTP account does not");
+        let _ = std::fs::remove_dir_all(&app.config.experiment);
+    }
+
+    /// Owner decision 2026-10-13: a pre-sign-in (no code) that the member login refused may be an
+    /// account that now uses a one-time code. It is marked as one and stops being pre-signed: no
+    /// retry, no sign-in after its next game, none at the next start, and its row says why. Its
+    /// next sign-in without a code that works makes it pre-signed again.
+    #[test]
+    fn a_refused_pre_sign_in_marks_the_account_otp_and_is_not_retried() {
+        let refused = "Game loader error during startup: Native PlayOnline member login failed (state 39, POL result -1036). (Windower via crystal-loader).";
+        for trigger in [launch_timing::LaunchTrigger::StartupSignIn, launch_timing::LaunchTrigger::SignInAfterGame,
+            launch_timing::LaunchTrigger::StartupRetry, launch_timing::LaunchTrigger::SignInAfterGameRetry] {
+            assert!(trigger.is_presign());
+            let (mut app, key) = resign_app("presign-refused");
+            let row = &mut app.accounts[0];
+            // What start_launch leaves on a pre-sign-in's row.
+            (row.busy, row.preparing_session, row.launch_trigger, row.presign_login) = (true, true, Some(trigger), true);
+            app.worker_event(WorkerEvent::Complete(key.clone(), Err(refused.into())));
+            let row = &app.accounts[0];
+            assert!(row.network_wait.is_none() && row.resign.is_none() && !row.busy, "{trigger:?}");
+            assert_eq!(row.status, format!("{refused} · This account may need a one-time password now: Crystal signs it in only when you press Play."));
+            assert!(app.settings.account_otp.contains(&key) && !app.settings.presigns(&key), "{trigger:?}");
+            assert!(load_settings(&app.config).unwrap().account_otp.contains(&key), "saved");
+            // Nothing signs it in by itself any more.
+            let _ = app.update(Message::Tick);
+            game_ends(&mut app, 0, signed_out());
+            assert!(app.accounts[0].resign.is_none() && app.take_resigns(Instant::now() + RESIGN_DELAY).is_empty());
+            app.startup_signin_pending = true;
+            assert!(app.take_startup_signins().is_empty() && app.startup_waiting.is_empty());
+            assert!(app.launches.as_ref().unwrap().is_empty(), "never retried");
+            let _ = std::fs::remove_dir_all(&app.config.experiment);
+        }
+        // A refusal of a sign-in that took a code teaches nothing; a network failure is no refusal.
+        let (mut app, key) = resign_app("presign-refused-other");
+        let row = &mut app.accounts[0];
+        (row.busy, row.otp_spent, row.launch_trigger) = (true, true, Some(launch_timing::LaunchTrigger::Play));
+        app.worker_event(WorkerEvent::Complete(key.clone(), Err(refused.into())));
+        assert!(!app.settings.account_otp.contains(&key) && app.settings.account_no_otp.contains(&key));
+        app.accounts[0].otp_spent = false;
+        let row = &mut app.accounts[0];
+        (row.busy, row.launch_trigger, row.presign_login) = (true, Some(launch_timing::LaunchTrigger::StartupSignIn), true);
+        app.worker_event(WorkerEvent::Complete(key.clone(),
+            Err("Game loader error during startup: Native PlayOnline member login failed (state 39, POL result -19). (Windower via crystal-loader).".into())));
+        assert!(app.settings.presigns(&key) && app.accounts[0].network_wait == Some(NetworkWait::StartupRetry));
+        let _ = std::fs::remove_dir_all(&app.config.experiment);
+    }
+
+    /// Review findings (2026-10-13): only a refused member login counts, and only of a sign-in
+    /// Crystal started by itself. A failure of the network-level connection (before any password
+    /// is sent: PlayOnline down for its own maintenance, unreachable), a cancelled login or an
+    /// older loader's unnamed stage leaves a known code-less account pre-signed; so does a refusal
+    /// of the user's own Play or Connect without a code (Wait and play then does not ask that
+    /// account for a code it does not use). A refused pre-sign-in that a Play queued on still
+    /// marks it.
+    #[test]
+    fn only_a_refused_member_login_of_crystals_own_sign_in_marks_the_account_otp() {
+        let refused = "Game loader error during startup: Native PlayOnline member login failed (state 39, POL result -1036). (Windower via crystal-loader).";
+        for failure in ["Game loader error during startup: Native PlayOnline network connection failed (state -1025, POL result -1036). (Windower via crystal-loader).",
+            "Game loader error during startup: Native PlayOnline login was cancelled at state -1 (POL result -1036). (Windower via crystal-loader).",
+            "Game loader error during startup: Native PlayOnline login failed (state 39, POL result -1036). (Windower via crystal-loader)."] {
+            let (mut app, key) = resign_app("presign-not-refused");
+            let row = &mut app.accounts[0];
+            (row.busy, row.preparing_session, row.launch_trigger, row.presign_login) = (true, true, Some(launch_timing::LaunchTrigger::StartupSignIn), true);
+            app.worker_event(WorkerEvent::Complete(key.clone(), Err(failure.into())));
+            assert!(app.settings.presigns(&key) && !app.settings.account_otp.contains(&key), "{failure}");
+            assert_eq!(app.accounts[0].status, failure, "no 'may need a one-time password' note");
+            let _ = std::fs::remove_dir_all(&app.config.experiment);
+        }
+        // The user's own sign-ins: Play, Connect, a parked one, a batch Play.
+        for trigger in [launch_timing::LaunchTrigger::Play, launch_timing::LaunchTrigger::Connect,
+            launch_timing::LaunchTrigger::ParkedPlay, launch_timing::LaunchTrigger::BatchPlay, launch_timing::LaunchTrigger::ReissuedPlay] {
+            assert!(!trigger.is_presign());
+            let (mut app, key) = resign_app("user-refused");
+            let row = &mut app.accounts[0];
+            (row.busy, row.launch_trigger) = (true, Some(trigger));
+            app.worker_event(WorkerEvent::Complete(key.clone(), Err(refused.into())));
+            assert!(app.settings.presigns(&key) && !app.settings.account_otp.contains(&key), "{trigger:?}");
+            let _ = std::fs::remove_dir_all(&app.config.experiment);
+        }
+        // A Play queued on a pre-sign-in (start_together keeps the existing session's
+        // presign_login): that pre-sign-in's refusal arrives as the Play's, and marks it.
+        let (mut app, key) = resign_app("queued-refused");
+        let row = &mut app.accounts[0];
+        (row.busy, row.batch_requested, row.launch_trigger, row.presign_login) = (true, true, Some(launch_timing::LaunchTrigger::QueuedPlay), true);
+        app.worker_event(WorkerEvent::Complete(key.clone(), Err(refused.into())));
+        assert!(app.settings.account_otp.contains(&key) && !app.settings.presigns(&key));
+        assert!(app.accounts[0].status.ends_with("This account may need a one-time password now: Crystal signs it in only when you press Play."));
+        let _ = std::fs::remove_dir_all(&app.config.experiment);
+    }
+
+    /// Review findings (2026-10-13): a batch reports one account's failure to every account in it
+    /// (session_batch::coordinate). Another account's refused member login marks no other account
+    /// as one that needs a one-time code: not one that got its session (Ready) first, even if the
+    /// raw refusal reached it, and not one told in the coordinator's own words. Only the refused
+    /// account's own pre-sign-in marks it.
+    #[test]
+    fn a_batch_marks_only_the_refused_account_otp() {
+        let refused = "Game loader error during startup: Native PlayOnline member login failed (state 39, POL result -1036). (Windower via crystal-loader).";
+        let (mut app, ready) = resign_app("batch-refused");
+        let (refused_key, told) = (app.accounts[1].key.clone(), app.accounts[2].key.clone());
+        app.settings.account_no_otp.extend([refused_key.clone(), told.clone()]);
+        // Three pre-sign-ins in flight, each with a Play queued on it, started together.
+        for row in &mut app.accounts[..3] {
+            (row.busy, row.batch_pending, row.batch_requested, row.presign_login) = (true, true, true, true);
+            row.launch_trigger = Some(launch_timing::LaunchTrigger::QueuedPlay);
+        }
+        app.worker_event(WorkerEvent::Complete(ready.clone(), Ok(LaunchResult {
+            pid: 70, detail: "Signed in.".into(), alive: Arc::new(AtomicBool::new(true)),
+            game_running: Arc::new(AtomicBool::new(false)), log: PathBuf::from("batch.log"),
+            outcome: Arc::new(std::sync::Mutex::new(None)), timing: String::new(),
+        })));
+        assert!(app.accounts[0].pid.is_some());
+        app.worker_event(WorkerEvent::Complete(ready.clone(), Err(refused.into())));
+        app.worker_event(WorkerEvent::Complete(refused_key.clone(), Err(refused.into())));
+        let others = t("Another selected account's PlayOnline sign-in was refused, so FFXI was not started.");
+        app.worker_event(WorkerEvent::Complete(told.clone(), Err(others.into())));
+        assert!(app.settings.presigns(&ready) && !app.settings.account_otp.contains(&ready), "it got its session");
+        assert!(app.settings.presigns(&told) && !app.settings.account_otp.contains(&told));
+        assert!(app.settings.account_otp.contains(&refused_key) && !app.settings.presigns(&refused_key));
+        assert!(!app.accounts[0].status.contains("may need a one-time password") && !app.accounts[2].status.contains("may need a one-time password"));
+        let _ = std::fs::remove_dir_all(&app.config.experiment);
+    }
+
+    /// Owner decision 2026-10-13: the Settings switch, off, stops Crystal's own sign-ins at its
+    /// start, after a game, a startup sign-in waiting for a closing session and a startup network
+    /// retry, and parks every account instead. Sessions already signed in stay. It is saved.
+    #[test]
+    fn the_switch_off_stops_startup_and_after_game_sign_ins() {
+        let (mut app, key) = resign_app("presign-switch");
+        let _ = app.update(Message::AutoSignIn(false));
+        assert!(!load_settings(&app.config).unwrap().auto_sign_in, "saved");
+        app.startup_signin_pending = true;
+        assert!(app.take_startup_signins().is_empty());
+        app.startup_issued = None; // no real park host from the Ticks below
+        assert!(app.park_keys().iter().any(|(row, ..)| *row == key), "it parks like any other account");
+        game_ends(&mut app, 0, signed_out());
+        assert!(app.accounts[0].resign.is_none());
+        // Pending when it was turned off.
+        let _ = app.update(Message::AutoSignIn(true));
+        app.startup_waiting.push((key.clone(), Instant::now()));
+        app.accounts[0].network_wait = Some(NetworkWait::StartupRetry);
+        assert!(!app.park_keys().iter().any(|(row, ..)| *row == key), "a pre-sign-in is coming");
+        let _ = app.update(Message::AutoSignIn(false));
+        assert!(app.take_waiting_startups(Instant::now()).is_empty() && app.startup_waiting.is_empty());
+        let generation = app.accounts[0].launch_generation;
+        app.worker_event(WorkerEvent::NetworkBack(key.clone(), true).for_launch(&key, generation));
+        assert!(app.launches.as_ref().unwrap().is_empty());
+        // A signed-in session is not signed out.
+        let alive = Arc::new(AtomicBool::new(true));
+        let row = &mut app.accounts[0];
+        (row.pid, row.alive, row.game_running) = (Some(77), Some(alive.clone()), Some(Arc::new(AtomicBool::new(false))));
+        let _ = app.update(Message::Tick);
+        assert!(app.accounts[0].pid.is_some() && alive.load(Ordering::Acquire));
+        // On again: the next start signs it in.
+        let _ = app.update(Message::AutoSignIn(true));
+        app.accounts[0].pid = None;
+        app.accounts[0].alive = None;
+        app.accounts[0].game_running = None;
+        app.startup_signin_pending = true;
+        assert_eq!(app.take_startup_signins(), vec![key]);
+        let _ = std::fs::remove_dir_all(&app.config.experiment);
+    }
+
+    /// Files before 2026-10-13 load: an account that had "Sign in when Crystal opens" is known to
+    /// sign in without a code (unless its latest sign-in took one), the switch is on, and the old
+    /// field is never written again. New fields round-trip.
+    #[test]
+    fn old_startup_sign_in_settings_migrate_and_new_ones_round_trip() {
+        let root = std::env::temp_dir().join(format!("crystal-presign-migrate-{}", backend::unique_id().unwrap()));
+        let config = crate::backend::Config { experiment: root.clone(), repository: root.clone(), game_install: None, dat_overlays: Vec::new() };
+        let path = settings_path(&config);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"install_path":"C:\\Games\\FFXI","account_startup_signin":["a","b"],"account_otp":["b"]}"#).unwrap();
+        let loaded = load_settings(&config).unwrap();
+        assert!(loaded.auto_sign_in);
+        assert_eq!(loaded.account_no_otp, BTreeSet::from(["a".to_owned()]));
+        assert_eq!(loaded.account_otp, BTreeSet::from(["b".to_owned()]), "a code taken since is newer evidence");
+        assert!(loaded.presigns("a") && !loaded.presigns("b") && !loaded.presigns("c"));
+        save_settings(&config, &loaded).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("account_startup_signin"), "{text}");
+        let mut reloaded = load_settings(&config).unwrap();
+        assert_eq!((reloaded.account_no_otp.clone(), reloaded.account_otp.clone(), reloaded.auto_sign_in), (loaded.account_no_otp.clone(), loaded.account_otp.clone(), true));
+        reloaded.auto_sign_in = false;
+        save_settings(&config, &reloaded).unwrap();
+        assert!(!load_settings(&config).unwrap().auto_sign_in);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The account editor has no per-account "Sign in when Crystal opens" any more; character
+    /// auto-select stays there. Settings → System has the one switch, in both languages.
+    #[test]
+    fn the_editor_has_no_startup_sign_in_checkbox_and_settings_has_the_switch() {
+        let size = iced::Size::new(1440.0, 900.0);
+        for lang in i18n::Lang::ALL {
+            i18n::set(lang);
+            let mut app = app();
+            app.viewport = size;
+            let key = app.accounts[0].key.clone();
+            let _ = app.update(Message::EditAccount(key));
+            let texts = privacy::testing::texts(ui::view(&app), size);
+            assert!(texts.iter().any(|line| line == t("Log in to a character automatically")), "{texts:?}");
+            assert!(!texts.iter().any(|line| line == t("Sign accounts in when Crystal opens") || line.contains("Sign in when Crystal opens")
+                || line.contains("security token") || line.contains("Crystal起動時")), "{texts:?}");
+            app.editor = None;
+            app.page = Page::Settings;
+            app.settings_tab = settings_page::Tab::System;
+            let texts = privacy::testing::texts(ui::view(&app), size);
+            // A toggler reports no label to the widget tree; its explanation is plain text.
+            assert!(texts.iter().any(|line| line == t("Accounts that sign in without a one-time password sign in to PlayOnline in the background when Crystal opens and again after their game closes, so Play starts FFXI without another sign-in.")), "{texts:?}");
+        }
+        i18n::set(i18n::Lang::En);
+    }
+
+    /// The released Play's version check asks for an update: it starts by itself (the Round 5
+    /// Update for that account's folder), its row shows the progress, and its success starts the
+    /// Play again; a failure, or an update that cannot start, says why.
+    #[test]
+    fn an_update_a_released_play_needs_starts_by_itself_then_the_play_again() {
+        let released = |busy_other: bool| {
+            let mut app = maintenance_app();
+            app.settings.install_selected = true;
+            let key = app.accounts[0].key.clone();
+            if busy_other {
+                // Another account's game is running: the update may not sign it out.
+                let row = &mut app.accounts[1];
+                row.pid = Some(77);
+                row.alive = Some(Arc::new(AtomicBool::new(true)));
+                row.game_running = Some(Arc::new(AtomicBool::new(true)));
+            }
+            app.start_mode_at(vec![key.clone()], false, Instant::now());
+            flag_read(&mut app, Duration::ZERO, Ok(play_flag::Flag::Up));
+            assert_eq!(app.released, vec![key.clone()]);
+            // Its sign-in runs; the version check refuses the start for an update.
+            app.accounts[0].busy = true;
+            let _ = app.update(Message::Tick);
+            assert_eq!(app.released, vec![key.clone()], "still starting");
+            let message = patch::gate(patch::LaunchCheck::Update(refused_report())).unwrap_err();
+            app.worker_event(WorkerEvent::StartGame(key.clone(), Some(refused_report()), Err(message)));
+            assert!(app.released.is_empty() && app.wait_update.as_ref().is_some_and(|update| update.keys == [key.clone()]));
+            assert!(!app.can_restart_launcher());
+            (app, key)
+        };
+        // The Update starts on the next Tick; success starts the Play again.
+        let (mut app, key) = released(false);
+        let _ = app.update(Message::Tick);
+        assert!(app.maintenance == Some(MaintenanceKind::Update) && app.waited_update_running(&key));
+        assert_eq!(app.reissue_after_update.iter().map(|(known, _)| known.as_str()).collect::<Vec<_>>(), [key.as_str()]);
+        let mut current = refused_report();
+        current.state = patch::PatchState::Current;
+        app.launches = Some(Vec::new());
+        let _ = app.update(Message::MaintenanceFinished(MaintenanceKind::Update, Ok("Updated".into()), Some(current.clone())));
+        let launches = app.launches.as_ref().unwrap();
+        assert_eq!((&launches[0].0, launches[0].3), (&vec![key.clone()], Some(launch_timing::LaunchTrigger::ReissuedPlay)));
+        assert!(app.wait_update.is_none() && app.can_restart_launcher());
+        // The update fails: the row says why, and nothing starts.
+        let (mut app, key) = released(false);
+        let _ = app.update(Message::Tick);
+        app.launches = Some(Vec::new());
+        let _ = app.update(Message::MaintenanceFinished(MaintenanceKind::Update, Err("Cancelled.".into()), None));
+        assert!(app.launches.as_ref().unwrap().is_empty() && app.wait_update.is_none());
+        assert_eq!(app.accounts[0].status, "Could not update FFXI before it starts: Cancelled.");
+        assert!(app.accounts[0].problem && !app.waited_update_running(&key));
+        // The update cannot start (another game is running): the row says why.
+        let (mut app, _) = released(true);
+        let _ = app.update(Message::Tick);
+        assert!(app.maintenance.is_none() && app.wait_update.is_none());
+        assert_eq!(app.accounts[0].status, tf("Could not update FFXI before it starts: {error}",
+            &[("error", &t("Close all games and sign out PlayOnline sessions before updating, repairing, or running official setup. Existing sessions were kept."))]));
+        // An OTP account's re-issued Play would be a new sign-in without a code: it asks for one.
+        let (mut app, _) = released(false);
+        let _ = app.update(Message::Tick);
+        app.accounts[0].otp_spent = true;
+        app.launches = Some(Vec::new());
+        let _ = app.update(Message::MaintenanceFinished(MaintenanceKind::Update, Ok("Updated".into()), Some(current)));
+        assert!(app.launches.as_ref().unwrap().is_empty());
+        assert_eq!(app.accounts[0].status, "FFXI is back — enter your one-time password to start");
+    }
+
+    /// Review finding: a released batch (Windower or Ashita accounts started together) whose W20
+    /// asks for an update reports each account Ready, then Failed (session_batch::coordinate);
+    /// that failure is still the Play's, so the update starts by itself and its success starts
+    /// every account again.
+    #[test]
+    fn a_released_batch_refused_for_an_update_starts_the_update_then_every_play() {
+        let mut app = maintenance_app();
+        app.settings.install_selected = true;
+        let keys = vec![app.accounts[0].key.clone(), app.accounts[1].key.clone()];
+        app.start_mode_at(keys.clone(), false, Instant::now());
+        flag_read(&mut app, Duration::ZERO, Ok(play_flag::Flag::Up));
+        assert_eq!(app.released, keys);
+        // What start_together leaves on the rows, then the coordinator's events.
+        let clicked = Instant::now();
+        for row in &mut app.accounts[..2] {
+            (row.busy, row.batch_pending, row.batch_requested) = (true, true, true);
+            row.launch_trigger = Some(launch_timing::LaunchTrigger::BatchPlay);
+            row.play_timing = Some(launch_timing::Timeline::begin_at(clicked));
+        }
+        for (at, key) in keys.iter().enumerate() {
+            app.worker_event(WorkerEvent::Complete(key.clone(), Ok(LaunchResult {
+                pid: 70 + at as u32, detail: "Signed in.".into(), alive: Arc::new(AtomicBool::new(true)),
+                game_running: Arc::new(AtomicBool::new(false)), log: PathBuf::from("batch.log"),
+                outcome: Arc::new(std::sync::Mutex::new(None)), timing: String::new(),
+            })));
+        }
+        let message = patch::gate(patch::LaunchCheck::Update(refused_report())).unwrap_err();
+        for key in &keys { app.worker_event(WorkerEvent::Complete(key.clone(), Err(message.clone()))); }
+        assert!(app.released.is_empty());
+        assert_eq!(app.wait_update.as_ref().map(|update| update.keys.clone()), Some(keys.clone()));
+        assert_eq!(app.refused_plays.iter().map(|(key, _)| key.clone()).collect::<Vec<_>>(), keys);
+        // The Update (it signs the prepared sessions out) starts by itself; its success starts
+        // both again.
+        for row in &mut app.accounts[..2] { (row.pid, row.alive, row.game_running) = (None, None, None); }
+        let _ = app.update(Message::Tick);
+        assert!(app.maintenance == Some(MaintenanceKind::Update), "{}", app.status);
+        let mut current = refused_report();
+        current.state = patch::PatchState::Current;
+        app.launches = Some(Vec::new());
+        let _ = app.update(Message::MaintenanceFinished(MaintenanceKind::Update, Ok("Updated".into()), Some(current)));
+        let started: Vec<_> = app.launches.as_ref().unwrap().iter().map(|(keys, _, _, trigger)| (keys.clone(), *trigger)).collect();
+        assert_eq!(started, keys.iter().map(|key| (vec![key.clone()], Some(launch_timing::LaunchTrigger::ReissuedPlay))).collect::<Vec<_>>());
+        // A batch whose game started keeps nothing for a later end to be classified by.
+        let row = &mut app.accounts[2];
+        (row.busy, row.batch_requested, row.launch_trigger) = (true, true, Some(launch_timing::LaunchTrigger::BatchPlay));
+        let key = row.key.clone();
+        app.worker_event(WorkerEvent::Complete(key, Ok(LaunchResult {
+            pid: 90, detail: "FFXI started with the selected accounts.".into(), alive: Arc::new(AtomicBool::new(true)),
+            game_running: Arc::new(AtomicBool::new(true)), log: PathBuf::new(),
+            outcome: Arc::new(std::sync::Mutex::new(None)), timing: String::new(),
+        })));
+        assert!(app.accounts[2].is_playing() && app.accounts[2].launch_trigger.is_none());
+    }
+
+    /// Review finding: waited accounts in different game folders each get their folder's Update.
+    /// The first automatic Update covers the last refused account's folder; a Play it starts
+    /// again in another folder may ask for that folder's, which starts by itself too; a folder
+    /// that still refuses after its own Update never loops.
+    #[test]
+    fn waited_plays_in_other_game_folders_get_their_own_update() {
+        let mut app = maintenance_app();
+        app.settings.install_selected = true;
+        app.settings.install_path = std::env::temp_dir().join("crystal-wait-settings-folder").to_string_lossy().into_owned();
+        let own = std::env::temp_dir().join("crystal-wait-own-folder");
+        app.settings.account_installs.insert(account_key(&app.accounts[1].account), own.to_string_lossy().into_owned());
+        let (first, second) = (app.accounts[0].key.clone(), app.accounts[1].key.clone());
+        app.start_mode_at(vec![first.clone(), second.clone()], false, Instant::now());
+        flag_read(&mut app, Duration::ZERO, Ok(play_flag::Flag::Up));
+        assert_eq!(app.released, vec![first.clone(), second.clone()]);
+        let refuse = |app: &mut App, key: &str| {
+            let at = app.accounts.iter().position(|row| row.key == key).unwrap();
+            app.accounts[at].busy = true;
+            let message = patch::gate(patch::LaunchCheck::Update(refused_report())).unwrap_err();
+            app.worker_event(WorkerEvent::StartGame(key.to_owned(), Some(refused_report()), Err(message)));
+        };
+        let mut current = refused_report();
+        current.state = patch::PatchState::Current;
+        let finish = |app: &mut App| {
+            app.launches = Some(Vec::new());
+            let _ = app.update(Message::MaintenanceFinished(MaintenanceKind::Update, Ok("Updated".into()), Some(current.clone())));
+            app.launches.as_ref().unwrap().iter().map(|(keys, ..)| keys[0].clone()).collect::<Vec<_>>()
+        };
+        refuse(&mut app, &first);
+        refuse(&mut app, &second);
+        // The first Update covers the second's own folder (the last refusal); both start again.
+        let _ = app.update(Message::Tick);
+        assert_eq!(app.wait_update.as_ref().map(|update| update.folder.clone()), Some(Some(own.clone())));
+        assert_eq!(finish(&mut app), vec![first.clone(), second.clone()]);
+        assert_eq!(app.released, vec![first.clone()], "the Settings folder is not updated yet");
+        // The first's W20 refuses again: the Settings folder's Update starts by itself.
+        refuse(&mut app, &first);
+        let _ = app.update(Message::Tick);
+        assert!(app.maintenance == Some(MaintenanceKind::Update) && app.waited_update_running(&first));
+        assert_eq!(app.wait_update.as_ref().map(|update| update.folder.clone()), Some(None));
+        assert_eq!(finish(&mut app), vec![first.clone()]);
+        // Still refused after its own folder's Update: shown, and no further Update.
+        assert!(app.released.is_empty());
+        refuse(&mut app, &first);
+        let _ = app.update(Message::Tick);
+        assert!(app.maintenance.is_none() && app.wait_update.is_none());
+    }
+
+    /// The button, the row's headline and Cancel, and the update's progress, in both languages.
+    #[test]
+    fn wait_and_play_is_shown_in_both_languages() {
+        for lang in i18n::Lang::ALL {
+            i18n::set(lang);
+            let mut app = app();
+            app.services.as_mut().unwrap().availability = services::Availability::Maintenance;
+            let size = iced::Size::new(1440.0, 900.0);
+            app.viewport = size;
+            for row in &mut app.accounts { row.selected = false; }
+            app.accounts[0].selected = true;
+            let key = app.accounts[0].key.clone();
+            let texts = privacy::testing::texts(ui::view(&app), size);
+            assert!(texts.iter().any(|line| line == t("Wait and play")), "{texts:?}");
+            app.waiting_plays.push(WaitingPlay { keys: vec![key.clone()], otp: Vec::new(), armed: Instant::now(), codes: Vec::new() });
+            let texts = privacy::testing::texts(ui::view(&app), size);
+            assert!(texts.iter().any(|line| line == t("Waiting for FFXI…")), "{texts:?}");
+            assert!(texts.iter().any(|line| line == t("FFXI is down for maintenance. Starting as soon as it's back…")), "{texts:?}");
+            app.page = Page::Accounts;
+            let texts = privacy::testing::texts(ui::view(&app), size);
+            assert!(texts.iter().any(|line| line == t("FFXI is down for maintenance. Starting as soon as it's back…")), "{texts:?}");
+            assert!(texts.iter().any(|line| line == t("Cancel")), "{texts:?}");
+            app.waiting_plays.clear();
+            app.maintenance = Some(MaintenanceKind::Update);
+            app.wait_update = Some(WaitUpdate { keys: vec![key], started: true, folder: None });
+            let texts = privacy::testing::texts(ui::view(&app), size);
+            assert!(texts.iter().any(|line| line == t("Updating FFXI before it starts…")), "{texts:?}");
+        }
+        i18n::set(i18n::Lang::En);
+    }
+
+    /// Review finding: a language switch replaced the status with the cached headlines
+    /// (Unknown), and the first-read hold was already spent, so Play went through during
+    /// maintenance until the new language's read landed.
+    #[test]
+    fn a_language_switch_keeps_the_play_gate() {
+        let root = std::env::var_os("CRYSTAL_DATA_ROOT").map(PathBuf::from).unwrap_or_else(std::env::temp_dir)
+            .join(format!("crystal-language-gate-{}", backend::unique_id().unwrap()));
+        let mut app = app();
+        app.config = Config { experiment: root.clone(), repository: root.join("runtime"), game_install: None, dat_overlays: Vec::new() };
+        i18n::set(i18n::Lang::En);
+        app.preview = false;
+        status_read(&mut app, services::Availability::Operational, Some(Duration::from_secs(7 * 60)));
+        assert!(app.service_down());
+        let _ = app.update(Message::SetLanguage(i18n::Lang::Ja));
+        assert!(app.service_down(), "still maintenance after the switch");
+        app.launches = None;
+        app.start_mode_at(vec![app.accounts[0].key.clone()], false, Instant::now());
+        assert!(!app.accounts[0].busy && app.receiver.try_recv().is_err(), "refused");
+        let _ = app.update(Message::SetLanguage(i18n::Lang::En));
+        let _ = std::fs::remove_dir_all(&app.config.experiment);
+    }
+
+    /// Review finding: a refused sign-in after the game came back as the startup sign-in that
+    /// was waiting for that session.
+    #[test]
+    fn a_refused_sign_in_after_the_game_cancels_a_waiting_startup_sign_in() {
+        let (mut app, key) = resign_app("resign-refused-waiting");
+        status_read(&mut app, services::Availability::Operational, Some(Duration::from_secs(8 * 60)));
+        app.startup_waiting.push((key.clone(), Instant::now()));
+        game_ends(&mut app, 0, signed_out());
+        assert!(app.startup_waiting.is_empty());
+        let _ = app.update(Message::Tick);
+        assert!(app.launches.as_ref().unwrap().is_empty() && app.receiver.try_recv().is_err());
+        let _ = std::fs::remove_dir_all(&app.config.experiment);
     }
 
     #[test]
-    fn startup_signin_defaults_off_and_selection_runs_only_once_after_vault_load() {
+    fn startup_signin_waits_for_unknown_accounts_and_selection_runs_only_once_after_vault_load() {
         let older: Settings = serde_json::from_str(r#"{"install_path":"C:\\Games\\FFXI"}"#).unwrap();
-        assert!(older.account_startup_signin.is_empty());
+        assert!(older.auto_sign_in && older.account_no_otp.is_empty(), "on, but no account is known yet");
         let mut app = app();
         app.preview = false;
         app.startup_signin_pending = true;
         app.vault_ready = false;
         let first = app.accounts[0].key.clone();
-        app.settings.account_startup_signin = app.accounts.iter().map(|r| r.key.clone()).collect();
+        app.settings.account_no_otp = app.accounts.iter().map(|r| r.key.clone()).collect();
         app.accounts[1].busy = true; // Reconnecting to an existing background worker.
         app.accounts[2].account.mode = AccountMode::Private;
         assert!(app.take_startup_signins().is_empty());
@@ -5550,12 +9216,38 @@ mod tests {
         assert!(app.take_startup_signins().is_empty(), "refresh and client exit must not sign in again");
     }
 
+    /// Finding: a startup key queued while its row reconnects to the previous session is
+    /// dropped quietly once that session is back signed in; 60 s later its status is not
+    /// overwritten with "skipped". A row still busy past the limit says it was skipped.
+    #[test]
+    fn a_reconnected_startup_row_keeps_its_status() {
+        let mut app = app();
+        app.preview = false;
+        app.startup_signin_pending = true;
+        let key = app.accounts[0].key.clone();
+        app.settings.account_no_otp.insert(key.clone());
+        app.settings.account_no_otp.insert(app.accounts[1].key.clone());
+        app.accounts[0].busy = true; // Reconnecting to its background worker.
+        app.accounts[1].busy = true; // Its previous host still closing.
+        assert!(app.take_startup_signins().is_empty());
+        assert_eq!(app.startup_waiting.len(), 2);
+        // The reconnect completes: signed in, FFXI closed.
+        let row = &mut app.accounts[0];
+        (row.busy, row.pid, row.game_running) = (false, Some(99), Some(Arc::new(AtomicBool::new(false))));
+        row.status = "Signed in to PlayOnline · FFXI is closed".into();
+        let later = Instant::now() + STARTUP_WAIT_LIMIT + Duration::from_secs(1);
+        assert!(app.take_waiting_startups(later).is_empty());
+        assert_eq!(app.accounts[0].status, "Signed in to PlayOnline · FFXI is closed");
+        assert_eq!(app.accounts[1].status, "Startup sign-in skipped: a session is still running.");
+        assert!(app.startup_waiting.is_empty());
+    }
+
     #[test]
     fn startup_signin_skips_existing_sessions_previews_and_file_operations() {
         let mut app = app();
         app.preview = false;
         app.startup_signin_pending = true;
-        app.settings.account_startup_signin.insert(app.accounts[0].key.clone());
+        app.settings.account_no_otp.insert(app.accounts[0].key.clone());
         app.accounts[0].pid = Some(99);
         app.accounts[0].game_running = Some(Arc::new(AtomicBool::new(false)));
         assert!(app.take_startup_signins().is_empty());
@@ -5574,27 +9266,28 @@ mod tests {
         assert!(app.take_startup_signins().is_empty());
     }
 
+    /// What Crystal learned about a login's sign-ins stays with that login: an edit that keeps
+    /// it keeps the knowledge, a changed login (a new account key) learns it again, and a deleted
+    /// account's goes with it.
     #[test]
-    fn startup_signin_saved_in_settings_follows_edited_account_and_deleted_accounts() {
+    fn sign_in_knowledge_follows_the_login_and_deleted_accounts() {
         let mut app = app();
         let old_key = app.accounts[0].key.clone();
         let other_key = app.accounts[1].key.clone();
-        app.settings.account_startup_signin.extend([old_key.clone(), other_key.clone()]);
+        app.settings.account_no_otp.extend([old_key.clone(), other_key.clone()]);
+        app.settings.account_otp.insert(app.accounts[2].key.clone());
+        let _ = app.update(Message::EditAccount(other_key.clone()));
+        let _ = app.update(Message::EditorChanged(Field::Label, "Renamed".into()));
+        let saved = app.accounts.iter().map(|r| r.account.clone()).collect();
+        let _ = app.update(Message::AccountsSaved(Ok(saved)));
+        assert!(app.settings.presigns(&other_key), "the same login keeps what was learned");
         let _ = app.update(Message::EditAccount(old_key.clone()));
-        assert!(app.editor.as_ref().unwrap().startup_signin);
         let _ = app.update(Message::EditorChanged(Field::PolId, "NEW12345".into()));
         let edited = app.editor.as_ref().unwrap().account.clone();
         let new_key = account_key(&edited);
         let _ = app.update(Message::AccountsSaved(Ok(vec![edited])));
-        assert_eq!(app.settings.account_startup_signin, BTreeSet::from([new_key.clone()]));
-        let bytes = serde_json::to_vec(&app.settings).unwrap();
-        let reloaded: Settings = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(reloaded.account_startup_signin, app.settings.account_startup_signin);
-        let _ = app.update(Message::EditAccount(new_key));
-        let _ = app.update(Message::EditorStartupSignin(false));
-        let saved = app.accounts.iter().map(|r| r.account.clone()).collect();
-        let _ = app.update(Message::AccountsSaved(Ok(saved)));
-        assert!(app.settings.account_startup_signin.is_empty());
+        assert!(app.settings.account_no_otp.is_empty() && app.settings.account_otp.is_empty(), "deleted accounts are forgotten");
+        assert!(!app.settings.presigns(&new_key), "a changed login is unknown until it signs in");
     }
 
     #[test]
@@ -5619,9 +9312,17 @@ mod tests {
         row.play_timing = Some(launch_timing::Timeline::begin());
         let key = row.key.clone();
         let report = patch::PatchReport { state: patch::PatchState::Unknown, local_version: String::new(), remote_version: String::new(), detail: String::new(), source_url: None, files_verified: None };
-        app.worker_event(WorkerEvent::StartGame(key, report, Err("Version check refused".into())));
+        app.worker_event(WorkerEvent::StartGame(key.clone(), Some(report.clone()), Err("Version check refused".into())));
         assert!(app.accounts[0].play_timing.is_none());
         assert!(app.accounts[0].problem);
+        // An accepted start was W20 done: the Play's timeline shows it (07c §5.3).
+        app.accounts[0].play_timing = Some(launch_timing::Timeline::begin());
+        app.worker_event(WorkerEvent::StartGame(key.clone(), Some(report), Ok("Game version matches.".into())));
+        assert!(app.accounts[0].play_timing.as_ref().unwrap().elapsed_at(launch_timing::Milestone::GameChecked).is_some());
+        // A session that never reached its main menu ran no W20 and keeps the shown report.
+        app.patch = None;
+        app.worker_event(WorkerEvent::StartGame(key, None, Err("PlayOnline did not return to its main menu in time, so FFXI was not started.".into())));
+        assert!(app.patch.is_none() && app.accounts[0].problem);
     }
 
     #[test]
@@ -5634,7 +9335,7 @@ mod tests {
         assert_eq!(app.settings.launch_plan(account).unwrap().tool, pol_less::Tool::Vanilla);
         assert_eq!(app.accounts[1].account.launch_with, other);
         app.editor = Some(Editor { key: Some(key), account: account.clone(),
-            game_install: String::new(), dat_overlays: Vec::new(), startup_signin: false, auto_login: pol_less::AutoLogin::default() });
+            game_install: String::new(), dat_overlays: Vec::new(), auto_login: pol_less::AutoLogin::default() });
         let _ = app.update(Message::EditorLaunchWith(Some(ui::LaunchWith::Windower)));
         assert_eq!(app.editor.as_ref().unwrap().account.launch_with, Some(ui::LaunchWith::Windower));
         let _ = app.update(Message::EditorLaunchWith(Some(ui::LaunchWith::Vanilla)));
@@ -5650,7 +9351,7 @@ mod tests {
             account: blank_account(),
             game_install: String::new(),
             dat_overlays: Vec::new(),
-            startup_signin: false, auto_login: pol_less::AutoLogin::default(),
+            auto_login: pol_less::AutoLogin::default(),
         });
         app.vault_saving = true;
         let _ = app.update(Message::AccountsSaved(Err("Save failed".into())));
@@ -5762,7 +9463,7 @@ mod tests {
         let path = r"C:\Games\Private Server";
         app.settings.install_path = r"C:\Games\Retail".into();
         app.settings.install_selected = true;
-        app.editor = Some(Editor { key: Some(first_key.clone()), account: first.clone(), game_install: path.into(), dat_overlays: vec![r"C:\Mods\High Priority".into(), r"C:\Mods\Fallback".into()], startup_signin: false, auto_login: pol_less::AutoLogin::default() });
+        app.editor = Some(Editor { key: Some(first_key.clone()), account: first.clone(), game_install: path.into(), dat_overlays: vec![r"C:\Mods\High Priority".into(), r"C:\Mods\Fallback".into()], auto_login: pol_less::AutoLogin::default() });
         let values: Vec<_> = app.accounts.iter().map(|r| r.account.clone()).collect();
         let _ = app.update(Message::AccountsSaved(Ok(values.clone())));
         let config = app.settings.config_for(&app.config, &first);
@@ -5794,7 +9495,7 @@ mod tests {
         app.settings.account_auto_away.insert("obsolete".into(), 60);
         app.settings.account_installs.insert(previous.clone(), r"C:\Games\Account".into());
         app.settings.account_overlays.insert(previous.clone(), vec![r"C:\Mods\Account".into()]);
-        app.settings.account_startup_signin.insert(previous.clone());
+        app.settings.account_no_otp.insert(previous.clone());
         app.settings.account_order = vec![previous.clone(), app.accounts[1].key.clone(), "obsolete".into()];
         let auto_login = pol_less::AutoLogin { enabled: true, character_slot: 3 };
         app.settings.account_auto_login.insert(previous.clone(), auto_login);
@@ -5811,17 +9512,18 @@ mod tests {
         let reloaded: Settings = serde_json::from_slice(&serde_json::to_vec(&app.settings).unwrap()).unwrap();
         assert_eq!(reloaded.account_auto_login, app.settings.account_auto_login);
         assert_eq!(app.settings.account_installs.get(&key).map(String::as_str), Some(r"C:\Games\Account"));
-        assert!(app.settings.account_overlays.contains_key(&key) && app.settings.account_startup_signin.contains(&key));
+        assert!(app.settings.account_overlays.contains_key(&key));
+        assert!(!app.settings.account_no_otp.contains(&key), "a changed login learns its sign-ins again");
         assert_eq!(app.settings.account_order, [key.clone(), app.accounts.iter().find(|row| row.key != key).unwrap().key.clone()]);
         assert!(app.accounts.iter().find(|row| row.key == key).unwrap().selected);
         for exists in [app.settings.account_installs.contains_key(&previous), app.settings.account_overlays.contains_key(&previous),
-            app.settings.account_startup_signin.contains(&previous)] { assert!(!exists); }
+            app.settings.account_no_otp.contains(&previous)] { assert!(!exists); }
 
         let values = app.accounts.iter().filter(|row| row.key != key).map(|row| row.account.clone()).collect();
         let _ = app.update(Message::AccountsSaved(Ok(values)));
         assert_eq!(app.settings.selected_accounts, Some(BTreeSet::new()));
         assert!(app.settings.account_auto_away.is_empty() && app.settings.account_installs.is_empty());
-        assert!(app.settings.account_overlays.is_empty() && app.settings.account_startup_signin.is_empty());
+        assert!(app.settings.account_overlays.is_empty() && app.settings.account_no_otp.is_empty());
         assert!(app.settings.account_auto_login.is_empty());
         assert!(!app.settings.account_order.contains(&key));
     }

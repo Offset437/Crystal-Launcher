@@ -26,7 +26,11 @@ pub(crate) const PROTOCOL: u32 = 1;
 /// A line from the loader. Unknown types and fields are tolerated.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum LoaderEvent {
-    Hello { v: u32, pid: u32, native_auth: bool, native_social: bool, native_batch: bool },
+    /// `viewer_check`: the loader asks for the sign-in's W2U at Connect (07c §1).
+    /// `park`: it accepts a credential-less `park` line first (pol-spec 07d §1).
+    Hello { v: u32, pid: u32, native_auth: bool, native_social: bool, native_batch: bool, viewer_check: bool, park: bool },
+    /// `parked`: polcore is created and the host waits for `credentials` (07d §1.3).
+    Parked { polcore_ms: Option<u64> },
     Started { pid: Option<u32> },
     Presence(Vec<u8>),
     NativeAuthStage(i32),
@@ -37,8 +41,15 @@ pub(crate) enum LoaderEvent {
     NativeSessionState(bool),
     NativeOwnMode(i32),
     NativeGameEnded { code: i32, game_returned: bool },
+    NativeSignOutComplete(i32),
     NativeControlResult { action: String, code: i32 },
+    ControllerResult { id: u64, ok: bool, message: String },
     NativeSocialReady,
+    /// `native_viewer_check`: the loader reached Open(0) and waits for this sign-in's
+    /// W2U (:54000) verdict before Open(1) (pol-spec 07c §1).
+    NativeViewerCheck,
+    /// `native_main_menu`: the Viewer presence publish completed (07c §2); W20 may follow.
+    NativeMainMenu { code: i32, returned: bool },
     NativeMailChanged,
     NativeSocialResult { id: String, action: String, code: i32, payload: Option<Vec<u8>> },
     Exit(i32),
@@ -66,6 +77,8 @@ struct Incoming {
     #[serde(default)]
     game_returned: bool,
     #[serde(default)]
+    returned: bool,
+    #[serde(default)]
     message: Option<String>,
     #[serde(default)]
     native_auth: bool,
@@ -74,6 +87,12 @@ struct Incoming {
     #[serde(default)]
     native_batch: bool,
     #[serde(default)]
+    viewer_check: bool,
+    #[serde(default)]
+    park: bool,
+    #[serde(default)]
+    polcore_ms: Option<u64>,
+    #[serde(default)]
     game: Option<bool>,
     #[serde(default)]
     action: Option<String>,
@@ -81,6 +100,10 @@ struct Incoming {
     mode: Option<i64>,
     #[serde(default)]
     id: Option<String>,
+    #[serde(default)]
+    request_id: Option<u64>,
+    #[serde(default)]
+    ok: Option<bool>,
 }
 
 /// Parse one loader line (without its `\n`).
@@ -99,7 +122,10 @@ pub(crate) fn parse_event(line: &[u8]) -> Result<LoaderEvent, String> {
             native_auth: value.native_auth,
             native_social: value.native_social,
             native_batch: value.native_batch,
+            viewer_check: value.viewer_check,
+            park: value.park,
         },
+        "parked" => LoaderEvent::Parked { polcore_ms: value.polcore_ms },
         "started" => LoaderEvent::Started { pid: pid(value.pid) },
         "presence" => LoaderEvent::Presence(
             base64_decode(value.payload.as_deref().unwrap_or(""))
@@ -131,11 +157,26 @@ pub(crate) fn parse_event(line: &[u8]) -> Result<LoaderEvent, String> {
             code: value.code.and_then(|c| i32::try_from(c).ok()).ok_or("Invalid game exit result.")?,
             game_returned: value.game_returned,
         },
+        "native_sign_out_complete" => LoaderEvent::NativeSignOutComplete(
+            value.code.and_then(|c| i32::try_from(c).ok()).filter(|c| *c <= 0)
+                .ok_or("Invalid native POL sign-out result.")?
+        ),
         "native_control_result" => LoaderEvent::NativeControlResult {
-            action: value.action.filter(|a| matches!(a.as_str(), "start_game" | "sign_out" | "visible" | "away" | "invisible")).ok_or("Invalid native POL control action.")?,
+            action: value.action.filter(|a| matches!(a.as_str(), "start_game" | "sign_out" | "visible" | "away" | "invisible" | "groups")).ok_or("Invalid native POL control action.")?,
             code: value.code.and_then(|c| i32::try_from(c).ok()).ok_or("Invalid native POL control result.")?,
         },
+        "controller_result" => LoaderEvent::ControllerResult {
+            id: value.request_id.ok_or("Invalid controller request identity.")?,
+            ok: value.ok.ok_or("Invalid controller result.")?,
+            message: value.message.filter(|text| text.len() <= 1024 && !text.contains('\0'))
+                .ok_or("Invalid controller result message.")?,
+        },
         "native_social_ready" => LoaderEvent::NativeSocialReady,
+        "native_viewer_check" => LoaderEvent::NativeViewerCheck,
+        "native_main_menu" => LoaderEvent::NativeMainMenu {
+            code: value.code.and_then(|c| i32::try_from(c).ok()).ok_or("Invalid native POL main-menu result.")?,
+            returned: value.returned,
+        },
         "native_mail_changed" => LoaderEvent::NativeMailChanged,
         "native_social_result" => {
             let id = value.id.filter(|s| s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit())).ok_or("Invalid native social request identity.")?;
@@ -295,6 +336,8 @@ pub(crate) struct LoaderPipe {
     native_auth: bool,
     native_social: bool,
     native_batch: bool,
+    viewer_check: bool,
+    park: bool,
     command_wake: Option<crate::session_worker::CommandWake>,
     command_wake_pending: bool,
 }
@@ -306,6 +349,12 @@ impl LoaderPipe {
     pub(crate) fn supports_native_auth(&self)->bool { self.native_auth }
     pub(crate) fn supports_native_social(&self)->bool { self.native_social }
     pub(crate) fn supports_native_batch(&self)->bool { self.native_batch }
+    /// The launcher sends no W2U of its own; a loader without this never
+    /// sends one before :51240 either.
+    pub(crate) fn supports_viewer_check(&self)->bool { self.viewer_check }
+    /// The loader accepts a credential-less `park` line (pol-spec 07d §1); a loader without
+    /// it is never parked and only gets today's `session` line.
+    pub(crate) fn supports_park(&self)->bool { self.park }
     /// The full `\\.\pipe\...` path the loader opens.
     pub(crate) fn name(&self) -> &str {
         &self.name
@@ -372,11 +421,13 @@ impl LoaderPipe {
                 "The process on the session pipe (PID {client}) is not the one that said hello (PID {pid}); the session was not sent.",
                 &[("client", &client), ("pid", &pid)],
             )),
-            LoaderEvent::Hello { pid, native_auth, native_social, native_batch, .. } => {
+            LoaderEvent::Hello { pid, native_auth, native_social, native_batch, viewer_check, park, .. } => {
                 verify_image(pid, expected_image)?;
                 self.native_auth=native_auth;
                 self.native_social=native_social;
                 self.native_batch=native_batch;
+                self.viewer_check=viewer_check;
+                self.park=park;
                 Ok(pid)
             }
             _ => Err(t("crystal-loader did not start with a hello; the session was not sent.").into()),
@@ -525,7 +576,7 @@ mod sys {
                     &attributes,
                 ))?;
                 let event = owned(CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()))?;
-                Ok(Self { name, handle, event, buffer: Vec::new(), native_auth:false, native_social:false, native_batch:false,
+                Ok(Self { name, handle, event, buffer: Vec::new(), native_auth:false, native_social:false, native_batch:false, viewer_check:false, park:false,
                     command_wake:None, command_wake_pending:false })
             }
         }
@@ -719,6 +770,20 @@ mod tests {
     use super::*;
     use std::io::{BufRead, BufReader, Write};
 
+    #[test]
+    fn controller_results_keep_large_ids_and_do_not_use_social_ids() {
+        assert!(matches!(parse_event(br#"{"type":"controller_result","request_id":18446744073709551615,"ok":true,"message":""}"#),
+            Ok(LoaderEvent::ControllerResult { id: u64::MAX, ok: true, message }) if message.is_empty()));
+        assert!(matches!(parse_event(br#"{"type":"controller_result","request_id":0,"ok":false,"message":"Unavailable"}"#),
+            Ok(LoaderEvent::ControllerResult { id: 0, ok: false, .. })));
+        for invalid in [
+            r#"{"type":"controller_result","id":"1","ok":true,"message":""}"#,
+            r#"{"type":"controller_result","request_id":1,"message":""}"#,
+            r#"{"type":"controller_result","request_id":-1,"ok":true,"message":""}"#,
+            r#"{"type":"controller_result","request_id":1,"ok":true,"message":"bad\u0000value"}"#,
+        ] { assert!(parse_event(invalid.as_bytes()).is_err()); }
+    }
+
     fn secrets() -> SessionSecrets {
         SessionSecrets {
             v_key: Zeroizing::new([0xA5; 16]),
@@ -775,15 +840,23 @@ mod tests {
 
     #[test]
     fn loader_lines_parse_and_tolerate_unknown_fields() {
-        assert_eq!(parse_event(br#"{"type":"hello","v":1,"pid":1234,"native_auth":true,"native_social":true}"#).unwrap(), LoaderEvent::Hello { v:1,pid:1234,native_auth:true,native_social:true,native_batch:false });
-        assert_eq!(parse_event(br#"{"type":"hello","v":1,"pid":1234,"native_auth":true,"native_social":true,"native_batch":true}"#).unwrap(), LoaderEvent::Hello { v:1,pid:1234,native_auth:true,native_social:true,native_batch:true });
+        assert_eq!(parse_event(br#"{"type":"hello","v":1,"pid":1234,"native_auth":true,"native_social":true}"#).unwrap(), LoaderEvent::Hello { v:1,pid:1234,native_auth:true,native_social:true,native_batch:false,viewer_check:false, park:false });
+        // A pre-round-1 loader (16e26f3): no viewer_check, so it never asks for the W2U.
+        assert_eq!(parse_event(br#"{"type":"hello","v":1,"pid":1234,"native_auth":true,"native_social":true,"native_batch":true}"#).unwrap(), LoaderEvent::Hello { v:1,pid:1234,native_auth:true,native_social:true,native_batch:true,viewer_check:false, park:false });
+        // crystal-loader proto::hello_line.
+        assert_eq!(parse_event(br#"{"type":"hello","v":1,"pid":1234,"native_auth":true,"native_social":true,"native_batch":true,"viewer_check":true}"#).unwrap(), LoaderEvent::Hello { v:1,pid:1234,native_auth:true,native_social:true,native_batch:true,viewer_check:true, park:false });
         assert_eq!(parse_event(br#"{"type":"native_session_state","game":false}"#).unwrap(), LoaderEvent::NativeSessionState(false));
         assert!(parse_event(br#"{"type":"native_session_state","game":1}"#).is_err());
         assert!(parse_event(br#"{"type":"native_session_state"}"#).is_err());
         assert!(parse_event(br#"{"type":"native_control_result","action":"delete_profile","code":0}"#).is_err());
         assert_eq!(parse_event(br#"{"type":"native_control_result","action":"sign_out","code":-256}"#).unwrap(), LoaderEvent::NativeControlResult { action: "sign_out".into(), code: -256 });
-        assert_eq!(parse_event(br#"{"type":"hello","v":1,"pid":1234,"extra":true}"#).unwrap(), LoaderEvent::Hello { v: 1, pid: 1234, native_auth:false, native_social:false, native_batch:false });
-        assert_eq!(parse_event(br#"{"type":"hello","v":1,"pid":1234,"native_auth":true}"#).unwrap(), LoaderEvent::Hello { v:1,pid:1234,native_auth:true,native_social:false,native_batch:false });
+        assert_eq!(parse_event(br#"{"type":"native_control_result","action":"groups","code":1}"#).unwrap(), LoaderEvent::NativeControlResult { action: "groups".into(), code: 1 });
+        assert_eq!(parse_event(br#"{"type":"native_sign_out_complete","code":0}"#).unwrap(), LoaderEvent::NativeSignOutComplete(0));
+        assert_eq!(parse_event(br#"{"type":"native_sign_out_complete","code":-2046}"#).unwrap(), LoaderEvent::NativeSignOutComplete(-2046));
+        assert!(parse_event(br#"{"type":"native_sign_out_complete"}"#).is_err());
+        assert!(parse_event(br#"{"type":"native_sign_out_complete","code":7}"#).is_err());
+        assert_eq!(parse_event(br#"{"type":"hello","v":1,"pid":1234,"extra":true}"#).unwrap(), LoaderEvent::Hello { v: 1, pid: 1234, native_auth:false, native_social:false, native_batch:false, viewer_check:false, park:false });
+        assert_eq!(parse_event(br#"{"type":"hello","v":1,"pid":1234,"native_auth":true}"#).unwrap(), LoaderEvent::Hello { v:1,pid:1234,native_auth:true,native_social:false,native_batch:false,viewer_check:false, park:false });
         assert_eq!(parse_event(br#"{"type":"authenticated"}"#).unwrap(),LoaderEvent::Authenticated);
         assert_eq!(parse_event(br#"{"type":"native_pol_status","code":-1025}"#).unwrap(),LoaderEvent::NativeStatus(-1025));
         assert!(parse_event(br#"{"type":"native_pol_status","code":1}"#).is_err());
@@ -824,6 +897,24 @@ mod tests {
         locations.pop();
         let line=serde_json::json!({"type":"native_friends","payload":encoded(&blob),"locations":encoded(&locations)});
         assert!(parse_event(line.to_string().as_bytes()).is_err());
+    }
+
+    /// The loader's lines from pol-spec 07c (round-1 contract), as crystal-loader proto.rs writes them.
+    #[test]
+    fn round1_viewer_check_and_main_menu_events_parse() {
+        assert_eq!(parse_event(br#"{"type":"native_viewer_check"}"#).unwrap(), LoaderEvent::NativeViewerCheck);
+        assert_eq!(parse_event(br#"{"type":"native_main_menu","code":1,"returned":false}"#).unwrap(), LoaderEvent::NativeMainMenu { code: 1, returned: false });
+        assert_eq!(parse_event(br#"{"type":"native_main_menu","code":-2046,"returned":true}"#).unwrap(), LoaderEvent::NativeMainMenu { code: -2046, returned: true });
+        assert!(parse_event(br#"{"type":"native_main_menu","returned":false}"#).is_err());
+    }
+
+    /// pol-spec 07d §1: the hello's `park` and the `parked` line, as crystal-loader proto.rs writes them.
+    #[test]
+    fn round2_park_hello_and_parked_events_parse() {
+        let hello = br#"{"type":"hello","v":1,"pid":1234,"native_auth":true,"native_social":true,"native_batch":true,"viewer_check":true,"park":true}"#;
+        assert_eq!(parse_event(hello).unwrap(), LoaderEvent::Hello { v:1,pid:1234,native_auth:true,native_social:true,native_batch:true,viewer_check:true, park:true });
+        assert_eq!(parse_event(br#"{"type":"parked","pid":1234,"polcore_ms":431}"#).unwrap(), LoaderEvent::Parked { polcore_ms: Some(431) });
+        assert_eq!(parse_event(br#"{"type":"parked","pid":1234}"#).unwrap(), LoaderEvent::Parked { polcore_ms: None });
     }
 
     #[test]

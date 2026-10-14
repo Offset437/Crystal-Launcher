@@ -18,7 +18,7 @@ Drag an account's handle to change its position; Crystal saves the order. Accoun
 
 Settings → Graphics offers optional ReShade for Vanilla, Windower and Ashita. Enable dgVoodoo, close games and sign out PlayOnline sessions, then choose Set up ReShade. Crystal downloads the standard official setup tool and selects its 32-bit game host and DirectX API. Choose the effects you want, finish setup, then turn ReShade on. Choose preset imports a copy of a preset `.ini`; its required effects can be installed through setup. Home opens ReShade's in-game menu. Presets, shaders and configuration are kept in Crystal's data folder through launcher updates and reinstalls; ReShade binaries and shaders are not bundled with Crystal.
 
-Each account has an optional automatic character login setting, disabled by default. Slot 1 selects the first character; choose another row for a different character. Navigation runs only while that game window is active. Unknown game layouts, unavailable characters and unexpected menus leave login to you.
+Each account has an optional automatic character login setting, disabled by default. Slot 1 selects the first character; choose another row for a different character. Each client can finish login in the background without switching your active window. Unknown game layouts, unavailable characters and unexpected menus leave login to you.
 
 The Home page and account editor let you choose each account's launch method. Settings → System sets the default for accounts using “Use default.” Vanilla starts Crystal's game host directly, uses the game's settings, and does not start Windower or Ashita or load their addons. Sign out of an existing PlayOnline session before switching its launch method; an already running host retains its original tool.
 
@@ -32,7 +32,11 @@ Update and repair require closed game clients and signed-out PlayOnline sessions
 
 Controller navigation is enabled by default. The D-pad or left stick moves focus, the bottom face button selects, the right face button goes back, shoulders change pages, and Start activates the main Play/Update button. Select a dropdown or slider to adjust its value, then confirm again. Navigation pauses outside Crystal and during game-button binding. Text entry and Windows file dialogs use the keyboard and mouse. Disable navigation under Settings → System.
 
-Crystal checks for signed launcher releases in the background. An available release offers **Update and restart**; running games continue. Settings → System provides a manual check and the automatic-check preference. The update helper replaces this launcher and its notices after the window exits, retaining the previous package. Launcher updates become available after a signed release is published.
+Controller bindings and options save automatically and apply to running retail games launched with the current Crystal build. Switching from XInput to DirectInput requires restarting that game. Controller setup includes ROG Xbox Ally and Ally X; positively identified built-in controls show the handheld's battery. Windows battery reports provide percentages or coarse levels, with charging shown separately.
+
+Privacy mode uses fixed-width masks for names, identifiers and message fields. Saved account details and message drafts are retained.
+
+Crystal checks for signed launcher releases in the background. An available release offers **Update and restart**; running games continue. Settings → System provides a manual check and the automatic-check preference. The update helper replaces this launcher and its notices after the window exits, retaining the previous package. Automatic updates require a publicly accessible signed release. While the repository is private, install the supplied setup executable to update Crystal; saved accounts and settings are retained.
 
 ## Building
 

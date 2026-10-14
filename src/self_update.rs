@@ -259,7 +259,7 @@ async fn check() -> Result<Option<Release>, String> {
         .await
         .map_err(|e| e.to_string())?;
     if index.status() == reqwest::StatusCode::NOT_FOUND {
-        return Ok(None);
+        return Err(t("GitHub launcher releases are unavailable. Private builds need the supplied installer.").into());
     }
     let releases: Vec<PublishedRelease> = serde_json::from_slice(
         &body(

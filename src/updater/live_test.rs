@@ -141,32 +141,30 @@ async fn official_copy_update_repair_and_cancel_resume() {
     assert!(!root.join(STATE_DIR).join("transaction.json").exists());
     eprintln!("Cancellation after Apply restored both file states and original version metadata");
 
+    // The copy is already at the latest version, so this update doesn't change the modified
+    // file: it stays, and no longer holds the version back (owner, 2026-10-13).
     let updated = run(root.clone(), Mode::Update, Operation::new()).await.unwrap();
     assert_eq!((updated.outdated, updated.missing, updated.modified, updated.repaired), (1, 1, 1, 2));
+    assert_eq!((updated.kept, updated.left), (0, 1));
     assert_eq!(updated.bytes, 0, "Resume must reuse the previously verified staged downloads");
-    assert!(!updated.verified, "Unknown modifications prevent a verified version commit");
+    assert!(updated.verified, "A modification this update doesn't change no longer prevents the commit: {}", updated.summary);
+    assert_eq!(updated.version, baseline.version);
     assert_eq!(fs::read(&old_path).unwrap(), direct);
     assert_eq!(FileSig::of_path(&missing_path).unwrap(), missing_file.current().sig);
     assert_eq!(fs::read(&modified_path).unwrap(), custom);
-    assert_eq!(fs::read(root.join("patch.ver")).unwrap(), applied_before);
-    assert_eq!(fs::read(root.join("patch.cfg")).unwrap(), manifest_before);
+    assert_eq!(crate::patch::installed_for_request(&root), baseline.version, "patch.ver still records the same version");
+    let installed_list = manifest::parse(&fs::read_to_string(root.join("patch.cfg")).unwrap()).unwrap();
+    assert_eq!(installed_list.latest_stamp(), Some(baseline.version.as_str()), "patch.cfg still lists the same version");
+    assert!(!root.join(STATE_DIR).join("kept").join(&modified_file.path).exists(), "a file left in place has no kept copy");
     eprintln!("Update/resume: {}", updated.summary);
 
     let repaired = run(root.clone(), Mode::Repair, Operation::new()).await.unwrap();
     assert!(repaired.verified);
-    assert_eq!(repaired.repaired, 1);
+    assert_eq!((repaired.repaired, repaired.kept), (1, 1));
     assert_eq!(fs::read(&modified_path).unwrap(), modified_before);
-    let mut retained_custom = false;
-    for backup in fs::read_dir(root.join(STATE_DIR).join("backups")).unwrap() {
-        let record = backup.unwrap().path().join("records.json");
-        if !record.is_file() { continue; }
-        let journal: Journal = serde_json::from_slice(&fs::read(record).unwrap()).unwrap();
-        for entry in journal.entries.iter().filter(|entry| entry.path == modified_file.path) {
-            let path = confined(&root, entry.backup.as_deref().unwrap()).unwrap();
-            retained_custom |= fs::read(path).unwrap() == custom;
-        }
-    }
-    assert!(retained_custom, "Repair must retain the modified file's exact original bytes");
+    // The lasting copy: older transactions' backups go at the next commit.
+    assert_eq!(fs::read(root.join(STATE_DIR).join("kept").join(&modified_file.path)).unwrap(), custom,
+        "Repair must keep the modified file's exact original bytes in .xi-updater\\kept");
     assert_eq!(crate::patch::installed_for_request(&root), baseline.version);
     eprintln!("Repair: {}", repaired.summary);
 
@@ -176,6 +174,6 @@ async fn official_copy_update_repair_and_cancel_resume() {
     assert!(!root.join(STATE_DIR).join("transaction.json").exists());
     eprintln!("Final independent official Check: {}", final_check.summary);
     fs::write(root.parent().unwrap().join("result.txt"), format!(
-        "{}\nReal official delta matched an independent direct download.\nCancellation after Apply restored the files and metadata.\n{}\nVerified staged downloads reused without re-downloading.\n{}\nModified original retained in backups.\n{}\n", baseline.summary, updated.summary, repaired.summary, final_check.summary
+        "{}\nReal official delta matched an independent direct download.\nCancellation after Apply restored the files and metadata.\n{}\nVerified staged downloads reused without re-downloading; the modification it doesn't change stayed.\n{}\nModified original kept in .xi-updater\\kept.\n{}\n", baseline.summary, updated.summary, repaired.summary, final_check.summary
     )).unwrap();
 }
