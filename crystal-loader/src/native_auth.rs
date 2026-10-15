@@ -1201,6 +1201,12 @@ impl NativeSession {
     /// Observe native snapshots through locked getters only (167/169/206/207/
     /// 838 and friend_locations). Never requests, pumps or consumes
     /// notifications, so it may run during play.
+    /// Keep the signed-in owner responsive while another Windower launcher
+    /// completes its profile save, before this process calls GameStart.
+    pub(crate) fn startup_frame(&mut self) -> bool {
+        owner_frame(&self.api, &mut self.pushes)
+    }
+
     pub fn observe_friends(&self) -> Result<FriendObserver, String> {
         let api = self.api.clone();
         let (stop, stopping) = mpsc::channel();

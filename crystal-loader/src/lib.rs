@@ -37,6 +37,10 @@ pub mod slots;
 pub mod trace;
 #[cfg(target_arch = "x86")]
 mod windower_exit;
+#[cfg(target_arch = "x86")]
+mod windower_start;
+#[cfg(target_arch = "x86")]
+mod windower_plugin_settings;
 
 use std::time::Duration;
 

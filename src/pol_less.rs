@@ -521,6 +521,9 @@ fn prepare_with_progress(config: &Config, plan: &Plan, account: &Account, timing
             }
             profile_access = Some(profile_access::launching(&tool_dir, progress)?);
             timing.stage("preparation: profile access acquired");
+            // A previous Windower launcher may now be saving this same file.
+            // Its native host holds the shared launch turn through that exit.
+            let _snapshot_turn = crate::session_worker::windower_turn(progress)?;
             ffxi_settings = Some(ffxi_settings::for_windower(&tool_dir, &profile)?);
         }
     }

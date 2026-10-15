@@ -1357,6 +1357,11 @@ pub(crate) fn find(config: &Config, account: &Account) -> Option<BackgroundSessi
 }
 
 impl BackgroundSession {
+    fn uses_windower(&self) -> bool {
+        read_record(&self.path).is_some_and(|record| record.worker == self.worker
+            && record.launch_tool == Some(Tool::Windower))
+    }
+
     pub(crate) fn game_running(&self) -> Option<bool> {
         if !self.active() { return None; }
         self.path.parent().and_then(|directory| read_friend_cache(directory, self.worker))
@@ -1523,6 +1528,42 @@ pub(crate) async fn sign_out_for_update(sessions: Vec<BackgroundSession>, operat
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+/// Retire idle Windower owners before its editor reads settings.xml. A worker
+/// can publish Finished before its Windower child saves, so wait for the actual
+/// worker exit, not just its session record. Active games keep running.
+pub(crate) fn sign_out_for_profile_editor(sessions: Vec<BackgroundSession>, mut progress: impl FnMut(&str)) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    for session in sessions.into_iter().filter(BackgroundSession::uses_windower) {
+        if !session.can_prepare_update() { continue; }
+        progress(t("Signing out idle PlayOnline sessions so Windower can edit profiles..."));
+        let mut requested = false;
+        while identity(session.worker.pid) == Some(session.worker) {
+            if session.active() && !requested {
+                // A Play queued elsewhere wins over the editor; never replace it
+                // with SignOut, and never stop a game that started meanwhile.
+                if !session.can_prepare_update() { break; }
+                let directory = session.path.parent().ok_or(t("Could not locate the PlayOnline session."))?;
+                let queued = directory.join("native-control.json");
+                if queued.exists() {
+                    return Err(t("Wait for the current PlayOnline request to finish, then edit profiles.").into());
+                }
+                let ready = read_friend_cache(directory, session.worker).is_some_and(|snapshot|
+                    snapshot.game_running == Some(false) && !snapshot.social.busy)
+                    && !directory.join("native-social.json").exists();
+                if ready {
+                    request_session_control(&session, NativeControl::SignOut, true)?;
+                    requested = true;
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(t("Timed out waiting for Windower to save profiles. No editor was opened.").into());
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+    Ok(())
 }
 
 // The batch observer already checked the installed Viewer before handing off
@@ -2374,6 +2415,16 @@ mod tests {
                 outcome,
             })
         });
+        // Model the retained Windower observer: Finished is already published,
+        // but its launcher still owns a final settings.xml save.
+        if root.join("hold-final-profile-save").exists() {
+            fs::write(root.join("final-profile-save-pending"), []).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !root.join("finish-profile-save").exists() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            fs::write(root.join("final-profile-save-complete"), []).unwrap();
+        }
         std::process::exit(code);
     }
 
@@ -2666,6 +2717,74 @@ mod tests {
         request_native_control(&config, &account, NativeControl::SignOut).unwrap();
         until(|| !launch.alive.load(Ordering::Acquire));
         assert!(find(&config, &account).is_none());
+    }
+
+    #[test]
+    fn profile_editor_retires_idle_windower_workers_but_preserves_games_and_other_tools() {
+        let idle_one = Fixture::new();
+        let idle_two = Fixture::new();
+        let game_fixture = Fixture::new();
+        let ashita_fixture = Fixture::new();
+        let account = account();
+        let launch = |fixture: &Fixture, tool| {
+            fs::write(fixture.0.join("social-fixture"), []).unwrap();
+            let config = config(&fixture.0);
+            let plan = Plan { tool, settings: Default::default(), social_only: true,
+                invisible_login: false, auto_away_minutes: 0, auto_login: Default::default(),
+                viewer_gaps: false, trigger: Default::default() };
+            let started = launch_command(child_command("session_worker::tests::worker_fixture", &fixture.0),
+                &config, account.clone(), String::new(), Some(plan), Instant::now(), |_| {}).unwrap();
+            (config, started)
+        };
+        let (one_config, one) = launch(&idle_one, Tool::Windower);
+        let (two_config, two) = launch(&idle_two, Tool::Windower);
+        let (game_config, game) = launch(&game_fixture, Tool::Windower);
+        let (ashita_config, ashita) = launch(&ashita_fixture, Tool::Ashita);
+        request_native_control(&game_config, &account, NativeControl::StartGame).unwrap();
+        until(|| game.game_running.load(Ordering::Acquire));
+        let sessions = [&one_config, &two_config, &game_config, &ashita_config].iter()
+            .map(|config| find(config, &account).unwrap()).collect();
+        let mut progress = Vec::new();
+        sign_out_for_profile_editor(sessions, |message| progress.push(message.to_owned())).unwrap();
+        assert_eq!(progress.len(), 2);
+        until(|| !one.alive.load(Ordering::Acquire) && !two.alive.load(Ordering::Acquire));
+        assert!(!one.alive.load(Ordering::Acquire) && !two.alive.load(Ordering::Acquire));
+        assert!(game.alive.load(Ordering::Acquire) && game.game_running.load(Ordering::Acquire));
+        assert!(ashita.alive.load(Ordering::Acquire));
+        assert!(!game_config.account_directory(&account).join("native-control.json").exists());
+        assert!(!ashita_config.account_directory(&account).join("native-control.json").exists());
+        for fixture in [&game_fixture, &ashita_fixture] { fs::write(fixture.0.join("stop"), []).unwrap(); }
+        until(|| !game.alive.load(Ordering::Acquire) && !ashita.alive.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn profile_editor_waits_for_the_final_save_after_a_finished_record() {
+        let fixture = Fixture::new();
+        fs::write(fixture.0.join("social-fixture"), []).unwrap();
+        fs::write(fixture.0.join("hold-final-profile-save"), []).unwrap();
+        let config = config(&fixture.0);
+        let account = account();
+        let plan = Plan { tool: Tool::Windower, settings: Default::default(), social_only: true,
+            invisible_login: false, auto_away_minutes: 0, auto_login: Default::default(),
+            viewer_gaps: false, trigger: Default::default() };
+        let _launch = launch_command(child_command("session_worker::tests::worker_fixture", &fixture.0),
+            &config, account.clone(), String::new(), Some(plan), Instant::now(), |_| {}).unwrap();
+        let session = find(&config, &account).unwrap();
+        let worker = session.worker;
+        let (send, received) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let result = sign_out_for_profile_editor(vec![session], |_| {});
+            send.send(result).unwrap();
+        });
+        until(|| fixture.0.join("final-profile-save-pending").exists());
+        assert!(find(&config, &account).is_none(), "Finished is already published");
+        assert!(matches!(received.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
+        assert_eq!(identity(worker.pid), Some(worker));
+        fs::write(fixture.0.join("finish-profile-save"), []).unwrap();
+        received.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
+        waiter.join().unwrap();
+        assert!(fixture.0.join("final-profile-save-complete").exists());
+        assert_ne!(identity(worker.pid), Some(worker));
     }
 
     #[tokio::test]

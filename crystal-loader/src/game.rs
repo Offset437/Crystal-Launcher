@@ -649,6 +649,10 @@ fn run_in_apartment(cfg: &mut GameConfig, park: Option<ParkHook<'_>>) -> Result<
     // Keep the injector shutdown guard through every game in this owner.
     #[cfg(target_arch = "x86")]
     let windower_exit = crate::windower_exit::Wakeup::install();
+    #[cfg(target_arch = "x86")]
+    if crate::windower_plugin_settings::install()? {
+        log!("stage: Windower plugin settings coordinator prepared");
+    }
     let mut outcome = GameOutcome { code: 0, message: String::new(), game_returned: false };
     let mut play = cfg.start_game;
     loop {
@@ -661,11 +665,6 @@ fn run_in_apartment(cfg: &mut GameConfig, park: Option<ParkHook<'_>>) -> Result<
         }
         #[cfg(feature = "native-login-diagnostics")]
         if let Some(trace) = &socket_trace { trace.stop(); }
-        if let Some(session) = native.as_mut() {
-            let handoff_started = Instant::now();
-            session.attach_game();
-            log!("local launch timing: native POL handoff {:.3}s", handoff_started.elapsed().as_secs_f64());
-        }
         outcome = run_game(&polcore, &ffxi_dir, table, native.as_mut(), cfg.auto_login)?;
         events_game_ended(&outcome);
         if native.is_none() || !cfg.keep_session { break; }
@@ -717,10 +716,31 @@ fn run_game(polcore: &Com, ffxi_dir: &Path, table: &[usize], mut native: Option<
     let lobby_observer = crate::lobby::Observer::start();
     // All native requests and local game setup have completed. A batch's one
     // kernel event releases every owner here; no supervisor polling delay.
-    if let Err(error) = crate::native_auth::wait_batch_game() {
+    let ready = crate::native_auth::wait_batch_game().and_then(|()| {
+        #[cfg(target_arch = "x86")]
+        return crate::windower_start::coordinate(&mut || {
+            if let Some(session) = native.as_deref_mut() {
+                session.startup_frame()
+            } else {
+                crate::native_auth::pump_idle_messages();
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                !crate::events::pipe_closed()
+            }
+        });
+        #[cfg(not(target_arch = "x86"))]
+        Ok(())
+    });
+    if let Err(error) = ready {
         if let Some(observer) = lobby_observer { observer.finish(); }
         drop(native_friends);
         return Err(error);
+    }
+    // Keep Viewer push ownership until all local waits have finished. Pumping
+    // while waiting for Windower must happen before the game takes that over.
+    if let Some(session) = native.as_deref_mut() {
+        let handoff_started = Instant::now();
+        session.attach_game();
+        log!("local launch timing: native POL handoff {:.3}s", handoff_started.elapsed().as_secs_f64());
     }
     crate::events::send(proto::started_line(std::process::id()));
     let auto_login = crate::auto_login::Worker::start(auto_login);

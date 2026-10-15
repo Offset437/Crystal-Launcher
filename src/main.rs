@@ -1202,7 +1202,7 @@ impl App {
 
     pub(crate) fn sessions_block_update(&self) -> bool { self.update_sessions().is_none() }
     pub fn launch_blocked(&self) -> bool {
-        self.installation_loading || self.files_changing() || self.recovering.is_some()
+        self.installation_loading || self.files_changing() || self.recovering.is_some() || self.windower_editor_open
     }
 
     /// Game, PlayOnline, ReShade or Crystal files are being written: what a parked pol.exe
@@ -2304,12 +2304,16 @@ impl App {
         use launch_timing::LaunchTrigger;
         // A Play the downtime gate below sets waiting is not recorded: it waits, as it would.
         #[cfg(test)]
-        if self.launches.is_some() && (social_only || self.preview || !self.service_down()) {
+        if self.launches.is_some() && !self.windower_editor_open && (social_only || self.preview || !self.service_down()) {
             if let Some(launches) = &mut self.launches { launches.push((keys, social_only, clicked, trigger)); }
             return;
         }
         if self.launch_blocked() {
-            self.status = t("Game launches are paused while files are being changed or official setup is running.").into();
+            self.status = if self.windower_editor_open {
+                t("Close Windower's profile editor before starting another session.")
+            } else {
+                t("Game launches are paused while files are being changed or official setup is running.")
+            }.into();
             return;
         }
         if self.preview || !self.vault_ready || self.vault_saving {
@@ -2613,7 +2617,7 @@ impl App {
     /// (its host closing, as at 18:59:55 in 08 §1 row 9) keeps its key pending until that
     /// session ends (`take_waiting_startups`); one already signed in and idle needs nothing.
     fn take_startup_signins(&mut self) -> Vec<String> {
-        if !self.startup_signin_pending || !self.vault_ready || self.installation_loading { return Vec::new(); }
+        if !self.startup_signin_pending || !self.vault_ready || self.installation_loading || self.windower_editor_open { return Vec::new(); }
         self.startup_signin_pending = false;
         // The parks start PARK_START_DELAY after this, startup sign-ins or not (07d §5.7).
         let now = Instant::now();
@@ -3623,15 +3627,21 @@ impl App {
             Message::EditWindowerProfiles => {
                 if self.preview || self.windower_editor_open { return Task::none(); }
                 self.windower_editor_open = true;
-                // The editor needs the profile guard the parked Windower hosts hold (07d §1.5).
+                // Idle signed-in owners retain the same profile guard as parks.
+                // Let their native sign-out and final Windower save finish first.
                 self.close_parks_in_background(Some(pol_less::Tool::Windower.name()));
                 self.status = t("Edit profiles in Windower. Saved changes apply on the next fresh game launch.").into();
                 let preferred = self.settings.windower_path.clone();
+                let sessions = self.accounts.iter().filter_map(|row|
+                    session_worker::find(&self.settings.config_for(&self.config, &row.account), &row.account)).collect();
                 let sender = self.sender.clone();
                 return Task::perform(async move {
                     tokio::task::spawn_blocking(move || {
                         let folder = pol_less::tools::detect(pol_less::Tool::Windower, &preferred)
                             .ok_or_else(|| t("Windower was not found. Set its folder in Settings → System → Launch tools.").to_owned())?;
+                        session_worker::sign_out_for_profile_editor(sessions, |line| {
+                            let _ = sender.send(WorkerEvent::WindowerProfileProgress(line.into()));
+                        })?;
                         launch_tools::edit_profiles(&folder, |line| {
                             let _ = sender.send(WorkerEvent::WindowerProfileProgress(line.into()));
                         })
@@ -7516,6 +7526,22 @@ mod tests {
         app.startup_issued = None;
         app.tend_parks(Instant::now() + Duration::from_secs(60));
         assert!(app.parks.is_empty());
+    }
+
+    #[test]
+    fn profile_editor_holds_new_launches_and_preserves_pending_startup_signins() {
+        let mut app = app();
+        app.windower_editor_open = true;
+        app.startup_signin_pending = true;
+        app.launches = Some(Vec::new());
+        assert!(app.launch_blocked());
+        assert!(app.take_startup_signins().is_empty());
+        assert!(app.startup_signin_pending);
+        app.start_launch_now(vec![app.accounts[0].key.clone()], false, Instant::now(), None);
+        assert!(app.launches.as_ref().unwrap().is_empty());
+        assert!(app.status.contains("profile editor"));
+        app.windower_editor_open = false;
+        assert!(!app.launch_blocked());
     }
 
     /// 07d §5.5 steps 1-2 (08 §1 row 9): a startup key whose row is still busy with the
