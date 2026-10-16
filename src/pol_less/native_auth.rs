@@ -217,6 +217,10 @@ impl SignedIn for NativeAuth {
     fn take_native_control(&self) -> Option<(crate::session_worker::NativeControl, bool)> {
         crate::session_worker::take_native_control(&self.directory)
     }
+    fn take_startup_sign_out(&self) -> bool {
+        self.social_only && !self.start_pending() && !self.play_pending_sent.load(Ordering::Acquire)
+            && crate::session_worker::take_startup_sign_out(&self.directory)
+    }
     fn take_controller_settings(&self) -> Option<Vec<u8>> {
         crate::session_worker::take_controller_settings(&self.directory)
     }
@@ -232,7 +236,8 @@ impl SignedIn for NativeAuth {
     fn take_play_pending(&self) -> bool {
         // Consume the note either way; only a pre-sign-in has Viewer pauses to skip.
         let noted = crate::session_worker::take_play_pending(&self.directory);
-        noted && self.viewer_gaps && !self.play_pending_sent.swap(true, Ordering::AcqRel)
+        let first = noted && !self.play_pending_sent.swap(true, Ordering::AcqRel);
+        first && self.viewer_gaps
     }
     fn take_native_activity(&self) -> bool {
         // Consume the note either way; only an idle Viewer session uses it.
@@ -488,14 +493,20 @@ mod tests {
     /// 07d §4.3: one `native_play_pending` per pre-sign-in; the note is consumed either way.
     #[test]
     fn a_play_pending_note_reaches_only_a_pre_sign_in_once() {
-        let mut fixture = Fixture::new();
+        let fixture = Fixture::new();
         std::fs::create_dir_all(&fixture.auth.directory).unwrap();
         let directory = fixture.auth.directory.clone();
         let note = || crate::session_worker::save_play_pending_for_test(&directory);
         note();
         assert!(!fixture.auth.take_play_pending(), "a cold Play has no Viewer pauses");
         assert!(!fixture.auth.take_play_pending(), "consumed");
+        assert!(fixture.auth.play_pending_sent.load(Ordering::Acquire), "remember the Play even without Viewer pauses");
+        std::fs::remove_dir_all(&fixture.auth.directory).unwrap();
+        let mut fixture = Fixture::new();
+        std::fs::create_dir_all(&fixture.auth.directory).unwrap();
         fixture.auth.viewer_gaps = true;
+        let directory = fixture.auth.directory.clone();
+        let note = || crate::session_worker::save_play_pending_for_test(&directory);
         note();
         assert!(fixture.auth.take_play_pending());
         note();

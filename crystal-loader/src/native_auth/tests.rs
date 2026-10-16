@@ -380,6 +380,86 @@ fn bootstrapped(viewer: &Path) -> NativeSession {
     script(891, &[native_profile::PROFILE_NOT_FOUND]);
     s
 }
+
+#[test]
+fn startup_sign_out_before_login_sends_no_credentials() {
+    let viewer = fixture();
+    let mut s = bootstrapped(&viewer);
+    with_startup_state(|state| state.store(SIGNING_IN, Ordering::Release));
+    clear_calls();
+    let replies = events::capture(request_sign_out);
+    assert!(replies.iter().any(|reply| reply.contains("\"action\":\"sign_out\",\"code\":0")));
+    assert!(s.sign_in_core(50, &credentials()).unwrap_err().contains("cancelled"));
+    assert!(raw_calls().is_empty());
+    drop(s);
+    assert!(!startup_cancelled());
+    assert!(!raw_calls().iter().any(|(slot, _)| [814, 1502].contains(slot)));
+    fs::remove_dir_all(viewer).unwrap();
+}
+
+#[test]
+fn startup_sign_out_cancels_each_open_with_the_native_cancel_operation() {
+    for mode in [0, 1] {
+        let viewer = fixture();
+        let mut s = bootstrapped(&viewer);
+        with_startup_state(|state| state.store(SIGNING_IN, Ordering::Release));
+        viewer_check_current();
+        let _pauses = CapturePauses::start();
+        FAKE.with(|f| {
+            let mut f = f.borrow_mut();
+            f.open0 = if mode == 0 { vec![17, -1] } else { vec![30] };
+            f.open3 = vec![17, -1];
+            f.fire = Some((815, if mode == 0 { 1 } else { 2 }, request_sign_out));
+        });
+        clear_calls();
+        let error = s.sign_in_core(50, &credentials()).unwrap_err();
+        assert!(error.contains("cancelled"), "{error}");
+        assert_eq!(raw_calls().iter().filter(|(slot, _)| *slot == 807).count(), 1);
+        assert!(!raw_calls().iter().any(|(slot, _)| *slot == 374));
+        if mode == 0 { assert!(!raw_calls().iter().any(|(slot, _)| *slot == 1502)); }
+        drop(s);
+        assert!(!startup_cancelled());
+        assert_eq!(raw_calls().iter().filter(|(slot, _)| *slot == 816).count(), mode);
+        fs::remove_dir_all(viewer).unwrap();
+    }
+}
+
+#[test]
+fn startup_sign_out_at_member_success_uses_normal_logout_before_any_status_load() {
+    let viewer = fixture();
+    let mut s = bootstrapped(&viewer);
+    s.set_viewer_gaps(true);
+    with_startup_state(|state| state.store(SIGNING_IN, Ordering::Release));
+    viewer_check_current();
+    let _pauses = CapturePauses::start();
+    FAKE.with(|f| {
+        let mut f = f.borrow_mut();
+        f.open0 = vec![30];
+        f.open3 = vec![30];
+        f.fire = Some((815, 2, request_sign_out));
+    });
+    clear_calls();
+    assert!(s.sign_in_core(50, &credentials()).is_err());
+    assert!(s.signed_in);
+    assert!(!raw_calls().iter().any(|(slot, _)| [374, 807].contains(slot)));
+    let replies = events::capture(|| drop(s));
+    assert!(replies.iter().any(|reply| reply.contains("\"native_sign_out_complete\",\"code\":0")));
+    assert_eq!(raw_calls().iter().filter(|(slot, _)| *slot == 816).count(), 1);
+    fs::remove_dir_all(viewer).unwrap();
+}
+
+#[test]
+fn startup_cancellation_never_claims_a_running_game_or_a_queued_play() {
+    let state = AtomicU8::new(SIGNING_IN);
+    assert_eq!(cancel_startup(&state, true), Some(-256));
+    assert_eq!(state.load(Ordering::Acquire), SIGNING_IN);
+    assert_eq!(cancel_startup(&state, false), Some(0));
+    assert_eq!(cancel_startup(&state, false), Some(0));
+    state.store(STARTUP_FINISHED, Ordering::Release);
+    assert_eq!(cancel_startup(&state, false), None);
+    let control = AtomicU8::new(GAME);
+    assert_eq!(accept_control(&control, &AtomicBool::new(false), SIGN_OUT), -256);
+}
 fn position(calls: &[(usize, Vec<usize>)], slot: usize, first: Option<usize>) -> Option<usize> {
     calls.iter().position(|(s, a)| *s == slot && first.is_none_or(|v| a.first() == Some(&v)))
 }

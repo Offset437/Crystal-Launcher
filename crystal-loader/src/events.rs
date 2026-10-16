@@ -54,8 +54,9 @@ fn mark_closed(why: &str) {
     }
 }
 
-/// Starts the writer and reader threads on the connected pipe.
-pub fn start(pipe: Pipe) {
+/// Starts the writer and continues the existing reader on the connected pipe.
+/// It may already hold commands following the session or credentials line.
+pub fn start(pipe: Pipe, mut reader: LineReader) {
     let pipe = Arc::new(pipe);
     let (tx, rx) = mpsc::channel::<String>();
     let writer_pipe = Arc::clone(&pipe);
@@ -77,13 +78,14 @@ pub fn start(pipe: Pipe) {
             }
         })
         .expect("spawn event writer");
+    // A buffered command can reply as soon as the reader starts.
+    *SINK.lock().unwrap_or_else(|e| e.into_inner()) = Some(Sink { tx, thread });
     std::thread::Builder::new()
         .name("crystal-replies".into())
         .spawn(move || {
-            let mut reader = LineReader::default();
             while !STOP_READER.load(Ordering::Acquire) {
-                match reader.read_line(&pipe, Some(Duration::from_millis(250))) {
-                    Ok(line) => match proto::parse_service_event(line) {
+                match reader.read_parsed(&pipe, Some(Duration::from_millis(250)), proto::parse_service_event) {
+                    Ok(parsed) => match parsed {
                         Ok(Some(proto::ServiceEvent::Presence(result))) => crate::slots::presence_result(result),
                         Ok(Some(proto::ServiceEvent::Credentials(credentials))) => crate::slots::update_credentials(credentials),
                         Ok(Some(proto::ServiceEvent::Friends(records))) => crate::slots::friends_result(Some(records)),
@@ -116,7 +118,6 @@ pub fn start(pipe: Pipe) {
             }
         })
         .expect("spawn reply reader");
-    *SINK.lock().unwrap_or_else(|e| e.into_inner()) = Some(Sink { tx, thread });
 }
 
 /// Queues one line (must end in `\n`). A no-op before `start` or after `finish`.

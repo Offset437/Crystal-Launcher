@@ -23,6 +23,7 @@ pub(crate) struct Quote {
 pub(crate) struct Results {
     pub items: Vec<Quote>,
     pub truncated: bool,
+    pub warning: Option<String>,
 }
 
 #[derive(Default)]
@@ -67,7 +68,36 @@ pub(crate) async fn search(query: String, world: &'static str) -> Result<Results
             } else { attempt.follow() }
         }))
         .build().map_err(|e| tf("FFXIAH lookup failed: {error}", &[("error", &e)]))?;
-    let mut response = request(&client, &query, sid).send().await
+    let (html, url) = read_page(request(&client, &query, sid)).await?;
+    let mut results = parse(&html, &url, sid)?;
+    // Exact searches redirect to one listing; its single/stack sibling has
+    // separate stock and sales. Keep the first listing if that fetch fails.
+    if let Some(other_url) = counterpart_url(&html, &url, sid) {
+        let other = async {
+            let (html, final_url) = read_page(client.get(other_url.clone())
+                .header(reqwest::header::COOKIE, format!("sid={sid}"))).await?;
+            if listing_key(&final_url) != listing_key(&other_url) {
+                return Err(t("FFXIAH's item page could not be read.").to_owned());
+            }
+            let mut other = parse(&html, &final_url, sid)?;
+            if other.items.len() != 1 || other.items[0].stack.is_some() != listing_key(&other_url).is_some_and(|(_, stack)| stack) {
+                return Err(t("FFXIAH's item page could not be read.").to_owned());
+            }
+            Ok(other.items.remove(0))
+        }.await;
+        match other {
+            Ok(item) => {
+                results.items.push(item);
+                results.items.sort_by_key(|item| item.stack.is_some());
+            }
+            Err(error) => results.warning = Some(tf("The other listing could not be loaded: {error}", &[("error", &error)])),
+        }
+    }
+    Ok(results)
+}
+
+async fn read_page(request: reqwest::RequestBuilder) -> Result<(String, reqwest::Url), String> {
+    let mut response = request.send().await
         .and_then(reqwest::Response::error_for_status)
         .map_err(|e| tf("FFXIAH lookup failed: {error}", &[("error", &e)]))?;
     let url = response.url().clone();
@@ -78,7 +108,7 @@ pub(crate) async fn search(query: String, world: &'static str) -> Result<Results
         }
         bytes.extend_from_slice(&chunk);
     }
-    parse(&String::from_utf8_lossy(&bytes), &url, sid)
+    Ok((String::from_utf8_lossy(&bytes).into_owned(), url))
 }
 
 fn selector(s: &str) -> Selector { Selector::parse(s).expect("static selector") }
@@ -87,6 +117,28 @@ fn plain(element: scraper::ElementRef<'_>) -> String {
 }
 fn number(s: &str) -> Option<u64> {
     s.trim().replace(',', "").parse().ok()
+}
+fn stack_size(label: &str, name: &str) -> Option<u64> {
+    label.strip_prefix(name)?.trim().strip_prefix('x').and_then(number).filter(|count| *count > 1)
+}
+fn listing_key(url: &reqwest::Url) -> Option<(&str, bool)> {
+    let id = url.path().strip_prefix("/item/")?.split('/').next()?;
+    if id.is_empty() || !id.bytes().all(|c| c.is_ascii_digit()) { return None; }
+    Some((id, url.query_pairs().any(|(key, value)| key == "stack" && value == "1")))
+}
+fn item_summary(doc: &Html) -> Option<scraper::ElementRef<'_>> {
+    doc.select(&selector(".item-name")).next()?.ancestors()
+        .filter_map(scraper::ElementRef::wrap).find(|element| element.value().name() == "table")
+}
+fn counterpart_url(html: &str, url: &reqwest::Url, sid: u8) -> Option<reqwest::Url> {
+    let current = reqwest::Url::parse(&item_url(url.as_str(), url, sid)?).ok()?;
+    let (id, stack) = listing_key(&current)?;
+    let doc = Html::parse_document(html);
+    item_summary(&doc)?.select(&selector("a[href]")).find_map(|link| {
+        let candidate = reqwest::Url::parse(&item_url(link.value().attr("href")?, url, sid)?).ok()?;
+        let (other_id, other_stack) = listing_key(&candidate)?;
+        (other_id == id && other_stack != stack).then_some(candidate)
+    })
 }
 fn item_url(href: &str, base: &reqwest::Url, sid: u8) -> Option<String> {
     let mut url = base.join(href).ok()?;
@@ -125,15 +177,19 @@ fn parse(html: &str, url: &reqwest::Url, sid: u8) -> Result<Results, String> {
             let name = plain(link);
             if name.is_empty() || name.len() > 512 { continue; }
             let label = plain(cells[1]);
-            let stack = label.strip_prefix(&name).map(str::trim).and_then(|s| s.strip_prefix('x')).and_then(number);
+            let stack = stack_size(&label, &name);
             items.push(Quote { name, url, stack, price: number(&plain(cells[5])), stock: number(&plain(cells[6])), last_sale: false });
         }
-        return Ok(Results { items, truncated });
+        return Ok(Results { items, truncated, ..Default::default() });
     }
     if let Some(item_url) = item_url(url.as_str(), url, sid) {
         let name = doc.select(&selector(".item-name .ucwords, #tbl-header h1")).next().map(plain)
             .filter(|n| !n.is_empty() && n.len() <= 512)
             .ok_or_else(|| t("FFXIAH's item page could not be read.").to_owned())?;
+        let stack = doc.select(&selector(".item-name")).next().and_then(|element| stack_size(&plain(element), &name));
+        let stock = item_summary(&doc)
+            .and_then(|table| table.select(&selector(".stock")).next())
+            .and_then(|element| number(&plain(element)));
         // Exact-name searches redirect to the item page. Read its public sales
         // data as JSON, never execute website scripts or import their code.
         let sales = doc.select(&selector("script")).find_map(|e| {
@@ -141,8 +197,8 @@ fn parse(html: &str, url: &reqwest::Url, sid: u8) -> Result<Results, String> {
             let tail = text.split_once("Item.sales")?.1.trim_start().strip_prefix('=')?.trim_start();
             <Option<Vec<Sale>> as serde::Deserialize>::deserialize(&mut serde_json::Deserializer::from_str(tail)).ok()
         }).ok_or_else(|| t("FFXIAH's item prices could not be read.").to_owned())?;
-        return Ok(Results { items: vec![Quote { name, url: item_url, stack: None,
-            price: sales.and_then(|s| s.first().map(|s| s.price)), stock: None, last_sale: true }], truncated: false });
+        return Ok(Results { items: vec![Quote { name, url: item_url, stack,
+            price: sales.and_then(|s| s.first().map(|s| s.price)), stock, last_sale: true }], ..Default::default() });
     }
     let title = doc.select(&selector("title")).next().map(plain).unwrap_or_default();
     if title == "Item Search - FFXIAH.com" { return Ok(Results::default()); }
@@ -183,6 +239,58 @@ mod tests {
         assert_eq!(parse(&html.replace("[{\"price\":4321,\"seller_name\":\"ignored\"}]", "null"), &url, 1).unwrap().items[0].price, None);
     }
     #[test]
+    fn exact_search_reads_current_stock_from_the_item_summary() {
+        let url = reqwest::Url::parse("https://www.ffxiah.com/item/9001/test").unwrap();
+        for (reported, expected) in [("7", Some(7)), ("0", Some(0)), ("1,234", Some(1234)), ("", None), ("unknown", None)] {
+            let html = page(25, &format!(
+                "<span class=stock>999</span><table class=stdtbl>\
+                <tr><td><span class=item-name><span class=ucwords>Test Ore</span></span></td></tr>\
+                <tr><td>Stock</td><td><span class=stock>{reported}</span></td></tr></table>\
+                <script>Item.sales = [{{\"price\":4321}}];</script>"));
+            let result = parse(&html, &url, 25).unwrap();
+            assert_eq!(result.items[0].stock, expected, "reported stock: {reported:?}");
+            assert_eq!(result.items[0].price, Some(4321));
+            assert!(result.items[0].last_sale);
+            assert!(parse(&html, &url, 28).is_err());
+        }
+    }
+    #[test]
+    fn exact_search_does_not_substitute_an_unrelated_items_stock() {
+        let url = reqwest::Url::parse("https://www.ffxiah.com/item/9001/test").unwrap();
+        let html = page(25, "<table class=stdtbl><tr><td><span class=item-name><span class=ucwords>Test Ore</span></span></td></tr></table>\
+            <span class=stock>999</span><script>Item.sales = null;</script>");
+        let result = parse(&html, &url, 25).unwrap();
+        assert_eq!(result.items[0].stock, None);
+        assert_eq!(result.items[0].price, None);
+    }
+    #[test]
+    fn exact_stack_listing_has_its_own_quantity_price_and_stock() {
+        let url = reqwest::Url::parse("https://www.ffxiah.com/item/9001/test/?stack=1").unwrap();
+        let html = page(25, "<table class=stdtbl><tr><td><span class=item-name><span class=ucwords>Test Ore</span>&nbsp;x12</span></td></tr>\
+            <tr><td>Stock</td><td><span class=stock>3</span></td></tr></table><script>Item.sales = [{\"price\":24000}];</script>");
+        let item = parse(&html, &url, 25).unwrap().items.remove(0);
+        assert_eq!((item.stack, item.price, item.stock), (Some(12), Some(24000), Some(3)));
+        assert_eq!(item.url, "https://www.ffxiah.com/item/9001/test/?stack=1&sid=25");
+        assert!(item.last_sale);
+    }
+    #[test]
+    fn only_the_same_items_other_listing_can_be_requested() {
+        let url = reqwest::Url::parse("https://www.ffxiah.com/item/9001/test").unwrap();
+        let bad_links = "<a href='https://example.com/item/9001/?stack=1'>foreign</a>\
+            <a href='/item/9002/?stack=1'>other item</a><a href='/item/9001/test'>same listing</a>\
+            <a href='javascript:alert(1)'>script</a>";
+        let html = |links: &str| page(25, &format!("<table class=stdtbl><tr><td><span class=item-name><span class=ucwords>Test Ore</span></span>{links}</td></tr></table>"));
+        assert!(counterpart_url(&html(bad_links), &url, 25).is_none());
+        let with_stack = html(&format!("{bad_links}<a href='/item/9001/test/?stack=1&sid=28'>stack</a>"));
+        assert_eq!(counterpart_url(&with_stack, &url, 25).unwrap().as_str(),
+            "https://www.ffxiah.com/item/9001/test/?stack=1&sid=25");
+        let stack_url = reqwest::Url::parse("https://www.ffxiah.com/item/9001/test/?stack=1").unwrap();
+        assert_eq!(counterpart_url(&html("<a href='/item/9001/test'>single</a>"), &stack_url, 25).unwrap().as_str(),
+            "https://www.ffxiah.com/item/9001/test?sid=25");
+        let search_url = reqwest::Url::parse("https://www.ffxiah.com/search/item?q=test").unwrap();
+        assert!(counterpart_url(&with_stack, &search_url, 25).is_none());
+    }
+    #[test]
     fn unexpected_links_and_unconfirmed_worlds_are_rejected() {
         let base = reqwest::Url::parse("https://www.ffxiah.com/search/item").unwrap();
         for link in ["https://example.com/item/9001", "javascript:alert(1)", "/login", "https://user@www.ffxiah.com/item/9001"] {
@@ -211,8 +319,14 @@ mod tests {
             assert!(!list.items.is_empty());
             println!("{world}: {} matches, first price {:?}", list.items.len(), list.items[0].price);
             let exact = search("Copper Ore".into(), world).await.unwrap();
-            assert!(!exact.items.is_empty());
-            println!("{world}: exact lookup {}, price {:?}", exact.items[0].name, exact.items[0].price);
+            assert_eq!(exact.items.len(), 2);
+            assert!(exact.warning.is_none(), "{:?}", exact.warning);
+            assert_eq!(exact.items[0].stack, None);
+            assert_eq!(exact.items[1].stack, Some(12));
+            for item in exact.items {
+                assert!(item.stock.is_some());
+                println!("{world}: exact lookup {} stack {:?}, price {:?}, stock {:?}", item.name, item.stack, item.price, item.stock);
+            }
         }
     }
 }

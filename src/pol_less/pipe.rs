@@ -28,7 +28,7 @@ pub(crate) const PROTOCOL: u32 = 1;
 pub(crate) enum LoaderEvent {
     /// `viewer_check`: the loader asks for the sign-in's W2U at Connect (07c §1).
     /// `park`: it accepts a credential-less `park` line first (pol-spec 07d §1).
-    Hello { v: u32, pid: u32, native_auth: bool, native_social: bool, native_batch: bool, viewer_check: bool, park: bool },
+    Hello { v: u32, pid: u32, native_auth: bool, native_social: bool, native_batch: bool, viewer_check: bool, startup_sign_out: bool, park: bool },
     /// `parked`: polcore is created and the host waits for `credentials` (07d §1.3).
     Parked { polcore_ms: Option<u64> },
     Started { pid: Option<u32> },
@@ -89,6 +89,8 @@ struct Incoming {
     #[serde(default)]
     viewer_check: bool,
     #[serde(default)]
+    startup_sign_out: bool,
+    #[serde(default)]
     park: bool,
     #[serde(default)]
     polcore_ms: Option<u64>,
@@ -123,6 +125,7 @@ pub(crate) fn parse_event(line: &[u8]) -> Result<LoaderEvent, String> {
             native_social: value.native_social,
             native_batch: value.native_batch,
             viewer_check: value.viewer_check,
+            startup_sign_out: value.startup_sign_out,
             park: value.park,
         },
         "parked" => LoaderEvent::Parked { polcore_ms: value.polcore_ms },
@@ -337,6 +340,7 @@ pub(crate) struct LoaderPipe {
     native_social: bool,
     native_batch: bool,
     viewer_check: bool,
+    startup_sign_out: bool,
     park: bool,
     command_wake: Option<crate::session_worker::CommandWake>,
     command_wake_pending: bool,
@@ -349,6 +353,7 @@ impl LoaderPipe {
     pub(crate) fn supports_native_auth(&self)->bool { self.native_auth }
     pub(crate) fn supports_native_social(&self)->bool { self.native_social }
     pub(crate) fn supports_native_batch(&self)->bool { self.native_batch }
+    pub(crate) fn supports_startup_sign_out(&self)->bool { self.startup_sign_out }
     /// The launcher sends no W2U of its own; a loader without this never
     /// sends one before :51240 either.
     pub(crate) fn supports_viewer_check(&self)->bool { self.viewer_check }
@@ -421,11 +426,12 @@ impl LoaderPipe {
                 "The process on the session pipe (PID {client}) is not the one that said hello (PID {pid}); the session was not sent.",
                 &[("client", &client), ("pid", &pid)],
             )),
-            LoaderEvent::Hello { pid, native_auth, native_social, native_batch, viewer_check, park, .. } => {
+            LoaderEvent::Hello { pid, native_auth, native_social, native_batch, viewer_check, startup_sign_out, park, .. } => {
                 verify_image(pid, expected_image)?;
                 self.native_auth=native_auth;
                 self.native_social=native_social;
                 self.native_batch=native_batch;
+                self.startup_sign_out=startup_sign_out;
                 self.viewer_check=viewer_check;
                 self.park=park;
                 Ok(pid)
@@ -576,7 +582,7 @@ mod sys {
                     &attributes,
                 ))?;
                 let event = owned(CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()))?;
-                Ok(Self { name, handle, event, buffer: Vec::new(), native_auth:false, native_social:false, native_batch:false, viewer_check:false, park:false,
+                Ok(Self { name, handle, event, buffer: Vec::new(), native_auth:false, native_social:false, native_batch:false, viewer_check:false, startup_sign_out:false, park:false,
                     command_wake:None, command_wake_pending:false })
             }
         }
@@ -840,11 +846,11 @@ mod tests {
 
     #[test]
     fn loader_lines_parse_and_tolerate_unknown_fields() {
-        assert_eq!(parse_event(br#"{"type":"hello","v":1,"pid":1234,"native_auth":true,"native_social":true}"#).unwrap(), LoaderEvent::Hello { v:1,pid:1234,native_auth:true,native_social:true,native_batch:false,viewer_check:false, park:false });
+        assert_eq!(parse_event(br#"{"type":"hello","v":1,"pid":1234,"native_auth":true,"native_social":true}"#).unwrap(), LoaderEvent::Hello { v:1,pid:1234,native_auth:true,native_social:true,native_batch:false,viewer_check:false, startup_sign_out:false, park:false });
         // A pre-round-1 loader (16e26f3): no viewer_check, so it never asks for the W2U.
-        assert_eq!(parse_event(br#"{"type":"hello","v":1,"pid":1234,"native_auth":true,"native_social":true,"native_batch":true}"#).unwrap(), LoaderEvent::Hello { v:1,pid:1234,native_auth:true,native_social:true,native_batch:true,viewer_check:false, park:false });
+        assert_eq!(parse_event(br#"{"type":"hello","v":1,"pid":1234,"native_auth":true,"native_social":true,"native_batch":true}"#).unwrap(), LoaderEvent::Hello { v:1,pid:1234,native_auth:true,native_social:true,native_batch:true,viewer_check:false, startup_sign_out:false, park:false });
         // crystal-loader proto::hello_line.
-        assert_eq!(parse_event(br#"{"type":"hello","v":1,"pid":1234,"native_auth":true,"native_social":true,"native_batch":true,"viewer_check":true}"#).unwrap(), LoaderEvent::Hello { v:1,pid:1234,native_auth:true,native_social:true,native_batch:true,viewer_check:true, park:false });
+        assert_eq!(parse_event(br#"{"type":"hello","v":1,"pid":1234,"native_auth":true,"native_social":true,"native_batch":true,"viewer_check":true}"#).unwrap(), LoaderEvent::Hello { v:1,pid:1234,native_auth:true,native_social:true,native_batch:true,viewer_check:true, startup_sign_out:false, park:false });
         assert_eq!(parse_event(br#"{"type":"native_session_state","game":false}"#).unwrap(), LoaderEvent::NativeSessionState(false));
         assert!(parse_event(br#"{"type":"native_session_state","game":1}"#).is_err());
         assert!(parse_event(br#"{"type":"native_session_state"}"#).is_err());
@@ -855,8 +861,8 @@ mod tests {
         assert_eq!(parse_event(br#"{"type":"native_sign_out_complete","code":-2046}"#).unwrap(), LoaderEvent::NativeSignOutComplete(-2046));
         assert!(parse_event(br#"{"type":"native_sign_out_complete"}"#).is_err());
         assert!(parse_event(br#"{"type":"native_sign_out_complete","code":7}"#).is_err());
-        assert_eq!(parse_event(br#"{"type":"hello","v":1,"pid":1234,"extra":true}"#).unwrap(), LoaderEvent::Hello { v: 1, pid: 1234, native_auth:false, native_social:false, native_batch:false, viewer_check:false, park:false });
-        assert_eq!(parse_event(br#"{"type":"hello","v":1,"pid":1234,"native_auth":true}"#).unwrap(), LoaderEvent::Hello { v:1,pid:1234,native_auth:true,native_social:false,native_batch:false,viewer_check:false, park:false });
+        assert_eq!(parse_event(br#"{"type":"hello","v":1,"pid":1234,"extra":true}"#).unwrap(), LoaderEvent::Hello { v: 1, pid: 1234, native_auth:false, native_social:false, native_batch:false, viewer_check:false, startup_sign_out:false, park:false });
+        assert_eq!(parse_event(br#"{"type":"hello","v":1,"pid":1234,"native_auth":true}"#).unwrap(), LoaderEvent::Hello { v:1,pid:1234,native_auth:true,native_social:false,native_batch:false,viewer_check:false, startup_sign_out:false, park:false });
         assert_eq!(parse_event(br#"{"type":"authenticated"}"#).unwrap(),LoaderEvent::Authenticated);
         assert_eq!(parse_event(br#"{"type":"native_pol_status","code":-1025}"#).unwrap(),LoaderEvent::NativeStatus(-1025));
         assert!(parse_event(br#"{"type":"native_pol_status","code":1}"#).is_err());
@@ -912,7 +918,7 @@ mod tests {
     #[test]
     fn round2_park_hello_and_parked_events_parse() {
         let hello = br#"{"type":"hello","v":1,"pid":1234,"native_auth":true,"native_social":true,"native_batch":true,"viewer_check":true,"park":true}"#;
-        assert_eq!(parse_event(hello).unwrap(), LoaderEvent::Hello { v:1,pid:1234,native_auth:true,native_social:true,native_batch:true,viewer_check:true, park:true });
+        assert_eq!(parse_event(hello).unwrap(), LoaderEvent::Hello { v:1,pid:1234,native_auth:true,native_social:true,native_batch:true,viewer_check:true, startup_sign_out:false, park:true });
         assert_eq!(parse_event(br#"{"type":"parked","pid":1234,"polcore_ms":431}"#).unwrap(), LoaderEvent::Parked { polcore_ms: Some(431) });
         assert_eq!(parse_event(br#"{"type":"parked","pid":1234}"#).unwrap(), LoaderEvent::Parked { polcore_ms: None });
     }

@@ -656,11 +656,14 @@ fn request_session_control(session: &BackgroundSession, action: NativeControl, g
     let _command = exclusive(&directory.join("native-social.lock"))
         .map_err(|_| t("Another PlayOnline request is being submitted."))?;
     if !session.active() { return Err(t("This account has no active PlayOnline session.").into()); }
-    let snapshot = read_friend_cache(directory, session.worker).ok_or(no_native_controls())?;
-    if snapshot.game_running != Some(false) {
+    let snapshot = friend_cache(directory, session.worker).map_err(|_| no_native_controls())?;
+    let startup_sign_out = matches!(action, NativeControl::SignOut)
+        && snapshot.as_ref().and_then(|snapshot| snapshot.game_running).is_none()
+        && read_record(&session.path).is_some_and(|record| record.worker == session.worker && record.social_only);
+    if !startup_sign_out && snapshot.as_ref().and_then(|snapshot| snapshot.game_running) != Some(false) {
         return Err(t("Close FFXI before starting another game or signing out of PlayOnline.").into());
     }
-    if snapshot.social.busy || directory.join("native-social.json").exists()
+    if snapshot.is_some_and(|snapshot| snapshot.social.busy) || directory.join("native-social.json").exists()
         || directory.join("native-control.json").exists() {
         return Err(t("Wait for the current PlayOnline request to finish.").into());
     }
@@ -743,11 +746,26 @@ fn start_signed_in_within(config: &Config, account: &Account, limit: Duration, w
 
 /// The action and its "also for my groups" choice.
 pub(crate) fn take_native_control(directory: &Path) -> Option<(NativeControl, bool)> {
+    take_native_control_matching(directory, false)
+}
+
+pub(crate) fn take_startup_sign_out(directory: &Path) -> bool {
+    take_native_control_matching(directory, true).is_some()
+}
+
+fn take_native_control_matching(directory: &Path, sign_out_only: bool) -> Option<(NativeControl, bool)> {
     let _lock = exclusive(&directory.join("native-social.lock")).ok()?;
     let path = directory.join("native-control.json");
     let bytes = read_bounded(&path, 1024)?;
+    let request = serde_json::from_slice::<ControlRequest>(&bytes).ok();
+    if sign_out_only && request.as_ref().is_some_and(|request|
+        !matches!(request.action, NativeControl::SignOut)
+        || read_bounded(&directory.join("native-play-pending.json"), 1024)
+            .and_then(|bytes| serde_json::from_slice::<Identity>(&bytes).ok()) == Some(request.worker)) {
+        return None;
+    }
     fs::remove_file(&path).ok()?;
-    let request: ControlRequest = serde_json::from_slice(&bytes).ok()?;
+    let request = request?;
     (Some(request.worker) == identity(std::process::id())).then_some((request.action, request.groups))
 }
 
@@ -1535,8 +1553,7 @@ impl IdleSessionClose {
             }
             return false;
         }
-        let ready = snapshot.is_some_and(|snapshot|
-            snapshot.game_running == Some(false) && !snapshot.social.busy)
+        let ready = session.can_prepare_update() && snapshot.is_none_or(|snapshot| !snapshot.social.busy)
             && !directory.join("native-social.json").exists();
         if ready && request_session_control(&session, NativeControl::SignOut, true).is_ok() {
             self.requested = true;
@@ -2281,6 +2298,58 @@ mod tests {
             assert!(asked.elapsed() < Duration::from_secs(5));
         }
         update_record(&path, worker, |record| record.state = Event::Finished(None)).unwrap();
+    }
+
+    #[test]
+    fn startup_close_can_queue_sign_out_before_the_first_native_status_report() {
+        let fixture = Fixture::new();
+        let config = config(&fixture.0);
+        let account = account();
+        let directory = config.account_directory(&account);
+        let path = record_path(&config, &account);
+        let worker = identity(std::process::id()).unwrap();
+        fs::create_dir_all(&directory).unwrap();
+        let mut record = Record { worker, state: Event::Progress("signing in".into()), social_only: true,
+            authenticated: false, native_batch: false, otp_used: Some(false), launch_tool: None };
+        save_record(&path, &record).unwrap();
+        let mut closing = IdleSessionClose::for_account(&config, &account, false).unwrap();
+        assert!(!closing.finished());
+        assert!(closing.requested, "sign-out must not wait for a friends or idle report");
+        assert!(take_startup_sign_out(&directory));
+        assert!(!take_startup_sign_out(&directory));
+        record.social_only = false;
+        save_record(&path, &record).unwrap();
+        assert!(IdleSessionClose::for_account(&config, &account, false).is_none());
+        assert!(request_native_control(&config, &account, NativeControl::SignOut).is_err());
+        record.social_only = true;
+        save_record(&path, &record).unwrap();
+        publish_friends(&directory, &crate::friends::Snapshot { game_running: Some(true), ..Default::default() }).unwrap();
+        assert!(IdleSessionClose::for_account(&config, &account, false).is_none());
+        assert!(request_native_control(&config, &account, NativeControl::SignOut).is_err());
+    }
+
+    #[test]
+    fn startup_close_consumes_only_its_workers_sign_out_and_preserves_queued_play() {
+        let fixture = Fixture::new();
+        let directory = &fixture.0;
+        let worker = identity(std::process::id()).unwrap();
+        let path = directory.join("native-control.json");
+        let control = |action, owner| save_json(&path, &ControlRequest { worker: owner, action, groups: true }).unwrap();
+        control(NativeControl::StartGame, worker);
+        assert!(!take_startup_sign_out(directory));
+        assert_eq!(take_native_control(directory), Some((NativeControl::StartGame, true)));
+        control(NativeControl::Away, worker);
+        assert!(!take_startup_sign_out(directory));
+        assert_eq!(take_native_control(directory), Some((NativeControl::Away, true)));
+        control(NativeControl::SignOut, worker);
+        save_play_pending_for_test(directory);
+        assert!(!take_startup_sign_out(directory));
+        assert!(path.exists());
+        assert!(take_play_pending(directory));
+        assert!(take_startup_sign_out(directory));
+        control(NativeControl::SignOut, Identity { created: 0, ..worker });
+        assert!(!take_startup_sign_out(directory));
+        assert!(!path.exists(), "discard a stale worker's command");
     }
 
     #[test]

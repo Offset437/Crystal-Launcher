@@ -250,21 +250,22 @@ pub fn run() -> i32 {
         log!("error: sending hello: {e}");
         return EXIT_PIPE;
     }
+    // A session and its first command can arrive in the same pipe read. Keep
+    // this reader through the handoff; only consumed credential bytes are wiped.
+    let mut reader = LineReader::default();
     let first = {
-        let mut reader = LineReader::default();
-        let parsed = match reader.read_line(&pipe, Some(SESSION_TIMEOUT)) {
-            Ok(line) => proto::parse_first_line(line),
+        let parsed = match reader.read_parsed(&pipe, Some(SESSION_TIMEOUT), proto::parse_first_line) {
+            Ok(parsed) => parsed,
             Err(e) => return fail(&pipe, EXIT_PIPE, format!("reading the session: {e}")),
         };
-        reader.wipe();
         match parsed {
             Ok(first) => first,
             Err(e) => return fail(&pipe, EXIT_PROTOCOL, format!("session rejected: {e}")),
         }
     };
     match first {
-        proto::FirstLine::Session(session) => run_session(pipe, session, &args),
-        proto::FirstLine::Park(park) => run_parked(pipe, park, &args),
+        proto::FirstLine::Session(session) => run_session(pipe, reader, session, &args),
+        proto::FirstLine::Park(park) => run_parked(pipe, reader, park, &args),
     }
 }
 
@@ -295,7 +296,7 @@ fn log_ffxi_settings(settings: Option<&ffxi_settings::FfxiSettings>) {
 }
 
 /// The cold path: a direct `session` line.
-fn run_session(pipe: Pipe, session: proto::Session, args: &args::Args) -> i32 {
+fn run_session(pipe: Pipe, reader: LineReader, session: proto::Session, args: &args::Args) -> i32 {
     log_session(&session);
     log_ffxi_settings(session.ffxi_settings.as_ref());
     if args.selftest_offline && session.native_auth.is_some() {
@@ -307,7 +308,7 @@ fn run_session(pipe: Pipe, session: proto::Session, args: &args::Args) -> i32 {
         log!("note: invisible_login ignored; the Viewer sends no status at sign-in");
     }
     let cfg = game::GameConfig { region: session.region, install_dir: session.install_dir, pol_install_dir: session.pol_install_dir, native_auth: session.native_auth, start_game: session.start_game, keep_session: session.keep_session, viewer_gaps: session.viewer_gaps, auto_away_minutes: session.auto_away_minutes, auto_login: session.auto_login, selftest: args.selftest_offline, trace_slots: args.trace_slots };
-    events::start(pipe);
+    events::start(pipe, reader);
 
     if args.selftest_offline {
         std::thread::spawn(|| {
@@ -340,7 +341,7 @@ fn join_game(game: std::thread::JoinHandle<GameResult>) -> GameResult {
 /// A parked host (pol-spec 07d §1.3): polcore up to its validated table on
 /// the game thread, `parked`, then the credentials with no timeout, then
 /// exactly the cold path (`Park::into_session` rebuilds its session).
-fn run_parked(pipe: Pipe, mut park: proto::Park, args: &args::Args) -> i32 {
+fn run_parked(pipe: Pipe, mut reader: LineReader, mut park: proto::Park, args: &args::Args) -> i32 {
     let park_started = std::time::Instant::now();
     log!("stage: park ok (v{}, region {}, lang {}, install_dir {}, ffxi_settings {}, auto_login {})",
         park.version, park.region.name(), park.lang, park.install_dir.as_deref().unwrap_or("(none)"),
@@ -368,11 +369,9 @@ fn run_parked(pipe: Pipe, mut park: proto::Park, args: &args::Args) -> i32 {
         };
         return game_failed(&pipe, error);
     };
-    let mut reader = LineReader::default();
     let credentials = park::await_credentials(std::process::id(), park_started, polcore,
         &mut |bytes| pipe.write_all(bytes),
-        &mut || reader.read_line(&pipe, None).map(proto::parse_credentials));
-    reader.wipe();
+        &mut || reader.read_parsed(&pipe, None, proto::parse_credentials));
     let unpark = match credentials {
         Ok((unpark, _)) => unpark,
         Err(code) => {
@@ -390,7 +389,7 @@ fn run_parked(pipe: Pipe, mut park: proto::Park, args: &args::Args) -> i32 {
     }
     let proto::Session { native_auth, start_game, keep_session, viewer_gaps, auto_away_minutes, .. } = session;
     let Some(native_auth) = native_auth else { return fail(&pipe, EXIT_PROTOCOL, "credentials rejected: no native credentials".into()) };
-    events::start(pipe);
+    events::start(pipe, reader);
     // The game thread is parked waiting for exactly this; its sign-in follows.
     let sent = play.send(game::Play { native_auth, start_game, keep_session, viewer_gaps, auto_away_minutes });
     let result = join_game(game);

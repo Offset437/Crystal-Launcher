@@ -20,6 +20,7 @@ mod installer;
 mod launch_log;
 mod launch_timing;
 mod launch_tools;
+mod launcher_close;
 mod prereqs;
 mod settings_page;
 mod operation;
@@ -673,7 +674,6 @@ pub(crate) enum Message {
     PatchLoaded(u64, patch::PatchReport),
     ViewerLoaded(u64, viewer::Status),
     CloseRequested,
-    SessionsClosed(Result<(), String>),
     ConfirmClose,
     CancelClose,
     PreviewReady(window::Screenshot),
@@ -3035,14 +3035,30 @@ impl App {
             }
         }
         let parks = self.parks.drain(None);
-        if sessions.is_empty() && parks.is_empty() { return iced::exit(); }
-        self.status = t("Signing out idle PlayOnline sessions before closing…").into();
-        Task::perform(async move {
-            tokio::task::spawn_blocking(move || {
+        let history = self.config.history_path();
+        if !self.preview {
+            launch_log::append_history(&history, "Crystal", &format!(
+                "launcher close: pid {}, idle sessions {}, parks {}", std::process::id(), sessions.len(), parks.len()), None);
+        }
+        if !self.preview && (!sessions.is_empty() || !parks.is_empty()) {
+            let started = launcher_close::start(move || {
+                let started = Instant::now();
                 pol_less::park::close_workers(parks);
-                session_worker::close_idle_sessions(sessions)
-            }).await.unwrap_or_else(|error| Err(error.to_string()))
-        }, Message::SessionsClosed)
+                let result = session_worker::close_idle_sessions(sessions);
+                launch_log::append_history(&history, "Crystal", &format!(
+                    "launcher close cleanup: pid {}, {} ms, {}", std::process::id(), started.elapsed().as_millis(),
+                    if result.is_ok() { "completed" } else { "failed" }), None);
+                result
+            });
+            if let Err(error) = started {
+                self.closing = false;
+                self.status = tf("Could not start PlayOnline cleanup: {error}", &[("error", &error.to_string())]);
+                return Task::none();
+            }
+        }
+        // Destroy the window and release its renderer now. main() keeps the
+        // cleanup owner alive until sign-out and final profile saves finish.
+        window::oldest().then(|id| id.map_or_else(iced::exit, window::close))
     }
 
     /// Close parked hosts for `keys` off the UI thread (a batch signs them in cold).
@@ -3503,7 +3519,12 @@ impl App {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
-        if self.closing && !matches!(&message, Message::SessionsClosed(_)) { return Task::none(); }
+        if self.closing && !matches!(&message,
+            Message::WindowResized(_) | Message::WindowMaximized(_)
+            | Message::MinimizeWindow | Message::MaximizeWindow | Message::TitlePressed
+            | Message::TitleMoved | Message::TitleReleased | Message::ResizeWindow(_)) {
+            return Task::none();
+        }
         // The helper is preparing to replace this process. Do not start new
         // writes or work between its readiness check and our exit.
         if matches!(self.self_update, self_update::State::Applying)
@@ -4637,10 +4658,6 @@ impl App {
                 self.confirm_close = false;
             }
             Message::CancelClose => self.confirm_close = false,
-            Message::SessionsClosed(result) => match result {
-                Ok(()) => return iced::exit(),
-                Err(error) => { self.closing = false; self.status = error; }
-            },
             Message::PreviewReady(screenshot) => {
                 // light/empty/close variants get their own files.
                 let light = self.settings.light_theme;
@@ -4807,7 +4824,7 @@ impl App {
             items: vec![ffxiah::Quote { name: "Copper Ore".into(), url: "https://www.ffxiah.com/item/640".into(),
                 stack: Some(12), price: Some(2000), stock: Some(2), last_sale: false },
                 ffxiah::Quote { name: "Copper Ingot".into(), url: "https://www.ffxiah.com/item/648".into(),
-                stack: None, price: Some(2000), stock: Some(0), last_sale: false }], truncated: false,
+                stack: None, price: Some(2000), stock: Some(0), last_sale: false }], ..Default::default()
         }));
     }
 
@@ -5343,6 +5360,7 @@ fn allowed_link(url: &str) -> bool {
                     | "ffxiah.com"
                     | "www.bg-wiki.com"
                     | "bg-wiki.com"
+                    | "wiki.ffo.jp"
                     | "support.na.square-enix.com"
                     | "reshade.me"
             )
@@ -5599,7 +5617,7 @@ fn main() -> iced::Result {
     }
     // Japanese text falls back to Yu Gothic UI glyph by glyph.
     i18n::install_font_fallback();
-    iced::application(App::new, App::update, ui::view)
+    let result = iced::application(App::new, App::update, ui::view)
         .title("Crystal Launcher")
         .theme(|app: &App| ui::theme(app.settings.light_theme))
         .subscription(App::subscription)
@@ -5621,7 +5639,12 @@ fn main() -> iced::Result {
             },
             ..Default::default()
         })
-        .run()
+        .run();
+    if let Err(error) = launcher_close::finish() {
+        launch_log::append_history(&Config::default().history_path(), "Crystal", &format!(
+            "launcher close failed: pid {}, {error}", std::process::id()), None);
+    }
+    result
 }
 
 #[cfg(test)]
@@ -7777,6 +7800,14 @@ mod tests {
         let _ = app.update(Message::Tick);
         let _ = app.update(Message::Launch(key));
         assert!(app.launches.as_ref().unwrap().is_empty(), "shutdown cannot start more work");
+        let size = iced::Size::new(1280.0, 720.0);
+        let _ = app.update(Message::WindowResized(size));
+        assert_eq!(app.viewport, size, "window controls stay responsive during sign-out");
+        app.title_held = true;
+        let _ = app.update(Message::TitleMoved);
+        assert!(!app.title_held);
+        let _ = app.update(Message::WindowMaximized(true));
+        assert!(app.maximized);
     }
 
     /// After a normal quit (or FFXI's usual -14) the account signs back in, as a pre-sign-in
@@ -9784,6 +9815,7 @@ mod tests {
     #[test]
     fn malicious_and_non_http_links_cannot_open() {
         assert!(allowed_link("https://www.ffxiah.com/"));
+        assert!(allowed_link("https://wiki.ffo.jp/"));
         assert!(allowed_link("https://www.playonline.com/ff11us/"));
         // The Japanese site's article and "View all news" links open too, and only on its host.
         assert!(allowed_link(services::sources(i18n::Lang::Ja).home));
@@ -9797,6 +9829,9 @@ mod tests {
             "file:///C:/Windows/System32/cmd.exe",
             "https://www.playonline.com.evil.test/",
             "https://x@www.ffxiah.com/",
+            "https://wiki.ffo.jp.evil.test/",
+            "http://wiki.ffo.jp/",
+            "https://user@wiki.ffo.jp/",
             "javascript:alert(1)",
         ] {
             assert!(!allowed_link(url));

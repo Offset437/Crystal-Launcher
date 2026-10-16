@@ -154,6 +154,7 @@ pub(crate) trait SignedIn: Send + Sync + 'static {
     fn controller_result(&self, _id: u64, _ok: bool, _message: &str) -> Result<(), String> { Ok(()) }
     /// A pending control and its "also for my groups" choice.
     fn take_native_control(&self) -> Option<(crate::session_worker::NativeControl, bool)> { None }
+    fn take_startup_sign_out(&self) -> bool { false }
     fn take_native_batch(&self) -> Option<Vec<u8>> { None }
     fn native_command_listener(&self) -> Option<crate::session_worker::CommandWake> { None }
     /// The window saw input for this idle session since the last call.
@@ -1108,6 +1109,15 @@ fn wait_started(pipe: &mut LoaderPipe, auth: &impl SignedIn, log: &mut SessionLo
             }
             log.line("A Play is waiting; the loader skips the remaining Viewer pauses.");
         }
+        // Older hosts accept sign-out only at the main menu. Leave their
+        // command queued for watch rather than consuming an unsupported cancel.
+        if !until_game && auth.social_only() && pipe.supports_startup_sign_out() && auth.take_startup_sign_out() {
+            if pipe.send(native_control_line(crate::session_worker::NativeControl::SignOut, true).as_bytes(),
+                Instant::now() + Duration::from_secs(2)).is_err() {
+                return Err(LoaderEnd::Closed);
+            }
+            log.line("Cancelling the unfinished PlayOnline sign-in before closing.");
+        }
         let slice = if auth.native_core() && auth.social_only() { (Instant::now() + PLAY_PENDING_POLL).min(deadline) } else { deadline };
         match pipe.next_event(Some(slice)) {
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut && slice < deadline => continue,
@@ -1959,6 +1969,55 @@ mod tests {
         injector_exit: Duration::from_millis(10),
         abort: None,
     };
+
+    #[test]
+    fn startup_sign_out_is_forwarded_before_idle_only_to_a_capable_sign_in_only_host() {
+        struct StartingAuth { social: bool, pending: AtomicBool }
+        impl SignedIn for StartingAuth {
+            fn native_core(&self) -> bool { true }
+            fn social_only(&self) -> bool { self.social }
+            fn idle_first(&self) -> bool { true }
+            fn take_startup_sign_out(&self) -> bool { self.pending.swap(false, Ordering::AcqRel) }
+            fn session_line(&self, _: &Path) -> Result<Zeroizing<Vec<u8>>, String> { unreachable!() }
+            fn forward_presence(&self, _: &[u8]) -> Result<bool, String> { unreachable!() }
+        }
+        for (capable, social, until_game) in [(true, true, false), (false, true, false), (true, false, false), (true, true, true)] {
+            let (prepared, dir) = fixture(Tool::Vanilla);
+            let mut log = SessionLog::open(&prepared.session.log).unwrap();
+            let mut pipe = LoaderPipe::create().unwrap();
+            let name = pipe.name().to_owned();
+            let forward = capable && social && !until_game;
+            let loader = std::thread::spawn(move || {
+                let file = OpenOptions::new().read(true).write(true).open(name).unwrap();
+                let mut writer = file.try_clone().unwrap();
+                writeln!(writer, r#"{{"type":"hello","v":1,"pid":{},"native_auth":true,"native_social":true,"startup_sign_out":{capable}}}"#,
+                    std::process::id()).unwrap();
+                if forward {
+                    let mut command = String::new();
+                    BufReader::new(file).read_line(&mut command).unwrap();
+                    assert_eq!(command, "{\"type\":\"native_sign_out\"}\n");
+                    writeln!(writer, r#"{{"type":"error","message":"synthetic sign-in cancelled"}}"#).unwrap();
+                } else {
+                    writeln!(writer, r#"{{"type":"started"}}"#).unwrap();
+                }
+            });
+            pipe.accept(FAST.hello, || Ok(())).unwrap();
+            pipe.handshake(&prepared.loader, FAST.hello).unwrap();
+            let auth = StartingAuth { social, pending: AtomicBool::new(true) };
+            let mut game = GameVersionCheck::new(&prepared);
+            let result = wait_started(&mut pipe, &auth, &mut log, FAST.start, &mut Timeline::begin(), &mut |_| {}, until_game, &mut game);
+            if forward {
+                assert!(matches!(result, Err(LoaderEnd::Error(_))));
+            } else {
+                assert_eq!(result, Ok(true));
+            }
+            assert_eq!(auth.pending.load(Ordering::Acquire), !forward);
+            loader.join().unwrap();
+            drop(pipe);
+            drop(log);
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
 
     #[test]
     fn handoff_publishes_before_transferring_to_the_verified_loader() {

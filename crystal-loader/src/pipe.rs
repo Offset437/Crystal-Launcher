@@ -219,8 +219,7 @@ impl Default for LineReader {
 }
 
 impl LineReader {
-    /// Returns the next line without its `\n`. `timeout: None` waits forever.
-    pub fn read_line(&mut self, pipe: &Pipe, timeout: Option<Duration>) -> Result<&[u8], PipeError> {
+    fn discard_consumed(&mut self) {
         if self.consumed > 0 {
             self.buf.copy_within(self.consumed..self.len, 0);
             let new_len = self.len - self.consumed;
@@ -228,6 +227,19 @@ impl LineReader {
             self.len = new_len;
             self.consumed = 0;
         }
+    }
+
+    /// Parses one owned message, then immediately wipes its source bytes while
+    /// retaining any following lines already read from the byte-stream pipe.
+    pub fn read_parsed<T>(&mut self, pipe: &Pipe, timeout: Option<Duration>, parse: impl FnOnce(&[u8]) -> T) -> Result<T, PipeError> {
+        let parsed = parse(self.read_line(pipe, timeout)?);
+        self.discard_consumed();
+        Ok(parsed)
+    }
+
+    /// Returns the next line without its `\n`. `timeout: None` waits forever.
+    pub fn read_line(&mut self, pipe: &Pipe, timeout: Option<Duration>) -> Result<&[u8], PipeError> {
+        self.discard_consumed();
         let deadline = timeout.map(|t| Instant::now() + t);
         loop {
             if let Some(pos) = self.buf[..self.len].iter().position(|&b| b == b'\n') {
@@ -277,6 +289,75 @@ pub fn random_pipe_path() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn coalesced_startup_handoff(parked: bool) {
+        use crate::{b64, proto::{self, FirstLine, ServiceEvent}};
+        use std::sync::mpsc;
+
+        let credentials = format!("\"native_auth\":{{\"pol_id\":\"{}\",\"pol_password\":\"{}\",\"se_id\":\"{}\",\"se_secret\":\"{}\",\"otp\":null,\"profile_key\":\"{}\"}}",
+            b64::encode(b"ABCD1234"), b64::encode(b"fake password"), b64::encode(b"fakeuser"), b64::encode(&[0x51; 20]), "a".repeat(40));
+        let startup = if parked {
+            format!("{{\"type\":\"park\",\"v\":1,\"region\":\"US\",\"lang\":\"US\"}}\n{{\"type\":\"credentials\",\"start_game\":false,{credentials}}}\n")
+        } else {
+            format!("{{\"type\":\"session\",\"v\":1,\"region\":\"US\",\"lang\":\"US\",\"start_game\":false,{credentials}}}\n")
+        };
+        let commands = concat!("{\"type\":\"native_sign_out\"}\n", "{\"type\":\"native_play_pending\"}\n",
+            "{\"type\":\"controller_settings\",\"request_id\":42,\"deadline_ms\":123456,\"settings\":{\"padmode000\":\"1,1,0,0,1,1\",\"padsin000\":\"1,2,3\"}}\n");
+        let payload = format!("{startup}{commands}");
+        let path = random_pipe_path();
+        let server = Pipe::create_server(&path).unwrap();
+        let (sent, written) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            server.accept().unwrap();
+            server.write_all(payload.as_bytes()).unwrap(); // one byte-stream write
+            sent.send(()).unwrap();
+            let _ = released.recv_timeout(Duration::from_secs(5));
+        });
+        let client = Pipe::connect(&path, std::process::id(), Duration::from_secs(5)).unwrap();
+        written.recv_timeout(Duration::from_secs(5)).unwrap();
+        let mut reader = LineReader::default();
+        let first = reader.read_parsed(&client, Some(Duration::from_secs(2)), proto::parse_first_line).unwrap().unwrap();
+        let session = match first {
+            FirstLine::Session(session) => { assert!(!parked); session }
+            FirstLine::Park(park) => {
+                assert!(parked);
+                let (credentials, _) = crate::park::await_credentials(std::process::id(), Instant::now(), Duration::ZERO,
+                    &mut |bytes| client.write_all(bytes),
+                    &mut || reader.read_parsed(&client, None, proto::parse_credentials)).unwrap();
+                park.into_session(credentials)
+            }
+        };
+        assert!(session.native_auth.is_some() && !session.start_game);
+        // The same kernel read must have included the commands, and no bytes
+        // from the consumed credentials may remain in the allocated buffer.
+        assert_eq!(&reader.buf[..reader.len], commands.as_bytes());
+        assert!(reader.buf[reader.len..].iter().all(|&byte| byte == 0));
+        assert_eq!(reader.consumed, 0);
+        drop(session);
+
+        // Continue the real parser on the reader thread with no further writes.
+        std::thread::spawn(move || {
+            let next = |reader: &mut LineReader| reader.read_parsed(&client, Some(Duration::from_secs(2)), proto::parse_service_event).unwrap().unwrap().unwrap();
+            assert!(matches!(next(&mut reader), ServiceEvent::NativeSignOut));
+            assert!(matches!(next(&mut reader), ServiceEvent::NativePlayPending));
+            assert!(matches!(next(&mut reader), ServiceEvent::ControllerSettings { id: 42, deadline_ms: 123456, settings } if settings.len() == 2));
+            assert_eq!((reader.len, reader.consumed), (0, 0));
+            assert!(reader.buf.iter().all(|&byte| byte == 0));
+        }).join().unwrap();
+        release.send(()).unwrap();
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn cold_session_preserves_coalesced_commands_and_wipes_consumed_credentials() {
+        coalesced_startup_handoff(false);
+    }
+
+    #[test]
+    fn parked_credentials_preserve_coalesced_commands_and_wipe_consumed_credentials() {
+        coalesced_startup_handoff(true);
+    }
 
     #[test]
     fn lines_cross_reads_and_server_pid_is_checked() {

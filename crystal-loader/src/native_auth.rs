@@ -134,6 +134,40 @@ static CONTROL: AtomicU8 = AtomicU8::new(GAME);
 /// the Viewer's Play follows a dialog the user already applied (07c §6 S1 b).
 static PLAY_LATCH: AtomicBool = AtomicBool::new(false);
 
+const SIGNING_IN: u8 = 0;
+const CANCELLING_SIGN_IN: u8 = 1;
+const STARTUP_FINISHED: u8 = 2;
+#[cfg(not(test))]
+static STARTUP_STATE: AtomicU8 = AtomicU8::new(SIGNING_IN);
+#[cfg(test)]
+thread_local! { static STARTUP_STATE: AtomicU8 = const { AtomicU8::new(STARTUP_FINISHED) }; }
+
+fn with_startup_state<T>(f: impl FnOnce(&AtomicU8) -> T) -> T {
+    #[cfg(not(test))]
+    { f(&STARTUP_STATE) }
+    #[cfg(test)]
+    { STARTUP_STATE.with(f) }
+}
+
+fn startup_cancelled() -> bool {
+    with_startup_state(|state| state.load(Ordering::Acquire) == CANCELLING_SIGN_IN)
+}
+
+/// Enter idle before ending startup, so a sign-out racing this transition is
+/// either a startup cancellation or an ordinary idle command.
+fn finish_startup() -> bool {
+    with_startup_state(|state| state.swap(STARTUP_FINISHED, Ordering::AcqRel) != CANCELLING_SIGN_IN)
+}
+
+fn cancel_startup(state: &AtomicU8, pending_play: bool) -> Option<i32> {
+    if state.load(Ordering::Acquire) == STARTUP_FINISHED { return None; }
+    if pending_play { return Some(-256); }
+    match state.compare_exchange(SIGNING_IN, CANCELLING_SIGN_IN, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) | Err(CANCELLING_SIGN_IN) => Some(0),
+        Err(_) => None,
+    }
+}
+
 /// Play was requested (START_GAME accepted or latched). From then on no new
 /// attempt starts (no auto-Away, no status/mail retry, no new mail transfer)
 /// and in-flight tickets finish without a cancel (07a presign-no-cancel-freeze 1).
@@ -260,7 +294,11 @@ pub fn wait_batch_game() -> Result<(), String> {
     if let Some(gate) = gate { gate.wait()?; }
     Ok(())
 }
-pub fn request_sign_out() { request_control(SIGN_OUT, "sign_out"); }
+pub fn request_sign_out() {
+    let code = with_startup_state(|state| cancel_startup(state, play_pending()))
+        .unwrap_or_else(|| accept_control(&CONTROL, &PLAY_LATCH, SIGN_OUT));
+    events::send(format!("{{\"type\":\"native_control_result\",\"action\":\"sign_out\",\"code\":{code}}}\n"));
+}
 pub fn request_status(mode: i32, groups: bool) {
     let flag = if groups { GROUPS } else { 0 };
     match mode {
@@ -693,6 +731,7 @@ impl NativeSession {
     }
 
     fn sign_in_core(&mut self, home: u32, c: &NativeCredentials) -> Result<(), String> {
+        if startup_cancelled() { return Err("PlayOnline sign-in was cancelled.".into()); }
         self.select_member(home, c);
         let name = native_profile::selected_name(&self.api, self.profiles)?;
         native_profile::connect(&self.api, &name)?; // connect screen 10199d02
@@ -777,7 +816,7 @@ impl NativeSession {
             }
             if !owner_frame(api, &mut self.pushes) {
                 log!("native POL Viewer gap {stage} stopped after {frames} frame(s)");
-                if events::pipe_closed() { return Err("The launcher closed the session during PlayOnline sign-in.".into()); }
+                if events::pipe_closed() || startup_cancelled() { return Err("The launcher closed the session during PlayOnline sign-in.".into()); }
                 return Err(format!("Native PlayOnline connection failed during sign-in (POL result {}).", api.zero(1103)));
             }
             frames += 1;
@@ -799,7 +838,7 @@ impl NativeSession {
         if std::mem::replace(&mut self.viewer_checked, true) {
             return Err("The PlayOnline Viewer version check already ran for this sign-in.".into());
         }
-        if events::pipe_closed() { return Err(VIEWER_CHECK_SILENT.into()); }
+        if events::pipe_closed() || startup_cancelled() { return Err(VIEWER_CHECK_SILENT.into()); }
         let api = self.api.clone();
         *VIEWER_CHECK.lock().unwrap_or_else(|e| e.into_inner()) = None; // only this request's answer counts
         events::send(proto::viewer_check_line());
@@ -842,6 +881,7 @@ impl NativeSession {
     /// latched a pump error.
     fn stopped_owner(&self, api: &Api) -> String {
         if events::pipe_closed() { return VIEWER_CHECK_SILENT.into(); }
+        if startup_cancelled() { return "PlayOnline sign-in was cancelled.".into(); }
         format!("Native PlayOnline connection failed before member login (POL result {}).", api.zero(1103))
     }
 
@@ -874,6 +914,7 @@ impl NativeSession {
     /// (2 network, 3 member). 31..38 are transitional; failure is a negative
     /// state, reported with 823 (D18).
     fn open(&mut self, mode: usize, linked: i32) -> Result<(), String> {
+        if startup_cancelled() { return Err("PlayOnline sign-in was cancelled.".into()); }
         let name = if mode == 0 { "open-network" } else { "open-member" };
         let mut cadence = StartupCadence::new(name);
         let api = &self.api;
@@ -933,7 +974,7 @@ impl NativeSession {
             }
             match aborted {
                 // The Viewer's cancel button: 807 makes the core fail the login.
-                None if events::pipe_closed() || started.elapsed() >= SIGN_IN_LIMIT => {
+                None if events::pipe_closed() || startup_cancelled() || started.elapsed() >= SIGN_IN_LIMIT => {
                     log!("native POL sign-in cancelled at state {state}");
                     api.zero(807);
                     aborted = Some(Instant::now());
@@ -954,6 +995,7 @@ impl NativeSession {
     /// was polled to its end by `settle_for_play`.
     pub fn attach_game(&mut self) {
         CONTROL.store(GAME, Ordering::Release);
+        finish_startup();
         let api = self.api.clone();
         self.viewer_status.retire();
         // Answer messages pushed during the last idle frames before the game
@@ -1048,6 +1090,10 @@ impl NativeSession {
         }
         PLAY_LATCH.store(false, Ordering::Release);
         CONTROL.store(SOCIAL, Ordering::Release);
+        if !finish_startup() {
+            CONTROL.store(GAME, Ordering::Release);
+            return Ok(false);
+        }
         events::send("{\"type\":\"native_session_state\",\"game\":false}\n".into());
         events::send("{\"type\":\"native_social_ready\"}\n".into());
         let observer = self.observe_friends()?;
@@ -1255,7 +1301,7 @@ fn owner_frame_with(api: &Api, pushes: &mut crate::native_social::PushDelivery, 
     work();
     pushes.flush_pushed(api, api.zero(838) == 3);
     pause_owner(interval);
-    !events::pipe_closed() && api.zero(1103) >= 0
+    !events::pipe_closed() && !startup_cancelled() && api.zero(1103) >= 0
 }
 
 // Initial open/status/list/presence polls, including the wall-clock mail list,
@@ -1444,6 +1490,8 @@ impl Drop for NativeSession {
     /// 101aa2d4 (1502 clear), 1019869a (host unregistration) and 10019464
     /// (920 file worker stop, 915 option.bin mutex). No 852 (B9).
     fn drop(&mut self) {
+        // Cancellation stops startup work; teardown still pumps and signs out.
+        finish_startup();
         self.viewer_status.cancel(&self.api);
         crate::native_social::set_listening(false);
         if self.home {

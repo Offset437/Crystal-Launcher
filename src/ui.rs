@@ -1583,10 +1583,38 @@ const AH_SERVER_NAMES: [&str; 16] = {
     }
     names
 };
-/// BG Wiki's MediaWiki search; an exact title jumps straight to the page.
+struct WikiSite {
+    title: &'static str,
+    home: &'static str,
+    search_placeholder: &'static str,
+}
+fn wiki_site() -> WikiSite {
+    match crate::i18n::current() {
+        crate::i18n::Lang::En => WikiSite {
+            title: "BG Wiki", home: "https://www.bg-wiki.com/", search_placeholder: t("Search BG Wiki"),
+        },
+        crate::i18n::Lang::Ja => WikiSite {
+            title: "FF11用語辞典", home: "https://wiki.ffo.jp/", search_placeholder: t("Search FF11 Dictionary"),
+        },
+    }
+}
+/// Open the search for the wiki matching the launcher's selected language.
 pub(crate) fn wiki_search_url(query: &str) -> String {
-    let mut url = reqwest::Url::parse("https://www.bg-wiki.com/index.php").expect("static URL");
-    url.query_pairs_mut().append_pair("search", query.trim());
+    let url = match crate::i18n::current() {
+        crate::i18n::Lang::En => {
+            let mut url = reqwest::Url::parse("https://www.bg-wiki.com/index.php").expect("static URL");
+            url.query_pairs_mut().append_pair("search", query.trim());
+            url
+        },
+        crate::i18n::Lang::Ja => {
+            let mut url = reqwest::Url::parse("https://wiki.ffo.jp/search.cgi").expect("static URL");
+            url.query_pairs_mut().extend_pairs([
+                ("CCC", "愛"), ("Command", "Search"), ("qf", query.trim()),
+                ("order", "match"), ("ffotype", "title"), ("type", "title"),
+            ]);
+            url
+        },
+    };
     url.into()
 }
 pub(crate) fn ah_server_id(server: &str) -> Option<u8> {
@@ -1611,10 +1639,30 @@ mod community_tests {
 
     #[test]
     fn wiki_search_encodes_the_query() {
+        crate::i18n::set(crate::i18n::Lang::En);
         assert_eq!(
             wiki_search_url("  Sortie gear & aug "),
             "https://www.bg-wiki.com/index.php?search=Sortie+gear+%26+aug"
         );
+        assert_eq!(wiki_site().title, "BG Wiki");
+        crate::i18n::set(crate::i18n::Lang::Ja);
+        let site = wiki_site();
+        assert_eq!(site.title, "FF11用語辞典");
+        assert_eq!(site.search_placeholder, "FF11用語辞典を検索");
+        assert!(crate::allowed_link(site.home));
+        let search = wiki_search_url("  サルベージ & 装備  ");
+        assert!(crate::allowed_link(&search));
+        let url = reqwest::Url::parse(&search).unwrap();
+        assert_eq!(url.host_str(), Some("wiki.ffo.jp"));
+        assert_eq!(url.path(), "/search.cgi");
+        let pairs: std::collections::BTreeMap<_, _> = url.query_pairs().collect();
+        assert_eq!(pairs.len(), 6);
+        assert_eq!(pairs.get("qf").unwrap(), "サルベージ & 装備");
+        assert_eq!(pairs.get("CCC").unwrap(), "愛");
+        assert_eq!(pairs.get("Command").unwrap(), "Search");
+        crate::i18n::set(crate::i18n::Lang::En);
+        assert_eq!(wiki_site().home, "https://www.bg-wiki.com/");
+        assert_eq!(wiki_search_url("Sortie"), "https://www.bg-wiki.com/index.php?search=Sortie");
     }
 
     #[test]
@@ -2320,11 +2368,11 @@ mod news_card_tests {
 fn resource_card<'a>(app: &'a App, wiki: bool, height: f32, s: f32, c: Colors) -> Element<'a, Message> {
     use crate::icons::{icon, Icon};
     let faint = faint(app.settings.light_theme);
-    let title = if wiki { "BG Wiki" } else { "FFXIAH" };
-    let url = if wiki {
-        "https://www.bg-wiki.com/"
+    let (title, url) = if wiki {
+        let site = wiki_site();
+        (site.title, site.home)
     } else {
-        "https://www.ffxiah.com/"
+        ("FFXIAH", "https://www.ffxiah.com/")
     };
     let link = move |content: Element<'a, Message>| {
         crate::controller_nav::button(content)
@@ -2388,7 +2436,7 @@ fn search_field<'a>(
 ) -> Element<'a, Message> {
     use crate::icons::{icon, Icon};
     let input = text_input(
-        if wiki { t("Search BG Wiki") } else { t("Find an item") },
+        if wiki { wiki_site().search_placeholder } else { t("Find an item") },
         if wiki { &app.wiki_query } else { &app.ah_query },
     )
     .on_input(if wiki {
@@ -5052,6 +5100,7 @@ fn ah_lookup_panel<'a>(app: &'a App, base: Element<'a, Message>) -> Element<'a, 
                     .style(quiet).on_press(Message::OpenUrl(item.url.clone())));
             }
             if results.truncated { body = body.push(text(t("Showing the first 30 matches. Refine the item name for more specific results.")).font(BODY).size(12).color(c.sub)); }
+            if let Some(warning) = &results.warning { body = body.push(text(warning).font(BODY).size(12).color(c.sub)); }
         }
     }
     let footer = column![

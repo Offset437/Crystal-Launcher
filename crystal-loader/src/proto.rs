@@ -928,7 +928,7 @@ pub fn json_string(s: &str) -> String {
 /// it refuses a native sign-in from a loader without it. `park`: it accepts a
 /// `park` line before credentials (07d §1).
 pub fn hello_line(pid: u32) -> String {
-    format!("{{\"type\":\"hello\",\"v\":{PROTOCOL_VERSION},\"pid\":{pid},\"native_auth\":true,\"native_social\":true,\"native_batch\":true,\"viewer_check\":true,\"park\":{PARK}}}\n")
+    format!("{{\"type\":\"hello\",\"v\":{PROTOCOL_VERSION},\"pid\":{pid},\"native_auth\":true,\"native_social\":true,\"native_batch\":true,\"viewer_check\":true,\"startup_sign_out\":true,\"park\":{PARK}}}\n")
 }
 
 /// The park reached its end point: polcore created, SetAreaCode/SetParamInit
@@ -1360,6 +1360,7 @@ mod tests {
         let hello = hello_line(77);
         assert_eq!(json::parse(hello.as_bytes()).unwrap().get("native_batch"), Some(&json::Value::Bool(true)));
         assert_eq!(json::parse(hello.as_bytes()).unwrap().get("viewer_check"), Some(&json::Value::Bool(true)));
+        assert_eq!(json::parse(hello.as_bytes()).unwrap().get("startup_sign_out"), Some(&json::Value::Bool(true)));
         let p =presence_payload([-2, -1, 0, -2, -1, 1]);
         assert_eq!(&p[..4], &(-2i32).to_le_bytes());
         assert_eq!(&p[20..], &1i32.to_le_bytes());
