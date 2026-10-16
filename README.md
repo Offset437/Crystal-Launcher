@@ -20,7 +20,9 @@ Settings → Graphics offers optional ReShade for Vanilla, Windower and Ashita. 
 
 Each account has an optional automatic character login setting, disabled by default. Slot 1 selects the first character; choose another row for a different character. Each client can finish login in the background without switching your active window. Unknown game layouts, unavailable characters and unexpected menus leave login to you.
 
-The Home page and account editor let you choose each account's launch method. Settings → System sets the default for accounts using “Use default.” Vanilla starts Crystal's game host directly, uses the game's settings, and does not start Windower or Ashita or load their addons. Sign out of an existing PlayOnline session before switching its launch method; an already running host retains its original tool.
+The Home page and account editor let you choose each account's launch method. Settings → System sets the default for accounts using “Use default.” Vanilla starts Crystal's game host directly, uses the game's settings, and does not start Windower or Ashita or load their addons. Use Sign out beside an idle account on the Accounts page before switching its launch method; an already running host retains its original tool.
+
+Closing FFXI signs out and closes that client's POL host. Settings → System offers a separate “Sign back in after FFXI closes” option, off by default. Startup sign-in remains a separate choice. Closing Crystal signs out idle PlayOnline sessions and closes parked hosts while running games continue independently. Windower's final profile save finishes before sign-out completes or its profile editor opens.
 
 Packaged builds keep settings and the Windows-user-encrypted credential vault under `%LOCALAPPDATA%\Crystal Launcher`. Updates and reinstalling preserve saved logins and settings for the same Windows user; they replace only the launcher package. One-time passwords are not saved. A development checkout may retain its existing local data location. Do not share credential vaults, login files, or unredacted account logs.
 
