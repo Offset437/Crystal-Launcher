@@ -1,6 +1,6 @@
 //! The game session belongs to a headless copy of Crystal, not the iced window.
 //! Credentials travel once through anonymous stdin; disk records contain only status.
-//! Closing/reopening the window neither signs out nor starts a second session.
+//! Closing the window retires idle sessions; running games keep their own workers.
 
 use crate::{
     backend::{self, Account, Config, LaunchResult},
@@ -1357,6 +1357,19 @@ pub(crate) fn find(config: &Config, account: &Account) -> Option<BackgroundSessi
 }
 
 impl BackgroundSession {
+    pub(crate) fn sign_out(self) -> Result<(), String> {
+        if !self.can_prepare_update() {
+            return Err(t("Close FFXI before starting another game or signing out of PlayOnline.").into());
+        }
+        close_idle_sessions(vec![IdleSessionClose::known(self.clone())])?;
+        // A Play from another window can win while we wait. Never claim that
+        // account signed out, or stop the game it started.
+        if identity(self.worker.pid) == Some(self.worker) {
+            return Err(t("Close FFXI before starting another game or signing out of PlayOnline.").into());
+        }
+        Ok(())
+    }
+
     fn uses_windower(&self) -> bool {
         read_record(&self.path).is_some_and(|record| record.worker == self.worker
             && record.launch_tool == Some(Tool::Windower))
@@ -1463,6 +1476,87 @@ impl BackgroundSession {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
+    }
+}
+
+/// Captures only the session path and process identity, never credentials. A
+/// sign-in thread may not have published its worker yet when the window closes.
+pub(crate) struct IdleSessionClose {
+    path: PathBuf,
+    worker: Option<Identity>,
+    requested: bool,
+}
+
+impl IdleSessionClose {
+    fn known(session: BackgroundSession) -> Self {
+        Self { path: session.path, worker: Some(session.worker), requested: false }
+    }
+
+    pub(crate) fn for_account(config: &Config, account: &Account, preparing: bool) -> Option<Self> {
+        if let Some(session) = find(config, account) {
+            return session.can_prepare_update().then(|| Self::known(session));
+        }
+        let path = record_path(config, account);
+        if let Some(record) = read_record(&path).filter(|record|
+            identity(record.worker.pid) == Some(record.worker)
+            && matches!(record.state, Event::Finished(_) | Event::Failed(_))) {
+            return Some(Self { path, worker: Some(record.worker), requested: true });
+        }
+        preparing.then(|| Self { path: record_path(config, account), worker: None, requested: false })
+    }
+
+    /// True when the captured worker ended, or a game/queued Play needs to keep
+    /// running. Completion records alone precede Windower's final profile save.
+    fn finished(&mut self) -> bool {
+        let Some(worker) = self.worker else {
+            if let Some(record) = read_record(&self.path).filter(|record|
+                identity(record.worker.pid) == Some(record.worker)
+                && matches!(record.state, Event::Progress(_) | Event::Started(_))) {
+                self.worker = Some(record.worker);
+            }
+            return false;
+        };
+        if identity(worker.pid) != Some(worker) { return true; }
+        let session = BackgroundSession { path: self.path.clone(), worker };
+        if self.requested { return session.game_running() == Some(true); }
+        if !session.active() { return false; }
+        let Some(directory) = self.path.parent() else { return false };
+        let snapshot = read_friend_cache(directory, worker);
+        if snapshot.as_ref().is_some_and(|snapshot| snapshot.game_running == Some(true)) { return true; }
+        let command = directory.join("native-control.json");
+        if command.exists() {
+            if let Some(control) = read_bounded(&command, 1024).and_then(|bytes| serde_json::from_slice::<ControlRequest>(&bytes).ok())
+                .filter(|control| control.worker == worker) {
+                match control.action {
+                    NativeControl::StartGame => return true,
+                    NativeControl::SignOut => self.requested = true,
+                    _ => {},
+                }
+            }
+            return false;
+        }
+        let ready = snapshot.is_some_and(|snapshot|
+            snapshot.game_running == Some(false) && !snapshot.social.busy)
+            && !directory.join("native-social.json").exists();
+        if ready && request_session_control(&session, NativeControl::SignOut, true).is_ok() {
+            self.requested = true;
+        }
+        false
+    }
+}
+
+/// Sign out each captured idle owner through polcore and wait for its worker to
+/// exit. Recheck game state and command locks on every submission; no process is
+/// terminated, and an active game or a queued Play wins over launcher shutdown.
+pub(crate) fn close_idle_sessions(mut sessions: Vec<IdleSessionClose>) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        sessions.retain_mut(|session| !session.finished());
+        if sessions.is_empty() { return Ok(()); }
+        if Instant::now() >= deadline {
+            return Err(t("Timed out signing out of PlayOnline. Crystal stayed open; running games were kept.").into());
+        }
+        std::thread::sleep(Duration::from_millis(25));
     }
 }
 
@@ -2755,6 +2849,128 @@ mod tests {
         assert!(!ashita_config.account_directory(&account).join("native-control.json").exists());
         for fixture in [&game_fixture, &ashita_fixture] { fs::write(fixture.0.join("stop"), []).unwrap(); }
         until(|| !game.alive.load(Ordering::Acquire) && !ashita.alive.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn launcher_close_waits_for_an_unreadable_idle_snapshot_to_recover() {
+        let fixture = Fixture::new();
+        let (config, account, directory, _) = controller_fixture(&fixture.0, Some(false));
+        let mut pending = IdleSessionClose::for_account(&config, &account, false).unwrap();
+        fs::remove_file(directory.join("friends.json")).unwrap();
+        assert!(!pending.finished(), "a missing cache is not evidence that its owner closed or started a game");
+        assert!(!pending.requested && !directory.join("native-control.json").exists());
+        publish_friends(&directory, &crate::friends::Snapshot { game_running: Some(false), ..Default::default() }).unwrap();
+        assert!(!pending.finished() && pending.requested);
+        let command: ControlRequest = serde_json::from_slice(&fs::read(directory.join("native-control.json")).unwrap()).unwrap();
+        assert_eq!(command.action, NativeControl::SignOut);
+    }
+
+    #[test]
+    fn launcher_close_signs_out_idle_sessions_and_keeps_the_other_game_running() {
+        let fixtures = [Fixture::new(), Fixture::new(), Fixture::new()];
+        let account = account();
+        let mut launches = Vec::new();
+        let mut sessions = Vec::new();
+        let mut workers = Vec::new();
+        for (index, fixture) in fixtures.iter().enumerate() {
+            fs::write(fixture.0.join("social-fixture"), []).unwrap();
+            let config = config(&fixture.0);
+            let launch = launch_command(child_command("session_worker::tests::worker_fixture", &fixture.0),
+                &config, account.clone(), String::new(), None, Instant::now(), |_| {}).unwrap();
+            if index == 2 {
+                request_native_control(&config, &account, NativeControl::StartGame).unwrap();
+                until(|| launch.game_running.load(Ordering::Acquire));
+            }
+            workers.push(find(&config, &account).unwrap().worker);
+            if let Some(session) = IdleSessionClose::for_account(&config, &account, false) { sessions.push(session); }
+            launches.push(launch);
+        }
+        assert_eq!(sessions.len(), 2, "a running game is excluded from shutdown");
+        close_idle_sessions(sessions).unwrap();
+        for index in 0..2 {
+            until(|| !launches[index].alive.load(Ordering::Acquire));
+            assert!(!launches[index].alive.load(Ordering::Acquire));
+            assert_ne!(identity(workers[index].pid), Some(workers[index]), "wait for the actual worker exit");
+        }
+        assert!(launches[2].alive.load(Ordering::Acquire) && launches[2].game_running.load(Ordering::Acquire));
+        assert!(!config(&fixtures[2].0).account_directory(&account).join("native-control.json").exists());
+    }
+
+    #[test]
+    fn account_signout_allows_a_fresh_worker_with_another_launch_method() {
+        let fixture = Fixture::new();
+        fs::write(fixture.0.join("social-fixture"), []).unwrap();
+        let config = config(&fixture.0);
+        let account = account();
+        let plan = |tool| Plan { tool, settings: Default::default(), social_only: true,
+            invisible_login: false, auto_away_minutes: 0, auto_login: Default::default(),
+            viewer_gaps: false, trigger: Default::default() };
+        let first = launch_command(child_command("session_worker::tests::worker_fixture", &fixture.0),
+            &config, account.clone(), String::new(), Some(plan(Tool::Vanilla)), Instant::now(), |_| {}).unwrap();
+        let session = find(&config, &account).unwrap();
+        assert!(session.ensure_launch_tool(Tool::Windower).is_err());
+        session.sign_out().unwrap();
+        until(|| !first.alive.load(Ordering::Acquire));
+        assert!(!first.alive.load(Ordering::Acquire) && find(&config, &account).is_none());
+        let second = launch_command(child_command("session_worker::tests::worker_fixture", &fixture.0),
+            &config, account.clone(), String::new(), Some(plan(Tool::Windower)), Instant::now(), |_| {}).unwrap();
+        assert_ne!(second.pid, first.pid);
+        assert!(find(&config, &account).unwrap().ensure_launch_tool(Tool::Windower).is_ok());
+    }
+
+    #[test]
+    fn launcher_close_catches_a_startup_worker_that_has_not_published_yet() {
+        let fixture = Fixture::new();
+        fs::write(fixture.0.join("social-fixture"), []).unwrap();
+        let config = config(&fixture.0);
+        let account = account();
+        assert!(IdleSessionClose::for_account(&config, &account, false).is_none());
+        let pending = IdleSessionClose::for_account(&config, &account, true).unwrap();
+        assert!(pending.worker.is_none());
+        let waiter = std::thread::spawn(move || close_idle_sessions(vec![pending]));
+        let plan = Plan { tool: Tool::Vanilla, settings: Default::default(), social_only: true,
+            invisible_login: false, auto_away_minutes: 0, auto_login: Default::default(),
+            viewer_gaps: false, trigger: Default::default() };
+        let launch = launch_command(child_command("session_worker::tests::worker_fixture", &fixture.0),
+            &config, account, String::new(), Some(plan), Instant::now(), |_| {}).unwrap();
+        waiter.join().unwrap().unwrap();
+        until(|| !launch.alive.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn launcher_close_waits_for_windower_to_finish_saving_and_does_not_overwrite_play() {
+        let fixture = Fixture::new();
+        fs::write(fixture.0.join("social-fixture"), []).unwrap();
+        fs::write(fixture.0.join("hold-final-profile-save"), []).unwrap();
+        let config = config(&fixture.0);
+        let account = account();
+        let _launch = launch_command(child_command("session_worker::tests::worker_fixture", &fixture.0),
+            &config, account.clone(), String::new(), None, Instant::now(), |_| {}).unwrap();
+        let session = find(&config, &account).unwrap();
+        let worker = session.worker;
+        // A Play queued by another window has priority over closing an idle owner.
+        let command_lock = exclusive(&config.account_directory(&account).join("native-social.lock")).unwrap();
+        save_json(&config.account_directory(&account).join("native-control.json"),
+            &ControlRequest { worker, action: NativeControl::StartGame, groups: true }).unwrap();
+        let mut pending = IdleSessionClose::known(session.clone());
+        assert!(pending.finished());
+        drop(command_lock);
+        until(|| session.game_running() == Some(true));
+        assert!(session.clone().sign_out().is_err(), "manual sign-out also preserves the game");
+        fs::write(fixture.0.join("game-exited"), []).unwrap();
+        until(|| session.game_running() == Some(false));
+        let (sent, received) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || { sent.send(session.sign_out()).unwrap(); });
+        until(|| fixture.0.join("final-profile-save-pending").exists());
+        assert_eq!(identity(worker.pid), Some(worker));
+        let mut closing_again = IdleSessionClose::for_account(&config, &account, false).unwrap();
+        assert!(closing_again.requested && !closing_again.finished(), "closing during a sign-out waits for the same worker");
+        assert!(matches!(received.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
+        fs::write(fixture.0.join("finish-profile-save"), []).unwrap();
+        received.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
+        waiter.join().unwrap();
+        assert!(fixture.0.join("final-profile-save-complete").exists());
+        assert_ne!(identity(worker.pid), Some(worker));
     }
 
     #[test]

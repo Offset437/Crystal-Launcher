@@ -173,11 +173,13 @@ pub(crate) struct Settings {
     /// in neither set has not been seen signing in yet.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub account_no_otp: BTreeSet<String>,
-    /// Settings → System, "Sign accounts in when Crystal opens" (owner decision 2026-10-13): the
-    /// one switch for Crystal's own sign-ins, at its start and after a game closes. On by
-    /// default, older files too.
+    /// Sign known accounts in when the launcher opens.
     #[serde(default = "default_true")]
     pub auto_sign_in: bool,
+    /// Reopening POL after FFXI exits is separate from startup sign-in. Older
+    /// settings files leave this off so closing a game actually closes its host.
+    #[serde(default)]
+    pub sign_in_after_game: bool,
     /// The launcher's own UI language (Settings page). Absent = follow the
     /// Windows display language. The game's language is never changed here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -224,6 +226,7 @@ impl Default for Settings {
             account_otp: BTreeSet::new(),
             account_no_otp: BTreeSet::new(),
             auto_sign_in: true,
+            sign_in_after_game: false,
             language: None,
             privacy: false,
             dgvoodoo: true,
@@ -240,6 +243,7 @@ pub(crate) struct AccountRow {
     pub selected: bool,
     pub otp: String,
     pub busy: bool,
+    signing_out: bool,
     /// Background sign-in can accept Play without starting another login.
     preparing_session: bool,
     queued_play: Option<Instant>,
@@ -284,14 +288,14 @@ pub(crate) struct AccountRow {
     /// The user signed out or edited the account during the running session: its end signs
     /// nothing back in.
     resign_declined: bool,
+    /// An explicit sign-out, or a game closed without automatic sign-in: keep
+    /// this account free of both signed-in and parked hosts until the next Play.
+    signed_out: bool,
     /// A sign-in after the game closed, waiting for its session to end fully.
     resign: Option<Resign>,
 }
 
-/// Owner decision 2026-10-12, "Sign it back in automatically": a pre-signed account (one Crystal
-/// signs in by itself, `Settings::presigns`) whose game closed (its session signed out and
-/// closed) signs in again, so the next Play is a pre-signed one. Square Enix sees a sign-out and
-/// then a fresh sign-in, as from a user who quits FFXI and reopens PlayOnline.
+/// An optional fresh sign-in after the game and its previous POL host close.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Resign {
     /// The row's launch generation at the game's end: a launch since (Play, Connect) wins.
@@ -387,17 +391,22 @@ impl AccountRow {
         self.pid.is_some() && self.game_running.as_ref().is_none_or(|g| g.load(Ordering::Acquire))
     }
     pub(crate) fn can_play(&self) -> bool {
-        !self.batch_pending && !self.is_playing() && self.queued_play.is_none() && (!self.busy || self.preparing_session)
+        !self.signing_out && !self.batch_pending && !self.is_playing() && self.queued_play.is_none() && (!self.busy || self.preparing_session)
     }
     fn queued_signin_play(&self) -> bool {
         self.busy && self.preparing_session && self.queued_play.is_some() && !self.batch_pending && !self.is_playing()
     }
     pub(crate) fn game_start_pending(&self) -> bool {
-        self.batch_pending || self.queued_play.is_some() || self.busy && !self.preparing_session
+        !self.signing_out && (self.batch_pending || self.queued_play.is_some() || self.busy && !self.preparing_session)
+    }
+    pub(crate) fn can_sign_out(&self) -> bool {
+        self.pid.is_some() && !self.signing_out && !self.busy && !self.is_playing()
+            && !self.batch_pending && self.queued_play.is_none()
     }
     /// The status line to show. A client's exit report is worded in the
     /// current language here; any later status replaces it.
     pub(crate) fn status_text(&self) -> std::borrow::Cow<'_, str> {
+        if self.signing_out { return t("Signing out of PlayOnline…").into(); }
         match &self.exit {
             Some(report) if report.summary == self.status => report.message().into(),
             _ => self.status.as_str().into(),
@@ -563,6 +572,8 @@ pub(crate) enum Message {
     FriendsConnect,
     FriendsPlay,
     FriendsSignOut,
+    AccountSignOut(String),
+    AccountSignedOut(String, u64, Result<(), String>),
     FriendsStatus(session_worker::NativeControl),
     FriendsStatusGroups(bool),
     FriendsAutoAway(u8),
@@ -617,6 +628,7 @@ pub(crate) enum Message {
     SetPrivacy(bool),
     /// Settings → System: "Sign accounts in when Crystal opens".
     AutoSignIn(bool),
+    SignInAfterGame(bool),
     ChooseProfile(String),
     SetLaunchWith(ui::LaunchWith),
     WikiQueryChanged(String),
@@ -661,6 +673,7 @@ pub(crate) enum Message {
     PatchLoaded(u64, patch::PatchReport),
     ViewerLoaded(u64, viewer::Status),
     CloseRequested,
+    SessionsClosed(Result<(), String>),
     ConfirmClose,
     CancelClose,
     PreviewReady(window::Screenshot),
@@ -759,6 +772,7 @@ pub(crate) struct App {
     /// The last pool tend (at most once a second).
     park_tended: Option<Instant>,
     pub confirm_close: bool,
+    closing: bool,
     pub pending_delete: Option<String>,
     pub wiki_query: String,
     pub ah_query: String,
@@ -882,6 +896,7 @@ impl App {
             park_checked: None,
             park_tended: None,
             confirm_close: false,
+            closing: false,
             pending_delete: None,
             wiki_query: String::new(),
             ah_query: String::new(),
@@ -1182,14 +1197,14 @@ impl App {
         self.launch_keys(true).into_iter().filter(|key| !self.is_waiting(key)).collect()
     }
     fn has_sessions(&self) -> bool {
-        self.accounts.iter().any(|r| r.busy || r.batch_pending || r.pid.is_some()
+        self.accounts.iter().any(|r| r.signing_out || r.busy || r.batch_pending || r.pid.is_some()
             || !self.preview && session_worker::find(&self.config, &r.account).is_some())
     }
 
     fn update_sessions(&self) -> Option<Vec<session_worker::BackgroundSession>> {
         let mut sessions = Vec::new();
         for row in &self.accounts {
-            if row.batch_pending || row.queued_play.is_some() || row.is_playing()
+            if row.signing_out || row.batch_pending || row.queued_play.is_some() || row.is_playing()
                 || row.busy && !row.preparing_session { return None; }
             let session = (!self.preview).then(|| session_worker::find(&self.config, &row.account)).flatten();
             if let Some(session) = session {
@@ -1202,7 +1217,7 @@ impl App {
 
     pub(crate) fn sessions_block_update(&self) -> bool { self.update_sessions().is_none() }
     pub fn launch_blocked(&self) -> bool {
-        self.installation_loading || self.files_changing() || self.recovering.is_some() || self.windower_editor_open
+        self.closing || self.installation_loading || self.files_changing() || self.recovering.is_some() || self.windower_editor_open
     }
 
     /// Game, PlayOnline, ReShade or Crystal files are being written: what a parked pol.exe
@@ -1701,6 +1716,7 @@ impl App {
                     account,
                     otp: String::new(),
                     busy: false,
+                    signing_out: false,
                     preparing_session: false,
                     queued_play: None,
                     batch_pending: false,
@@ -1722,6 +1738,7 @@ impl App {
                     presign_login: false,
                     game_seen: false,
                     resign_declined: false,
+                    signed_out: false,
                     resign: None,
                 }
             };
@@ -1861,6 +1878,7 @@ impl App {
                 }
             };
             jobs.push(job);
+            row.signed_out = false;
             row.launch_generation = row.launch_generation.wrapping_add(1);
             generations.insert(key, row.launch_generation);
             row.batch_pending = true;
@@ -2411,6 +2429,7 @@ impl App {
             }
             row.launch_generation = row.launch_generation.wrapping_add(1);
             let generation = row.launch_generation;
+            row.signed_out = false;
             if row.pid.is_some() {
                 // The stock FFXI version check runs immediately before the game starts, here
                 // as well as in a Play that signs in: off the interface thread, once the
@@ -2656,7 +2675,7 @@ impl App {
     /// its next Play starts warm instead of cold. A pre-sign-in that comes later takes the park.
     fn park_keys(&self) -> Vec<(String, pol_less::park::ParkKey, pol_less::Plan)> {
         self.accounts.iter()
-            .filter(|row| row.account.mode == AccountMode::Retail && !self.presign_coming(row)
+            .filter(|row| row.account.mode == AccountMode::Retail && !row.signed_out && !self.presign_coming(row)
                 && row.pid.is_none() && !row.busy && row.can_play())
             .filter_map(|row| {
                 let plan = self.launch_tools.launch_plan(&self.settings, &row.account)?;
@@ -2719,7 +2738,7 @@ impl App {
     }
 
     fn presigned_row(&self, row: &AccountRow) -> bool {
-        row.account.mode == AccountMode::Retail && self.settings.presigns(&row.key) && !row.otp_spent && row.otp.is_empty()
+        row.account.mode == AccountMode::Retail && !row.signed_out && self.settings.presigns(&row.key) && !row.otp_spent && row.otp.is_empty()
     }
 
     /// Whether `key` may sign back in after its game by itself (see `Resign`): a pre-signed
@@ -2732,7 +2751,7 @@ impl App {
 
     /// `resign_allowed` but for the service's state.
     fn resign_eligible(&self, key: &str) -> bool {
-        self.presigned(key)
+        self.settings.sign_in_after_game && self.presigned(key)
     }
 
     /// The row of a sign-in after a game that the maintenance or outage refused says so.
@@ -2751,6 +2770,14 @@ impl App {
     /// is left alone: its host may still be running. `host` is the ended session's loader PID.
     fn note_game_end(&mut self, key: &str, kind: Option<launch_log::ExitKind>, host: Option<u32>) {
         use launch_log::ExitKind;
+        if !self.settings.sign_in_after_game {
+            self.startup_waiting.retain(|(waiting, _)| waiting != key);
+            if let Some(row) = self.accounts.iter_mut().find(|row| row.key == key) {
+                row.signed_out = true;
+                row.drop_resign();
+            }
+            return;
+        }
         if self.preview || kind == Some(ExitKind::WorkerEnded) { return; }
         if !self.resign_allowed(key) {
             if self.resign_eligible(key) {
@@ -2964,6 +2991,58 @@ impl App {
     /// then its host; past CLOSE_WAIT it is terminated (07d §1.5 "Kill").
     fn close_parks(&mut self) {
         pol_less::park::close_workers(self.parks.drain(None));
+    }
+
+    fn sign_out_account(&mut self, key: String) -> Task<Message> {
+        self.startup_waiting.retain(|(waiting, _)| *waiting != key);
+        let Some(row) = self.accounts.iter_mut().find(|row| row.key == key) else { return Task::none() };
+        row.decline_resign();
+        row.signed_out = true;
+        row.network_wait = None;
+        if !row.can_sign_out() { return Task::none(); }
+        let generation = row.launch_generation;
+        let config = self.settings.config_for(&self.config, &row.account);
+        let session = (!self.preview).then(|| session_worker::find(&config, &row.account)).flatten();
+        row.busy = true;
+        row.signing_out = true;
+        row.preparing_session = false;
+        row.problem = false;
+        row.status = t("Signing out of PlayOnline…").into();
+        if self.preview { return Task::done(Message::AccountSignedOut(key, generation, Ok(()))); }
+        Task::perform(async move {
+            tokio::task::spawn_blocking(move || match session {
+                Some(session) => session.sign_out(),
+                None => Ok(()),
+            }).await.unwrap_or_else(|error| Err(error.to_string()))
+        }, move |result| Message::AccountSignedOut(key.clone(), generation, result))
+    }
+
+    fn begin_close(&mut self) -> Task<Message> {
+        self.confirm_close = false;
+        self.closing = true;
+        self.startup_signin_pending = false;
+        self.startup_waiting.clear();
+        let mut sessions = Vec::new();
+        for row in &mut self.accounts {
+            row.decline_resign();
+            row.signed_out = true;
+            row.network_wait = None;
+            if !self.preview {
+                let config = self.settings.config_for(&self.config, &row.account);
+                if let Some(session) = session_worker::IdleSessionClose::for_account(&config, &row.account, row.busy && row.preparing_session) {
+                    sessions.push(session);
+                }
+            }
+        }
+        let parks = self.parks.drain(None);
+        if sessions.is_empty() && parks.is_empty() { return iced::exit(); }
+        self.status = t("Signing out idle PlayOnline sessions before closing…").into();
+        Task::perform(async move {
+            tokio::task::spawn_blocking(move || {
+                pol_less::park::close_workers(parks);
+                session_worker::close_idle_sessions(sessions)
+            }).await.unwrap_or_else(|error| Err(error.to_string()))
+        }, Message::SessionsClosed)
     }
 
     /// Close parked hosts for `keys` off the UI thread (a batch signs them in cold).
@@ -3399,14 +3478,14 @@ impl App {
     }
 
     pub(crate) fn can_restart_launcher(&self) -> bool {
-        self.maintenance.is_none() && self.active_operation.is_none() && !self.prereqs.busy()
+        !self.closing && self.maintenance.is_none() && self.active_operation.is_none() && !self.prereqs.busy()
             && !self.dgvoodoo.busy() && !self.reshade.busy && self.friends.pending.is_none()
             && self.vault_ready && !self.startup_signin_pending && !self.vault_saving
             && self.held_plays.is_empty()
             // A waiting Play, one released from its wait and still starting, or the update it
             // asked for, is pending launch work (waits are not saved across a restart).
             && self.waiting_plays.is_empty() && self.released.is_empty() && self.wait_update.is_none()
-            && !self.accounts.iter().any(|a| a.busy || a.batch_pending)
+            && !self.accounts.iter().any(|a| a.signing_out || a.busy || a.batch_pending)
     }
 
     fn poll_controller(&mut self, capturing: bool) {
@@ -3424,6 +3503,7 @@ impl App {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        if self.closing && !matches!(&message, Message::SessionsClosed(_)) { return Task::none(); }
         // The helper is preparing to replace this process. Do not start new
         // writes or work between its readiness check and our exit.
         if matches!(self.self_update, self_update::State::Applying)
@@ -3461,6 +3541,11 @@ impl App {
             Message::AutoSignIn(on) => {
                 self.settings.auto_sign_in = on;
                 self.park_checked = None;
+                if !self.preview { if let Err(error) = save_settings(&self.config, &self.settings) { self.status = error; } }
+            }
+            Message::SignInAfterGame(on) => {
+                self.settings.sign_in_after_game = on;
+                if !on { for row in &mut self.accounts { row.drop_resign(); } }
                 if !self.preview { if let Err(error) = save_settings(&self.config, &self.settings) { self.status = error; } }
             }
             Message::ControllerPlay => {
@@ -3546,12 +3631,26 @@ impl App {
                 if let Some(key) = self.friends.account.clone() { self.start(vec![key]); }
             }
             Message::FriendsSignOut => {
-                // An explicit sign-out is never undone by a sign-in after a game.
-                if let Some(row) = self.accounts.iter_mut().find(|a| self.friends.account.as_ref() == Some(&a.key)) { row.decline_resign(); }
-                if !self.preview {
-                    if let Some(row) = self.accounts.iter().find(|a| self.friends.account.as_ref() == Some(&a.key)) {
-                        let config = self.settings.config_for(&self.config, &row.account);
-                        self.friends.error = session_worker::request_native_control(&config, &row.account, session_worker::NativeControl::SignOut).err().unwrap_or_default();
+                if let Some(key) = self.friends.account.clone() { return self.sign_out_account(key); }
+            }
+            Message::AccountSignOut(key) => return self.sign_out_account(key),
+            Message::AccountSignedOut(key, generation, result) => {
+                if let Some(row) = self.accounts.iter_mut().find(|row| row.key == key && row.launch_generation == generation) {
+                    row.signing_out = false;
+                    row.busy = false;
+                    row.problem = result.is_err();
+                    row.status = result.as_ref().err().cloned().unwrap_or_else(|| t("Signed out of PlayOnline").into());
+                    if result.is_ok() {
+                        row.pid = None;
+                        row.alive = None;
+                        row.game_running = None;
+                        row.outcome = None;
+                        row.exit = None;
+                        row.timing.clear();
+                    }
+                    if self.friends.account.as_ref() == Some(&key) {
+                        self.friends.error = result.err().unwrap_or_default();
+                        self.load_friends();
                     }
                 }
             }
@@ -3694,7 +3793,10 @@ impl App {
                     if row.pid.is_some() && row.alive.as_ref().is_some_and(|a| a.load(Ordering::Acquire)) {
                         // A sign-out or edit before this game (a pre-signed Play since) declines
                         // nothing about it.
-                        if row.is_playing() && !std::mem::replace(&mut row.game_seen, true) { row.resign_declined = false; }
+                        if row.is_playing() && !std::mem::replace(&mut row.game_seen, true) {
+                            row.resign_declined = false;
+                            row.signed_out = false;
+                        }
                         if row.is_playing() && !row.batch_pending {
                             if let Some(mut timing) = row.play_timing.take() {
                                 timing.stage("game start observed by launcher");
@@ -3725,6 +3827,7 @@ impl App {
                             .outcome
                             .take()
                             .and_then(|slot| slot.lock().ok().and_then(|mut r| r.take()));
+                        if row.game_seen && !self.settings.sign_in_after_game { row.signed_out = true; }
                         if std::mem::take(&mut row.game_seen) && !std::mem::take(&mut row.resign_declined) {
                             game_ends.push((row.key.clone(), report.as_ref().map(|r| r.kind.clone()), host));
                         }
@@ -4524,18 +4627,20 @@ impl App {
                 if self.vault_saving {
                     self.confirm_close = true;
                 } else {
-                    self.close_parks();
-                    return iced::exit();
+                    return self.begin_close();
                 }
             }
             Message::ConfirmClose => {
                 if self.maintenance.is_none() && !self.prereqs.busy() && !self.reshade.busy {
-                    self.close_parks();
-                    return iced::exit();
+                    return self.begin_close();
                 }
                 self.confirm_close = false;
             }
             Message::CancelClose => self.confirm_close = false,
+            Message::SessionsClosed(result) => match result {
+                Ok(()) => return iced::exit(),
+                Err(error) => { self.closing = false; self.status = error; }
+            },
             Message::PreviewReady(screenshot) => {
                 // light/empty/close variants get their own files.
                 let light = self.settings.light_theme;
@@ -5569,6 +5674,7 @@ mod tests {
             park_checked: None,
             park_tended: None,
             confirm_close: false,
+            closing: false,
             pending_delete: None,
             wiki_query: String::new(),
             ah_query: String::new(),
@@ -7587,6 +7693,7 @@ mod tests {
         app.config.experiment = std::env::temp_dir().join(format!("crystal-{name}-{}", backend::unique_id().unwrap()));
         let key = app.accounts[0].key.clone();
         assert!(app.settings.auto_sign_in);
+        app.settings.sign_in_after_game = true;
         app.settings.account_no_otp.insert(key.clone());
         (app, key)
     }
@@ -7607,6 +7714,70 @@ mod tests {
     }
 
     fn signed_out() -> launch_log::ExitReport { launch_log::classify_loader_end(&launch_log::LoaderEnd::SignedOut, Duration::from_secs(900)) }
+
+    #[test]
+    fn closing_a_game_stays_signed_out_by_default_even_with_startup_signin_enabled() {
+        let (mut app, key) = resign_app("close-game-stays-out");
+        app.settings.sign_in_after_game = false;
+        let mut older = serde_json::to_value(Settings::default()).unwrap();
+        older.as_object_mut().unwrap().remove("sign_in_after_game");
+        assert!(!serde_json::from_value::<Settings>(older).unwrap().sign_in_after_game);
+        app.startup_waiting.push((key.clone(), Instant::now()));
+        game_ends(&mut app, 0, signed_out());
+        assert!(app.accounts[0].signed_out && app.accounts[0].resign.is_none());
+        assert!(app.take_resigns(Instant::now() + RESIGN_DELAY).is_empty());
+        assert!(app.take_waiting_startups(Instant::now()).is_empty());
+        assert!(!app.park_keys().iter().any(|(row, ..)| row == &key), "no replacement parked pol.exe");
+        assert!(app.launches.as_ref().unwrap().is_empty());
+        app.startup_signin_pending = true;
+        assert!(app.take_startup_signins().is_empty(), "an explicit Play or next launcher window owns the next sign-in");
+    }
+
+    #[test]
+    fn account_signout_is_available_without_opening_friends_and_blocks_recreation() {
+        let mut app = app();
+        app.page = Page::Accounts;
+        let key = app.accounts[0].key.clone();
+        app.settings.account_no_otp.insert(key.clone());
+        app.accounts[0].pid = Some(77);
+        app.accounts[0].game_running = Some(Arc::new(AtomicBool::new(false)));
+        assert!(app.accounts[0].can_sign_out());
+        let texts = privacy::testing::texts(ui::view(&app), iced::Size::new(1600.0, 1000.0));
+        assert!(texts.iter().any(|text| text == t("Sign out")));
+        assert_eq!(app.update(Message::AccountSignOut(key.clone())).units(), 1);
+        assert!(app.accounts[0].busy && app.accounts[0].signed_out && !app.accounts[0].can_play());
+        // Finished can be published while Windower still has its profile save.
+        app.accounts[0].alive = Some(Arc::new(AtomicBool::new(false)));
+        let _ = app.update(Message::Tick);
+        assert!(app.accounts[0].signing_out && !app.accounts[0].busy && !app.accounts[0].can_play());
+        assert!(!app.can_restart_launcher() && app.sessions_block_update());
+        let generation = app.accounts[0].launch_generation;
+        let _ = app.update(Message::AccountSignedOut(key.clone(), generation, Ok(())));
+        assert!(app.accounts[0].pid.is_none() && app.accounts[0].can_play());
+        assert_eq!(app.accounts[0].status, "Signed out of PlayOnline");
+        assert!(!app.park_keys().iter().any(|(row, ..)| row == &key));
+        assert!(app.take_waiting_startups(Instant::now()).is_empty());
+    }
+
+    #[test]
+    fn launcher_close_drops_automatic_signins_and_preserves_running_game_state() {
+        let (mut app, key) = resign_app("close-window");
+        app.startup_waiting.push((key.clone(), Instant::now()));
+        let alive = Arc::new(AtomicBool::new(true));
+        let game = Arc::new(AtomicBool::new(true));
+        app.accounts[0].pid = Some(77);
+        app.accounts[0].alive = Some(alive.clone());
+        app.accounts[0].game_running = Some(game.clone());
+        let _ = app.update(Message::CloseRequested);
+        assert!(app.closing && app.launch_blocked());
+        assert!(app.startup_waiting.is_empty() && !app.startup_signin_pending);
+        assert!(app.accounts[0].signed_out && app.accounts[0].resign.is_none());
+        assert!(alive.load(Ordering::Acquire) && game.load(Ordering::Acquire));
+        assert!(app.accounts[0].is_playing());
+        let _ = app.update(Message::Tick);
+        let _ = app.update(Message::Launch(key));
+        assert!(app.launches.as_ref().unwrap().is_empty(), "shutdown cannot start more work");
+    }
 
     /// After a normal quit (or FFXI's usual -14) the account signs back in, as a pre-sign-in
     /// named "sign-in after game", only once its row has been free for RESIGN_DELAY (≥ 3 s).
@@ -8409,6 +8580,7 @@ mod tests {
         assert_eq!(app.service_availability(), services::Availability::Outage);
         assert_eq!(app.main_action(), MainAction::Offline);
         app.settings.account_no_otp.insert(key.clone());
+        app.settings.sign_in_after_game = true;
         assert!(app.resign_eligible(&key) && !app.resign_allowed(&key), "no sign-in after a game while the worlds are down");
         // The worlds are back.
         status_read(&mut app, services::Availability::Operational, None);
@@ -8735,7 +8907,7 @@ mod tests {
     }
 
     /// Owner decision 2026-10-13: an account's first Play teaches Crystal. One that signed in
-    /// without a code is pre-signed from then on (its game's end signs it back in); one that took
+    /// without a code is eligible for startup sign-in; one that took
     /// a code is not, and neither is one whose sign-in failed.
     #[test]
     fn a_first_play_teaches_whether_the_account_is_pre_signed() {
@@ -8768,7 +8940,7 @@ mod tests {
             row.alive.as_ref().unwrap().store(false, Ordering::Release);
         }
         let _ = app.update(Message::Tick);
-        assert!(app.accounts[0].resign.is_some(), "the account learned as code-less signs back in after its game");
+        assert!(app.accounts[0].resign.is_none() && app.accounts[0].signed_out, "closing the game keeps POL closed by default");
         assert!(app.accounts[1].resign.is_none(), "an OTP account does not");
         let _ = std::fs::remove_dir_all(&app.config.experiment);
     }
@@ -8979,7 +9151,7 @@ mod tests {
             app.settings_tab = settings_page::Tab::System;
             let texts = privacy::testing::texts(ui::view(&app), size);
             // A toggler reports no label to the widget tree; its explanation is plain text.
-            assert!(texts.iter().any(|line| line == t("Accounts that sign in without a one-time password sign in to PlayOnline in the background when Crystal opens and again after their game closes, so Play starts FFXI without another sign-in.")), "{texts:?}");
+            assert!(texts.iter().any(|line| line == t("Accounts that sign in without a one-time password sign in to PlayOnline in the background when Crystal opens, so Play starts FFXI without another sign-in.")), "{texts:?}");
         }
         i18n::set(i18n::Lang::En);
     }

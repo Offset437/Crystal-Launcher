@@ -3576,8 +3576,10 @@ fn account_row<'a>(app: &'a App, item: &'a crate::AccountRow, c: Colors) -> Elem
         Some(124.0),
     );
     let edit = icon_control(c, Icon::Edit, false, (!app.vault_saving).then(|| Message::EditAccount(item.key.clone())));
+    let sign_out = control(c, Tone::Secondary, None, t("Sign out"),
+        (item.can_sign_out() && !app.launch_blocked()).then(|| Message::AccountSignOut(item.key.clone())), Some(100.0));
     iced::widget::mouse_area(container(
-        row![grip, pick, avatar(c, picked, 40.0), identity, status, otp, launch, edit]
+        row![grip, pick, avatar(c, picked, 40.0), identity, status, otp, launch, sign_out, edit]
             .spacing(16)
             .align_y(Alignment::Center),
     )

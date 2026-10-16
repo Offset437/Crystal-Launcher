@@ -129,9 +129,7 @@ fn ownership_notice(app: &App) -> Element<'_, Message> {
     ].spacing(8.0 * s).padding([12.0 * s, 0.0]).into()
 }
 
-/// The one switch for Crystal's own sign-ins (owner decision 2026-10-13): every account it knows
-/// signs in without a one-time password is signed in when Crystal opens and again after its
-/// game closes (`Settings::presigns`). Character auto-select stays per account, in its editor.
+/// Startup sign-in and signing back in after a game have separate choices.
 fn sign_in_switch(app: &App) -> Element<'_, Message> {
     let c = colors(app.settings.light_theme);
     column![
@@ -141,9 +139,15 @@ fn sign_in_switch(app: &App) -> Element<'_, Message> {
             .font(BODY)
             .text_size(13)
             .size(18),
-        text(t("Accounts that sign in without a one-time password sign in to PlayOnline in the background when Crystal opens and again after their game closes, so Play starts FFXI without another sign-in."))
+        text(t("Accounts that sign in without a one-time password sign in to PlayOnline in the background when Crystal opens, so Play starts FFXI without another sign-in."))
             .font(BODY).size(12).color(c.sub),
         text(t("Crystal learns this from each account's sign-ins: a new account joins after its first Play without a one-time password. Accounts that use one sign in only when you press Play."))
+            .font(BODY).size(12).color(c.sub),
+        crate::controller_nav::toggler(app.settings.sign_in_after_game)
+            .label(t("Sign back in after FFXI closes"))
+            .on_toggle(Message::SignInAfterGame)
+            .font(BODY).text_size(13).size(18),
+        text(t("Off by default: closing FFXI closes its POL host. When enabled with startup sign-in, Crystal opens a fresh PlayOnline session for the next Play."))
             .font(BODY).size(12).color(c.sub),
     ]
     .spacing(10)
